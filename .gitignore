@@ -1,0 +1,7 @@
+# Godot 4 editor/import cache
+.godot/
+
+# OS / scratch
+*.tmp
+Thumbs.db
+.DS_Store
