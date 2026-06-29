@@ -9,10 +9,11 @@ const ROADLINE_SHADER := preload("res://shaders/roadline.gdshader")
 const GlbUtil := preload("res://scripts/GlbUtil.gd")
 
 @export var road_width: float = 9.0
-@export var loop_radius: float = 175.0
-@export var radius_wobble: float = 48.0
-@export var hill_height: float = 7.5
-@export var num_points: int = 30
+@export var loop_radius: float = 460.0
+@export var radius_wobble: float = 150.0
+@export var hill_height: float = 8.0
+@export var num_points: int = 48
+@export var drive_half_width: float = 22.0   ## wide drivable corridor so you can feel it
 
 var _curve: Curve3D
 var _rng := RandomNumberGenerator.new()
@@ -69,11 +70,11 @@ func _build_road() -> void:
 	var ground_mat := StandardMaterial3D.new()
 	ground_mat.albedo_color = Color(0.07, 0.08, 0.06)
 	ground_mat.roughness = 1.0
-	_ground_skirt(75.0, -0.6, ground_mat)
+	_ground_skirt(190.0, -0.6, ground_mat)
 	# drivable asphalt
 	_ribbon(0.0, road_width * 0.5, 0.0, asphalt, 0.14, false)
-	# collision surface a bit wider than the lanes (shoulders), invisible
-	var col := _ribbon(0.0, road_width * 0.5 + 4.0, -0.02, null, 0.1, true)
+	# wide invisible collision corridor (lets you roam off the lane and feel the car)
+	var col := _ribbon(0.0, drive_half_width, -0.05, null, 0.1, true)
 	col.visible = false
 	# lane lines
 	var yellow := _line_mat(Color(0.82, 0.70, 0.20), 0.45)
@@ -132,16 +133,19 @@ func _ribbon(lateral: float, half_w: float, y_lift: float, mat: Material, uv_til
 	var d := 0.0
 	while d <= length:
 		var xf := _curve.sample_baked_with_rotation(d, true, true)
-		var right := xf.basis.x
-		var up := xf.basis.y
-		var c := xf.origin + up * y_lift
-		var vL := c + right * (lateral - half_w)
-		var vR := c + right * (lateral + half_w)
+		# horizontal cross-section: level across, only the centerline elevation (hills)
+		# changes along the road. No sideways roll, so edges never dip below the dirt.
+		var fwd := xf.basis.z
+		var fwd_h := Vector3(fwd.x, 0.0, fwd.z).normalized()
+		var right_h := Vector3(fwd_h.z, 0.0, -fwd_h.x)
+		var c := xf.origin + Vector3(0, y_lift, 0)
+		var vL := c + right_h * (lateral - half_w)
+		var vR := c + right_h * (lateral + half_w)
 		var v := d * uv_tile
-		st.set_normal(up)
+		st.set_normal(Vector3.UP)
 		st.set_uv(Vector2(0.0, v))
 		st.add_vertex(vL)
-		st.set_normal(up)
+		st.set_normal(Vector3.UP)
 		st.set_uv(Vector2(1.0, v))
 		st.add_vertex(vR)
 		rings += 1

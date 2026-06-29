@@ -6,17 +6,17 @@ extends Node3D
 
 const SKY_SHADER := preload("res://shaders/sky.gdshader")
 
-@export var time_of_day: float = 0.42      ## 0=midnight, 0.25=sunrise, 0.5=noon, 0.75=sunset
+@export var time_of_day: float = 0.5       ## 0=midnight, 0.25=sunrise, 0.5=noon, 0.75=sunset
 @export var auto_advance: bool = true
 @export var day_length_sec: float = 900.0  ## slow cycle so you start (and stay a while) in daylight
 
 # palette keyframes (midnight -> sunrise -> noon -> sunset -> midnight)
 const KEYS := [
-	{"t": 0.00, "top": Color(0.02, 0.03, 0.09), "hor": Color(0.05, 0.07, 0.16), "gnd": Color(0.02, 0.02, 0.05), "energy": 0.25},
-	{"t": 0.23, "top": Color(0.14, 0.11, 0.32), "hor": Color(0.92, 0.46, 0.30), "gnd": Color(0.40, 0.25, 0.20), "energy": 0.65},
-	{"t": 0.50, "top": Color(0.26, 0.50, 0.88), "hor": Color(0.72, 0.83, 0.96), "gnd": Color(0.50, 0.55, 0.58), "energy": 1.0},
-	{"t": 0.77, "top": Color(0.22, 0.13, 0.42), "hor": Color(1.00, 0.50, 0.16), "gnd": Color(0.45, 0.28, 0.20), "energy": 0.9},
-	{"t": 1.00, "top": Color(0.02, 0.03, 0.09), "hor": Color(0.05, 0.07, 0.16), "gnd": Color(0.02, 0.02, 0.05), "energy": 0.25},
+	{"t": 0.00, "top": Color(0.02, 0.03, 0.10), "hor": Color(0.05, 0.07, 0.18), "gnd": Color(0.02, 0.02, 0.05), "energy": 0.3},
+	{"t": 0.23, "top": Color(0.16, 0.20, 0.45), "hor": Color(0.95, 0.55, 0.35), "gnd": Color(0.40, 0.30, 0.22), "energy": 0.7},
+	{"t": 0.50, "top": Color(0.16, 0.42, 0.85), "hor": Color(0.58, 0.76, 0.95), "gnd": Color(0.45, 0.50, 0.52), "energy": 1.0},
+	{"t": 0.77, "top": Color(0.22, 0.13, 0.42), "hor": Color(1.00, 0.52, 0.18), "gnd": Color(0.45, 0.28, 0.20), "energy": 0.9},
+	{"t": 1.00, "top": Color(0.02, 0.03, 0.10), "hor": Color(0.05, 0.07, 0.18), "gnd": Color(0.02, 0.02, 0.05), "energy": 0.3},
 ]
 
 var _env: Environment
@@ -150,6 +150,7 @@ func _apply(t: float) -> void:
 	_sky_mat.set_shader_parameter("sun_glow_color", Color(1.0, 0.55, 0.25))
 	_sky_mat.set_shader_parameter("sun_glow", lerp(0.25, 0.8, warmth) * day)
 	_sky_mat.set_shader_parameter("star_amount", night)
+	_sky_mat.set_shader_parameter("cloud_amount", day)
 
 	# sun arc + warmth
 	var e_angle: float = asin(clamp(elev, -1.0, 1.0))

@@ -10,10 +10,11 @@ func _process(_d: float) -> void:
 	if _f == 60:
 		var car: Node3D = _main.call("get_car")
 		var fwd := -car.global_transform.basis.z
+		var fwd_h := Vector3(fwd.x, 0, fwd.z).normalized()
 		_cam = Camera3D.new()
 		add_child(_cam)
-		_cam.global_position = car.global_position - fwd * 14.0 + Vector3(0, 9, 0)
-		_cam.look_at(car.global_position + fwd * 30.0, Vector3.UP)
+		_cam.global_position = car.global_position - fwd_h * 35.0 + Vector3(0, 28, 0)
+		_cam.look_at(car.global_position + fwd_h * 60.0, Vector3.UP)
 		_cam.current = true
 	if _f == 120:
 		await RenderingServer.frame_post_draw

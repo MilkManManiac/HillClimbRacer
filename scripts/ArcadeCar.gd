@@ -16,7 +16,7 @@ extends RigidBody3D
 @export var max_yaw_rate: float = 1.7    ## rad/s cap so fast turns stay stable
 @export var gravity_force: float = 32.0  ## strong gravity = planted, not floaty
 # --- automatic gearbox (slow, gradual build to top speed) --------------------
-@export var engine_power: float = 5200.0 ## drive force (N) at full torque in 1st gear
+@export var engine_power: float = 9500.0 ## drive force (N) at full torque in 1st gear
 @export var brake_force: float = 6800.0
 @export var coast_drag: float = 70.0     ## N per m/s when off throttle
 @export var gear_top: Array[float] = [9.0, 16.0, 23.0, 29.0, 36.0]   ## upshift speeds (m/s)

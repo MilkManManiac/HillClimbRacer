@@ -30,7 +30,7 @@ var _sub_until: float = 0.0
 func _ready() -> void:
 	_setup_sky()
 	_setup_roads()
-	_setup_terrain()
+	# mountains disabled for now — they loomed/clipped; revisit as distant backdrop later
 	_setup_forest()
 	_setup_car()
 	_setup_postprocess()

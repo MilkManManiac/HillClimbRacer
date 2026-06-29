@@ -11,7 +11,7 @@ const PINES := [
 const GlbUtil := preload("res://scripts/GlbUtil.gd")
 const CELL := 70.0
 const ROCK_GLB := "res://assets/rocks/rock_quaternius_large_cc0.glb"
-const ROCK_SCALE := 22.0
+const ROCK_SCALE := 0.3   ## the mesh is ~7.7m wide natively, so this gives ~1.5-3.5m boulders
 
 @export var course_curve: Curve3D
 @export var road_width: float = 9.0
@@ -23,14 +23,14 @@ var _bush_x: Array[Transform3D] = []
 var _rock_x: Array[Transform3D] = []
 
 # tree rows by distance from the road centerline (each side), with spawn chance
+const WALL_OFF := 22.0   ## collision wall distance from centerline (just outside the drivable corridor)
 const ROWS := [
-	{"dist": 14.0, "chance": 0.95},
-	{"dist": 18.5, "chance": 0.9},
-	{"dist": 23.5, "chance": 0.85},
-	{"dist": 29.5, "chance": 0.7},
-	{"dist": 37.0, "chance": 0.55},
-	{"dist": 46.0, "chance": 0.4},
-	{"dist": 57.0, "chance": 0.28},
+	{"dist": 25.0, "chance": 0.9},
+	{"dist": 31.0, "chance": 0.8},
+	{"dist": 39.0, "chance": 0.7},
+	{"dist": 49.0, "chance": 0.55},
+	{"dist": 62.0, "chance": 0.4},
+	{"dist": 78.0, "chance": 0.28},
 ]
 
 func _ready() -> void:
@@ -54,28 +54,31 @@ func _line_curve() -> void:
 	var d := 0.0
 	while d < length:
 		var xf := course_curve.sample_baked_with_rotation(d, true, true)
-		var right := xf.basis.x
-		var base := xf.origin + xf.basis.y * -0.6   # sit on the ground skirt
+		# horizontal frame so trees/walls sit level on slopes (no vertical swing)
+		var fwd := xf.basis.z
+		var fwd_h := Vector3(fwd.x, 0.0, fwd.z).normalized()
+		var right_h := Vector3(fwd_h.z, 0.0, -fwd_h.x)
+		var base := Vector3(xf.origin.x, xf.origin.y - 0.6, xf.origin.z)
 		for side: float in [-1.0, 1.0]:
 			for row in ROWS:
 				if _rng.randf() > float(row.chance):
 					continue
-				var off: float = float(row.dist) + _rng.randf_range(-1.5, 1.5)
-				var along: float = _rng.randf_range(-1.2, 1.2)
-				var pos: Vector3 = base + right * (off * side) + (-xf.basis.z) * along
+				var off: float = float(row.dist) + _rng.randf_range(-2.0, 2.0)
+				var along: float = _rng.randf_range(-1.5, 1.5)
+				var pos: Vector3 = base + right_h * (off * side) + fwd_h * along
 				_add_pine(pos)
-			# front bush to block the ground-level gap (just past the collision wall)
-			if _rng.randf() < 0.5:
-				_bush_x.append(Transform3D(_bush_basis(), base + right * (10.5 * side)))
+			# front bush just past the collision wall
+			if _rng.randf() < 0.4:
+				_bush_x.append(Transform3D(_bush_basis(), base + right_h * ((WALL_OFF + 1.5) * side)))
 			# occasional roadside boulder
-			if _rng.randf() < 0.08:
+			if _rng.randf() < 0.06:
 				var rs: float = ROCK_SCALE * _rng.randf_range(0.6, 1.5)
 				var rb := Basis(Vector3.UP, _rng.randf() * TAU).scaled(Vector3(rs, rs * _rng.randf_range(0.7, 1.1), rs))
-				_rock_x.append(Transform3D(rb, base + right * (_rng.randf_range(11.0, 17.0) * side)))
+				_rock_x.append(Transform3D(rb, base + right_h * (_rng.randf_range(WALL_OFF + 1.0, WALL_OFF + 9.0) * side)))
 		# collision wall rings (built into a ribbon after the loop)
-		_wall_l.append(base + right * -8.0)
-		_wall_r.append(base + right * 8.0)
-		d += 2.5
+		_wall_l.append(base + right_h * -WALL_OFF)
+		_wall_r.append(base + right_h * WALL_OFF)
+		d += 3.5
 	_build_wall(_wall_l)
 	_build_wall(_wall_r)
 
