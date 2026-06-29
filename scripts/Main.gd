@@ -6,7 +6,7 @@ extends Node3D
 const VHS_SHADER := preload("res://shaders/vhs_postprocess.gdshader")
 const ArcadeCarScript := preload("res://scripts/ArcadeCar.gd")
 const CockpitScript := preload("res://scripts/Cockpit.gd")
-const RoadNetworkScript := preload("res://scripts/RoadNetwork.gd")
+const RoadCourseScript := preload("res://scripts/RoadCourse.gd")
 const SkyScript := preload("res://scripts/Sky.gd")
 const ForestScript := preload("res://scripts/Forest.gd")
 const TerrainScript := preload("res://scripts/Terrain.gd")
@@ -15,6 +15,7 @@ const GRID_XS: Array[float] = [-130.0, 0.0, 130.0]
 const GRID_ZS: Array[float] = [40.0, -90.0, -220.0, -350.0]
 
 var _car: RigidBody3D
+var _road: Node3D
 var _prompt: Label
 var _subtitle: Label
 var _narrator: Label
@@ -28,8 +29,8 @@ var _sub_until: float = 0.0
 
 func _ready() -> void:
 	_setup_sky()
-	_setup_terrain()
 	_setup_roads()
+	_setup_terrain()
 	_setup_forest()
 	_setup_car()
 	_setup_postprocess()
@@ -96,17 +97,16 @@ func _setup_forest() -> void:
 	var forest := Node3D.new()
 	forest.name = "Forest"
 	forest.set_script(ForestScript)
-	forest.set("xs", GRID_XS)
-	forest.set("zs", GRID_ZS)
+	forest.set("course_curve", _road.call("get_curve"))
 	add_child(forest)
 
 # --- roads -------------------------------------------------------------------
 
 func _setup_roads() -> void:
-	var roads := Node3D.new()
-	roads.name = "RoadNetwork"
-	roads.set_script(RoadNetworkScript)
-	add_child(roads)
+	_road = Node3D.new()
+	_road.name = "RoadCourse"
+	_road.set_script(RoadCourseScript)
+	add_child(_road)
 
 # --- car ---------------------------------------------------------------------
 
@@ -115,8 +115,9 @@ func _setup_car() -> void:
 	_car.name = "Car"
 	_car.set_script(ArcadeCarScript)
 	add_child(_car)
-	# start on the southern road, facing north (-Z), dropped just above the ground
-	_car.global_position = Vector3(0, 1.2, 30)
+	# spawn at the start of the road course, facing along it
+	if _road:
+		_car.global_transform = _road.call("get_start_transform")
 	# interactive cockpit systems hang off the car
 	var cockpit := Node.new()
 	cockpit.name = "Cockpit"
@@ -135,10 +136,10 @@ func _setup_postprocess() -> void:
 	_vhs_mat = ShaderMaterial.new()
 	_vhs_mat.shader = VHS_SHADER
 	# keep a light filmic touch, but don't darken the bright daytime scene
-	_vhs_mat.set_shader_parameter("vignette_amount", 0.5)
-	_vhs_mat.set_shader_parameter("scanline_amount", 0.04)
-	_vhs_mat.set_shader_parameter("grain_amount", 0.03)
-	_vhs_mat.set_shader_parameter("aberration", 0.0008)
+	_vhs_mat.set_shader_parameter("vignette_amount", 0.2)
+	_vhs_mat.set_shader_parameter("scanline_amount", 0.0)
+	_vhs_mat.set_shader_parameter("grain_amount", 0.02)
+	_vhs_mat.set_shader_parameter("aberration", 0.0004)
 	rect.material = _vhs_mat
 	layer.add_child(rect)
 	add_child(layer)

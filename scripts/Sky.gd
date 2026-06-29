@@ -6,9 +6,9 @@ extends Node3D
 
 const SKY_SHADER := preload("res://shaders/sky.gdshader")
 
-@export var time_of_day: float = 0.77      ## 0=midnight, 0.25=sunrise, 0.5=noon, 0.75=sunset
+@export var time_of_day: float = 0.42      ## 0=midnight, 0.25=sunrise, 0.5=noon, 0.75=sunset
 @export var auto_advance: bool = true
-@export var day_length_sec: float = 480.0
+@export var day_length_sec: float = 900.0  ## slow cycle so you start (and stay a while) in daylight
 
 # palette keyframes (midnight -> sunrise -> noon -> sunset -> midnight)
 const KEYS := [
@@ -57,7 +57,7 @@ func _build_environment() -> void:
 
 	# AgX tonemap for a filmic, non-blown-out look
 	env.tonemap_mode = Environment.TONE_MAPPER_AGX
-	env.tonemap_exposure = 1.0
+	env.tonemap_exposure = 1.25
 	env.set("tonemap_agx_white", 10.0)
 	env.set("tonemap_agx_contrast", 1.35)
 
@@ -78,7 +78,7 @@ func _build_environment() -> void:
 
 	# light atmospheric haze + god rays (volumetric) and aerial depth fog
 	env.volumetric_fog_enabled = true
-	env.volumetric_fog_density = 0.022
+	env.volumetric_fog_density = 0.009
 	env.volumetric_fog_albedo = Color(0.9, 0.85, 0.8)
 	env.set("volumetric_fog_anisotropy", 0.7)
 	env.set("volumetric_fog_gi_inject", 1.0)
@@ -86,7 +86,7 @@ func _build_environment() -> void:
 
 	env.fog_enabled = true
 	env.fog_mode = Environment.FOG_MODE_DEPTH
-	env.fog_density = 0.006
+	env.fog_density = 0.003
 	env.fog_aerial_perspective = 0.4
 	env.set("fog_sun_scatter", 0.3)
 	env.fog_sky_affect = 0.5
@@ -170,7 +170,7 @@ func _apply(t: float) -> void:
 	_env.volumetric_fog_albedo = (p.hor as Color).lerp(Color(0.9, 0.9, 0.95), 0.5)
 
 	# never let ambient crush to pure black at night
-	_env.ambient_light_energy = lerp(0.18, 1.15, day)
+	_env.ambient_light_energy = lerp(0.3, 1.5, day)
 	_env.ambient_light_color = (p.top as Color)
 
 func get_sun() -> DirectionalLight3D: return _sun

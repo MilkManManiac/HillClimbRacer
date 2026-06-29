@@ -6,11 +6,11 @@ extends Node3D
 
 const SNOW_SHADER := preload("res://shaders/terrain_snow.gdshader")
 
-@export var center := Vector3(0, 0, -155)   ## grid center
+@export var center := Vector3(0, 0, 0)       ## course is centered on origin
 @export var flat_radius: float = 380.0       ## no terrain inside this radius
 
 func _ready() -> void:
-	_build_hills()
+	# the road course now carries the near hills; keep only the distant mountain ring
 	_build_mountains()
 
 # --- rolling hills (near ring) -----------------------------------------------

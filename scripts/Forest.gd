@@ -1,24 +1,37 @@
 extends Node3D
-## A dense, tall, eerie pine forest that walls in the road. Real CC0 conifer GLB meshes
-## (Quaternius, public domain) instanced via chunked MultiMesh for culling, packed in
-## bands along every road so you can't see or drive through them. Invisible collision
-## walls behind the front trunk row stop the car. Low ground scatter blocks sightlines.
+## Dense, tall, eerie pine forest lining the curved RoadCourse. Real CC0 conifer GLBs
+## (Quaternius, public domain) instanced via chunked MultiMesh, planted in several rows
+## down both sides of the road curve (following its hills), with continuous invisible
+## collision walls so you can't drive into the woods.
 
 const PINES := [
-	{"path": "res://assets/trees/pine_quaternius_cc0.glb", "scale": 1.9},
-	{"path": "res://assets/trees/pine_tall_quaternius_cc0.glb", "scale": 2.2},
+	{"path": "res://assets/trees/pine_quaternius_cc0.glb", "scale": 1.7},
+	{"path": "res://assets/trees/pine_tall_quaternius_cc0.glb", "scale": 2.0},
 ]
-const CELL := 70.0          # chunk size for per-cell MultiMesh culling
+const GlbUtil := preload("res://scripts/GlbUtil.gd")
+const CELL := 70.0
+const ROCK_GLB := "res://assets/rocks/rock_quaternius_large_cc0.glb"
+const ROCK_SCALE := 22.0
 
+@export var course_curve: Curve3D
 @export var road_width: float = 9.0
-@export var xs: Array[float] = [-130.0, 0.0, 130.0]
-@export var zs: Array[float] = [40.0, -90.0, -220.0, -350.0]
-@export var border: float = 150.0
 
 var _meshes: Array[Mesh] = []
 var _rng := RandomNumberGenerator.new()
-var _cells := {}            # Vector2i -> Array (one Array[Transform3D] per pine mesh)
-var _bush := {"x": [], "wall": []}   # bush transforms; (wall reuses nothing)
+var _cells := {}
+var _bush_x: Array[Transform3D] = []
+var _rock_x: Array[Transform3D] = []
+
+# tree rows by distance from the road centerline (each side), with spawn chance
+const ROWS := [
+	{"dist": 14.0, "chance": 0.95},
+	{"dist": 18.5, "chance": 0.9},
+	{"dist": 23.5, "chance": 0.85},
+	{"dist": 29.5, "chance": 0.7},
+	{"dist": 37.0, "chance": 0.55},
+	{"dist": 46.0, "chance": 0.4},
+	{"dist": 57.0, "chance": 0.28},
+]
 
 func _ready() -> void:
 	_rng.seed = 70707
@@ -27,16 +40,99 @@ func _ready() -> void:
 		if m:
 			_meshes.append(m)
 	if _meshes.is_empty():
-		_meshes.append(_fallback_pine())     # never leave the world bare
-	_scatter_fill()
-	_line_roads()
+		_meshes.append(_fallback_pine())
+	if course_curve:
+		_line_curve()
 	_bake_cells()
 	_build_floor()
+	_build_rocks()
+
+# --- placement along the curve -----------------------------------------------
+
+func _line_curve() -> void:
+	var length := course_curve.get_baked_length()
+	var d := 0.0
+	while d < length:
+		var xf := course_curve.sample_baked_with_rotation(d, true, true)
+		var right := xf.basis.x
+		var base := xf.origin + xf.basis.y * -0.6   # sit on the ground skirt
+		for side: float in [-1.0, 1.0]:
+			for row in ROWS:
+				if _rng.randf() > float(row.chance):
+					continue
+				var off: float = float(row.dist) + _rng.randf_range(-1.5, 1.5)
+				var along: float = _rng.randf_range(-1.2, 1.2)
+				var pos: Vector3 = base + right * (off * side) + (-xf.basis.z) * along
+				_add_pine(pos)
+			# front bush to block the ground-level gap (just past the collision wall)
+			if _rng.randf() < 0.5:
+				_bush_x.append(Transform3D(_bush_basis(), base + right * (10.5 * side)))
+			# occasional roadside boulder
+			if _rng.randf() < 0.08:
+				var rs: float = ROCK_SCALE * _rng.randf_range(0.6, 1.5)
+				var rb := Basis(Vector3.UP, _rng.randf() * TAU).scaled(Vector3(rs, rs * _rng.randf_range(0.7, 1.1), rs))
+				_rock_x.append(Transform3D(rb, base + right * (_rng.randf_range(11.0, 17.0) * side)))
+		# collision wall rings (built into a ribbon after the loop)
+		_wall_l.append(base + right * -8.0)
+		_wall_r.append(base + right * 8.0)
+		d += 2.5
+	_build_wall(_wall_l)
+	_build_wall(_wall_r)
+
+var _wall_l: Array[Vector3] = []
+var _wall_r: Array[Vector3] = []
+
+func _bush_basis() -> Basis:
+	var s := _rng.randf_range(0.8, 1.8)
+	return Basis(Vector3.UP, _rng.randf() * TAU).scaled(Vector3(s, s * 0.7, s))
+
+func _bucket(pos: Vector3, mesh_idx: int) -> void:
+	var s: float = float(PINES[mesh_idx].scale) if mesh_idx < PINES.size() else 2.0
+	s *= _rng.randf_range(0.8, 1.25)
+	var b := Basis(Vector3.UP, _rng.randf() * TAU)
+	var lean := Vector3(_rng.randf() * 2.0 - 1.0, 0.0, _rng.randf() * 2.0 - 1.0).normalized()
+	b = b.rotated(lean, deg_to_rad(_rng.randf_range(0.0, 3.0)))
+	b = b.scaled(Vector3(s, s * _rng.randf_range(0.9, 1.25), s))
+	var xform := Transform3D(b, pos)
+	var key := Vector2i(int(floor(pos.x / CELL)), int(floor(pos.z / CELL)))
+	if not _cells.has(key):
+		var lists: Array = []
+		for _i in range(_meshes.size()):
+			lists.append([] as Array)
+		_cells[key] = lists
+	_cells[key][mesh_idx].append(xform)
+
+func _add_pine(pos: Vector3) -> void:
+	_bucket(pos, _rng.randi() % _meshes.size())
+
+# --- collision wall ribbon (vertical, follows the curve) ---------------------
+
+func _build_wall(pts: Array[Vector3]) -> void:
+	if pts.size() < 2:
+		return
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	for p in pts:
+		st.add_vertex(p + Vector3(0, -1.0, 0))
+		st.add_vertex(p + Vector3(0, 22.0, 0))
+	for r in range(pts.size() - 1):
+		var a := r * 2
+		var b := r * 2 + 1
+		var c := (r + 1) * 2
+		var dvv := (r + 1) * 2 + 1
+		st.add_index(a); st.add_index(c); st.add_index(b)
+		st.add_index(b); st.add_index(c); st.add_index(dvv)
+	var mesh := st.commit()
+	var mi := MeshInstance3D.new()
+	mi.mesh = mesh
+	mi.visible = false
+	add_child(mi)
+	mi.create_trimesh_collision()
 
 # --- GLB loading -------------------------------------------------------------
 
 func _load_pine(path: String) -> Mesh:
-	if not ResourceLoader.exists(path) and not FileAccess.file_exists(path):
+	if not FileAccess.file_exists(path):
 		return null
 	var doc := GLTFDocument.new()
 	var state := GLTFState.new()
@@ -93,7 +189,6 @@ func _xform_to_root(node: Node3D, root: Node) -> Transform3D:
 	return t
 
 func _fallback_pine() -> Mesh:
-	# crude tall conifer if the GLBs are missing: trunk + stacked cones
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var trunk := CylinderMesh.new()
@@ -117,117 +212,6 @@ func _fallback_pine() -> Mesh:
 	m.surface_set_material(0, mat)
 	return m
 
-# --- placement ---------------------------------------------------------------
-
-func _bucket(pos: Vector3, mesh_idx: int) -> void:
-	var s: float = float(PINES[mesh_idx].scale) if mesh_idx < PINES.size() else 2.5
-	s *= _rng.randf_range(0.8, 1.25)
-	var b := Basis(Vector3.UP, _rng.randf() * TAU)
-	# very slight lean for organic feel
-	var lean := Vector3(_rng.randf() * 2.0 - 1.0, 0.0, _rng.randf() * 2.0 - 1.0).normalized()
-	b = b.rotated(lean, deg_to_rad(_rng.randf_range(0.0, 3.0)))
-	b = b.scaled(Vector3(s, s * _rng.randf_range(0.9, 1.25), s))
-	var xform := Transform3D(b, pos)
-	var key := Vector2i(int(floor(pos.x / CELL)), int(floor(pos.z / CELL)))
-	if not _cells.has(key):
-		var lists: Array = []
-		for _i in range(_meshes.size()):
-			lists.append([] as Array)
-		_cells[key] = lists
-	_cells[key][mesh_idx].append(xform)
-
-func _add_pine(pos: Vector3) -> void:
-	_bucket(pos, _rng.randi() % _meshes.size())
-
-func _on_road(x: float, z: float, clearance: float) -> bool:
-	for rz in zs:
-		if abs(z - rz) < clearance and x > _amin(xs) - clearance and x < _amax(xs) + clearance:
-			return true
-	for rx in xs:
-		if abs(x - rx) < clearance and z > _amin(zs) - clearance and z < _amax(zs) + clearance:
-			return true
-	return false
-
-func _scatter_fill() -> void:
-	# the bulk forest filling everything that isn't road
-	var min_x: float = _amin(xs) - border
-	var max_x: float = _amax(xs) + border
-	var min_z: float = _amin(zs) - border
-	var max_z: float = _amax(zs) + border
-	var stepf := 9.5
-	var x := min_x
-	while x < max_x:
-		var z := min_z
-		while z < max_z:
-			var px := x + _rng.randf_range(-3.0, 3.0)
-			var pz := z + _rng.randf_range(-3.0, 3.0)
-			z += stepf
-			if _on_road(px, pz, road_width * 0.5 + 5.0):
-				continue
-			if _rng.randf() < 0.1:
-				continue
-			_add_pine(Vector3(px, 0, pz))
-		x += stepf
-
-func _line_roads() -> void:
-	for z in zs:
-		_line_leg(Vector3(_amin(xs), 0, z), Vector3(_amax(xs), 0, z))
-	for x in xs:
-		_line_leg(Vector3(x, 0, _amin(zs)), Vector3(x, 0, _amax(zs)))
-
-func _line_leg(a: Vector3, b: Vector3) -> void:
-	var length: float = a.distance_to(b)
-	var dir: Vector3 = (b - a).normalized()
-	var perp: Vector3 = dir.cross(Vector3.UP).normalized()
-	# how close a tree may get to ANY road centerline before it's rejected (keeps
-	# trunks off this road AND off crossing roads at intersections)
-	var guard: float = road_width * 0.5 + 1.5
-	var inset := road_width
-	var d := inset
-	while d < length - inset:
-		var p: Vector3 = a + dir * d
-		for side: float in [-1.0, 1.0]:
-			for off: float in [3.5, 6.0]:
-				var jp: Vector3 = p + perp * (road_width * 0.5 + off) * side
-				jp += dir * _rng.randf_range(-1.0, 1.0)
-				if not _on_road(jp.x, jp.z, guard):
-					_add_pine(Vector3(jp.x, 0, jp.z))
-			# ground-level bush at the front to block sightlines under trunks
-			var bp: Vector3 = p + perp * (road_width * 0.5 + 2.5) * side
-			if _rng.randf() < 0.5 and not _on_road(bp.x, bp.z, guard):
-				_bush.x.append(bp)
-		d += 2.4
-	# invisible collision walls behind the front row — built in short segments so
-	# they can break at intersections (no wall across a crossing road)
-	for side: float in [-1.0, 1.0]:
-		var seg := inset
-		while seg < length - inset - 8.0:
-			var s0: Vector3 = a + dir * seg
-			var s1: Vector3 = a + dir * (seg + 9.0)
-			var midp: Vector3 = (s0 + s1) * 0.5 + perp * (road_width * 0.5 + 3.5) * side
-			if not _on_road(midp.x, midp.z, road_width * 0.5 + 4.0):
-				_make_wall(s0, s1, perp * side, road_width * 0.5 + 3.5)
-			seg += 9.0
-
-func _make_wall(a: Vector3, b: Vector3, side: Vector3, offset: float) -> void:
-	var length: float = a.distance_to(b)
-	if length < 4.0:
-		return
-	var mid: Vector3 = (a + b) * 0.5 + side * offset
-	var dir: Vector3 = (b - a).normalized()
-	var body := StaticBody3D.new()
-	var cs := CollisionShape3D.new()
-	var box := BoxShape3D.new()
-	box.size = Vector3(length, 22.0, 1.0)
-	cs.shape = box
-	body.add_child(cs)
-	var basis := Basis()
-	basis.x = dir
-	basis.y = Vector3.UP
-	basis.z = dir.cross(Vector3.UP).normalized()
-	body.transform = Transform3D(basis, mid + Vector3(0, 11.0, 0))
-	add_child(body)
-
 # --- bake --------------------------------------------------------------------
 
 func _bake_cells() -> void:
@@ -250,7 +234,7 @@ func _bake_cells() -> void:
 			add_child(mmi)
 
 func _build_floor() -> void:
-	if _bush.x.is_empty():
+	if _bush_x.is_empty():
 		return
 	var bush := SphereMesh.new()
 	bush.radius = 0.9
@@ -264,26 +248,27 @@ func _build_floor() -> void:
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
 	mm.mesh = bush
-	mm.instance_count = _bush.x.size()
-	for i in range(_bush.x.size()):
-		var s := _rng.randf_range(0.8, 1.8)
-		var b := Basis(Vector3.UP, _rng.randf() * TAU).scaled(Vector3(s, s * 0.7, s))
-		mm.set_instance_transform(i, Transform3D(b, _bush.x[i] + Vector3(0, 0.4, 0)))
+	mm.instance_count = _bush_x.size()
+	for i in range(_bush_x.size()):
+		mm.set_instance_transform(i, _bush_x[i])
 	var mmi := MultiMeshInstance3D.new()
 	mmi.multimesh = mm
 	mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(mmi)
 
-# --- helpers -----------------------------------------------------------------
-
-func _amin(arr: Array[float]) -> float:
-	var v: float = arr[0]
-	for x in arr:
-		v = min(v, x)
-	return v
-
-func _amax(arr: Array[float]) -> float:
-	var v: float = arr[0]
-	for x in arr:
-		v = max(v, x)
-	return v
+func _build_rocks() -> void:
+	if _rock_x.is_empty():
+		return
+	var rock_mesh := GlbUtil.load_mesh(ROCK_GLB)
+	if rock_mesh == null:
+		return
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.mesh = rock_mesh
+	mm.instance_count = _rock_x.size()
+	for i in range(_rock_x.size()):
+		mm.set_instance_transform(i, _rock_x[i])
+	var mmi := MultiMeshInstance3D.new()
+	mmi.multimesh = mm
+	mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(mmi)

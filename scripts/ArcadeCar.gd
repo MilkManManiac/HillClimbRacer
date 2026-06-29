@@ -10,7 +10,10 @@ extends RigidBody3D
 @export var max_speed: float = 34.0      ## m/s (~122 km/h)
 @export var reverse_speed: float = 11.0
 @export var grip: float = 9.0            ## how hard lateral velocity is killed
-@export var turn_speed: float = 2.3      ## rad/s yaw at full lock (low speed)
+@export var wheelbase: float = 2.8       ## front-to-rear axle (turn geometry)
+@export var max_steer_angle: float = 0.6 ## rad at full lock (low speed)
+@export var high_speed_steer: float = 0.45 ## fraction of steer removed at top speed
+@export var max_yaw_rate: float = 1.7    ## rad/s cap so fast turns stay stable
 @export var gravity_force: float = 32.0  ## strong gravity = planted, not floaty
 # --- automatic gearbox (slow, gradual build to top speed) --------------------
 @export var engine_power: float = 5200.0 ## drive force (N) at full torque in 1st gear
@@ -24,6 +27,12 @@ extends RigidBody3D
 @export var steer_smooth: float = 9.0
 @export var base_fov: float = 74.0
 @export var max_fov: float = 90.0
+# CC0 exterior body (Kenney Car Kit, public domain). Tunable so it lines up nicely.
+const GlbUtil := preload("res://scripts/GlbUtil.gd")
+const CAR_GLB := "res://assets/car/kenney_sedan_cc0.glb"
+@export var car_scale: float = 1.7
+@export var car_offset: Vector3 = Vector3(0, 0.05, 0)
+@export var car_yaw_deg: float = 0.0
 
 # mouse-look
 var _yaw: float = 0.0
@@ -125,11 +134,21 @@ func _physics_process(delta: float) -> void:
 		var lateral := right.dot(vel)
 		apply_central_force(-right * lateral * grip * mass)
 
-		# steering: set yaw rate directly, less authority at speed
-		if absf(fwd_speed) > 0.4:
-			var k: float = clamp(speed / max_speed, 0.0, 1.0)
-			var steer_amt: float = turn_speed * (1.0 - k * 0.5)
-			angular_velocity.y = _steer * steer_amt * signf(fwd_speed)
+		# steering: bicycle model -> yaw rate scales with SPEED (natural feel; the car
+		# can't pivot in place, and turn radius = wheelbase / tan(steer) is constant for
+		# a given steer input). Steering authority eases off as speed rises for stability.
+		var k: float = clamp(absf(fwd_speed) / max_speed, 0.0, 1.0)
+		var steer_angle: float = _steer * max_steer_angle * (1.0 - k * high_speed_steer)
+		# visually turn the front wheels
+		if _wheel_meshes.size() >= 2:
+			_wheel_meshes[0].rotation.y = steer_angle
+			_wheel_meshes[1].rotation.y = steer_angle
+		if absf(fwd_speed) > 0.3:
+			var yaw_rate: float = (fwd_speed / wheelbase) * tan(steer_angle)
+			yaw_rate = clamp(yaw_rate, -max_yaw_rate, max_yaw_rate)
+			angular_velocity.y = yaw_rate
+		else:
+			angular_velocity.y = lerpf(angular_velocity.y, 0.0, 0.25)
 
 	# --- visual lean (Tilt node only — physics body stays stable) ----------
 	var fwd_accel: float = (fwd_speed - _prev_fwd_speed) / maxf(delta, 0.0001)
@@ -210,6 +229,18 @@ func _build_tilt_and_cabin() -> void:
 	_tilt.add_child(_cabin)
 	_build_interior(_cabin)
 
+func _build_car_body(c: Node3D) -> void:
+	var body := GlbUtil.load_scene(CAR_GLB)
+	if body == null:
+		return                                  # keep procedural look if asset missing
+	body.scale = Vector3.ONE * car_scale
+	body.rotation_degrees = Vector3(0, car_yaw_deg, 0)
+	body.position = car_offset
+	c.add_child(body)
+	# the GLB car has its own wheels; hide our raycast wheel cylinders
+	for w in _wheel_meshes:
+		w.visible = false
+
 # --- interior (placeholder primitives; Cockpit.gd adds interactivity) --------
 
 func _add_box(parent: Node3D, size: Vector3, color: Color, pos: Vector3, rot := Vector3.ZERO) -> MeshInstance3D:
@@ -237,10 +268,10 @@ func _emissive(color: Color, energy: float) -> StandardMaterial3D:
 func _build_interior(c: Node3D) -> void:
 	var dark := Color(0.05, 0.05, 0.06)
 	var darker := Color(0.03, 0.03, 0.035)
-	# exterior shell
-	_add_box(c, Vector3(2.0, 0.5, 4.3), Color(0.06, 0.05, 0.07), Vector3(0, 0.55, 0))
-	_add_box(c, Vector3(1.85, 0.35, 1.5), Color(0.07, 0.06, 0.07), Vector3(0, 0.95, -1.55))
-	_add_box(c, Vector3(1.85, 0.08, 2.6), dark, Vector3(0, 1.92, 0.45))
+	# exterior shell + lower hood (out of sightline) + roof
+	_add_box(c, Vector3(2.0, 0.5, 4.3), Color(0.10, 0.09, 0.11), Vector3(0, 0.55, 0))
+	_add_box(c, Vector3(1.7, 0.18, 1.3), Color(0.11, 0.10, 0.11), Vector3(0, 0.82, -1.75))
+	_add_box(c, Vector3(1.85, 0.08, 2.6), Color(0.10, 0.10, 0.11), Vector3(0, 1.95, 0.55))
 	# dashboard
 	_add_box(c, Vector3(1.85, 0.34, 0.4), dark, Vector3(0, 1.12, -1.05))
 	_add_box(c, Vector3(0.5, 0.16, 0.3), Color(0.02, 0.02, 0.02), Vector3(-0.45, 1.28, -0.95))
@@ -275,10 +306,10 @@ func _build_interior(c: Node3D) -> void:
 		c.add_child(rim)
 		dash_materials.append(dm)
 
-	# head pivot + camera (front-left seat)
+	# head pivot + camera (front-left seat) — sit forward/up for a clear road view
 	_head = Node3D.new()
 	_head.name = "Head"
-	_head.position = Vector3(-0.4, 1.5, -0.15)
+	_head.position = Vector3(-0.4, 1.58, -0.55)
 	c.add_child(_head)
 	_cam = Camera3D.new()
 	_cam.name = "Camera"
@@ -286,6 +317,14 @@ func _build_interior(c: Node3D) -> void:
 	_cam.fov = base_fov
 	_cam.current = true
 	_head.add_child(_cam)
+
+	# faint always-on cabin fill so the interior isn't pure black in daylight
+	var fill := OmniLight3D.new()
+	fill.position = Vector3(-0.1, 1.7, -0.3)
+	fill.light_energy = 0.35
+	fill.light_color = Color(0.7, 0.75, 0.85)
+	fill.omni_range = 2.6
+	c.add_child(fill)
 
 	# interior dome light (off by default)
 	dome_light = OmniLight3D.new()
