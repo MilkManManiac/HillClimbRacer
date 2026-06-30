@@ -20,7 +20,8 @@ const CAR_GLB := "res://assets/car/kenney_sedan_cc0.glb"
 @export var max_steer_angle: float = 0.4   # smaller = gentler turns
 @export var steer_rate: float = 3.0        # lower = slower steering response
 @export var gravity_force: float = 17.0    # lower = floatier, more hang time
-@export var suspension_rest: float = 0.55
+@export var suspension_rest: float = 0.55   # ride height (raised by Bigger Wheels)
+@export var wheel_radius: float = 0.5        # visual wheel size + bump reach
 @export var suspension_stiff: float = 95.0
 @export var suspension_damp: float = 6.0
 @export var dive_force: float = 26.0       # downward push when diving
@@ -43,6 +44,8 @@ var _trick_timer: float = 0.0
 var terrain: Node3D   # set by HCMain; used to catch ground tunneling
 
 var _rays: Array[RayCast3D] = []
+var _wheel_meshes: Array[MeshInstance3D] = []
+var _wheel_positions: Array[Vector3] = []
 var _grounded: bool = false
 var _steer: float = 0.0
 var _air_time: float = 0.0
@@ -248,14 +251,40 @@ func _build_collision() -> void:
 func _build_rays() -> void:
 	var fx := 0.9
 	var fz := 1.4
-	for pos in [Vector3(-fx, 0.5, -fz), Vector3(fx, 0.5, -fz), Vector3(-fx, 0.5, fz), Vector3(fx, 0.5, fz)]:
+	_wheel_positions = [Vector3(-fx, 0.5, -fz), Vector3(fx, 0.5, -fz), Vector3(-fx, 0.5, fz), Vector3(fx, 0.5, fz)]
+	for pos in _wheel_positions:
 		var ray := RayCast3D.new()
 		ray.position = pos
-		ray.target_position = Vector3(0, -(suspension_rest + 0.45), 0)
 		ray.collision_mask = 1
 		ray.add_exception(self)
 		add_child(ray)
 		_rays.append(ray)
+		# visible wheel (sized by the Bigger Wheels upgrade)
+		var wm := MeshInstance3D.new()
+		var cyl := CylinderMesh.new()
+		cyl.height = 0.34
+		wm.mesh = cyl
+		var m := StandardMaterial3D.new()
+		m.albedo_color = Color(0.05, 0.05, 0.06)
+		m.roughness = 0.9
+		wm.material_override = m
+		wm.rotation_degrees = Vector3(0, 0, 90)   # axle along X
+		add_child(wm)
+		_wheel_meshes.append(wm)
+	apply_wheel_size()
+
+## Update ray reach + wheel meshes after a ride-height / wheel-size change.
+func apply_wheel_size() -> void:
+	for ray in _rays:
+		ray.target_position = Vector3(0, -(suspension_rest + wheel_radius + 0.35), 0)
+	for i in range(_wheel_meshes.size()):
+		var wm := _wheel_meshes[i]
+		var cyl: CylinderMesh = wm.mesh
+		cyl.top_radius = wheel_radius
+		cyl.bottom_radius = wheel_radius
+		var base: Vector3 = _wheel_positions[i]
+		# bottom of wheel sits at the rest ground level (local y = 0.5 - suspension_rest)
+		wm.position = Vector3(base.x, 0.5 - suspension_rest + wheel_radius, base.z)
 
 func _build_body() -> void:
 	var body := GlbUtil.load_scene(CAR_GLB)
@@ -264,6 +293,7 @@ func _build_body() -> void:
 		body.position = Vector3(0, 0.1, 0)
 		body.rotation.y = PI   # face -Z (travel direction); model was leading rear-first
 		add_child(body)
+		_hide_glb_wheels(body)   # we draw our own (sizeable) wheels instead
 	else:
 		# fallback box car
 		var mi := MeshInstance3D.new()
@@ -275,3 +305,10 @@ func _build_body() -> void:
 		mi.material_override = m
 		mi.position = Vector3(0, 0.7, 0)
 		add_child(mi)
+
+func _hide_glb_wheels(node: Node) -> void:
+	if str(node.name).to_lower().contains("wheel") and node is Node3D:
+		(node as Node3D).visible = false
+		return
+	for c in node.get_children():
+		_hide_glb_wheels(c)

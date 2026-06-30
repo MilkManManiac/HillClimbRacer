@@ -22,12 +22,12 @@ var _score_lbl: Label
 var _trick_lbl: Label
 
 # --- economy / upgrades ------------------------------------------------------
-const UP_KEYS := ["engine", "fuel", "suspension", "grip", "air"]
-const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "suspension": "Suspension", "grip": "Grip", "air": "Air Control"}
-const UP_BASECOST := {"engine": 160, "fuel": 130, "suspension": 150, "grip": 120, "air": 140}
+const UP_KEYS := ["engine", "fuel", "suspension", "wheels", "grip", "air"]
+const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "suspension": "Suspension", "wheels": "Bigger Wheels", "grip": "Grip", "air": "Air Control"}
+const UP_BASECOST := {"engine": 160, "fuel": 130, "suspension": 150, "wheels": 170, "grip": 120, "air": 140}
 const UP_MAX := 6
 var money: int = 0
-var _levels := {"engine": 0, "fuel": 0, "suspension": 0, "grip": 0, "air": 0}
+var _levels := {"engine": 0, "fuel": 0, "suspension": 0, "wheels": 0, "grip": 0, "air": 0}
 var _was_dead := false
 var _shop: Control
 var _shop_header: Label
@@ -140,8 +140,13 @@ func _apply_upgrades() -> void:
 	_car.set("engine_force", 19000.0 + _levels.engine * 3500.0)
 	_car.set("max_speed", 125.0 + _levels.engine * 7.0)
 	_car.set("max_fuel", 600.0 + _levels.fuel * 240.0)
-	_car.set("land_damage_speed", 12.0 + _levels.suspension * 5.0)
+	_car.set("land_damage_speed", 12.0 + _levels.suspension * 5.0 + _levels.wheels * 2.0)
 	_car.set("grip", 8.5 + _levels.grip * 0.9)
+	# Bigger Wheels: more ride height + larger wheels (clearance over bumps)
+	_car.set("suspension_rest", 0.55 + _levels.wheels * 0.18)
+	_car.set("wheel_radius", 0.5 + _levels.wheels * 0.12)
+	if _car.has_method("apply_wheel_size"):
+		_car.call("apply_wheel_size")
 	_car.set("air_pitch_torque", 11.0 + _levels.air * 2.0)
 	_car.set("air_roll_torque", 9.0 + _levels.air * 1.6)
 	_car.set("air_yaw_torque", 6.0 + _levels.air * 1.2)
