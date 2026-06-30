@@ -11,13 +11,13 @@ const GlbUtil := preload("res://scripts/GlbUtil.gd")
 const CAR_GLB := "res://assets/car/kenney_sedan_cc0.glb"
 
 # --- tunables ---
-@export var engine_force: float = 4200.0
-@export var max_speed: float = 45.0
-@export var brake_force: float = 5000.0
-@export var grip: float = 8.0
+@export var engine_force: float = 10000.0
+@export var max_speed: float = 75.0
+@export var brake_force: float = 5500.0
+@export var grip: float = 8.5
 @export var wheelbase: float = 2.8
 @export var max_steer_angle: float = 0.55
-@export var gravity_force: float = 30.0
+@export var gravity_force: float = 24.0
 @export var suspension_rest: float = 0.55
 @export var suspension_stiff: float = 130.0
 @export var suspension_damp: float = 9.0
@@ -25,7 +25,7 @@ const CAR_GLB := "res://assets/car/kenney_sedan_cc0.glb"
 @export var air_pitch_torque: float = 11.0
 @export var air_roll_torque: float = 9.0
 @export var air_yaw_torque: float = 6.0
-@export var max_fuel: float = 100.0
+@export var max_fuel: float = 600.0   # generous for the feel/air sandbox (tune later)
 @export var max_health: float = 100.0
 @export var land_damage_speed: float = 12.0  # vertical impact speed before damage starts
 
@@ -98,7 +98,7 @@ func _physics_process(delta: float) -> void:
 		# drive / brake (fuel-gated)
 		if fuel > 0.0 and throttle > 0.01 and fwd_speed < max_speed:
 			apply_central_force(fwd * throttle * engine_force)
-			fuel -= delta * (2.0 + throttle * 6.0)
+			fuel -= delta * (0.8 + throttle * 2.2)
 		elif braking > 0.01:
 			if fwd_speed > 0.5:
 				apply_central_force(-fwd * brake_force * braking)
@@ -106,7 +106,7 @@ func _physics_process(delta: float) -> void:
 				apply_central_force(fwd * -braking * engine_force * 0.4)
 		else:
 			apply_central_force(-fwd * fwd_speed * 0.5 * mass * 0.02)
-		fuel -= delta * 0.4   # idle burn
+		fuel -= delta * 0.2   # idle burn
 		# grip: kill sideways slide
 		apply_central_force(-right * right.dot(vel) * grip * mass)
 		# steering (bicycle model)
@@ -199,6 +199,7 @@ func _build_body() -> void:
 	if body:
 		body.scale = Vector3.ONE * 1.7
 		body.position = Vector3(0, 0.1, 0)
+		body.rotation.y = PI   # face -Z (travel direction); model was leading rear-first
 		add_child(body)
 	else:
 		# fallback box car

@@ -11,9 +11,9 @@ const LAT := 3            # chunks each side of centerline -> band width = (2*LA
 const AHEAD := 11         # chunks generated ahead (in -Z)
 const BEHIND := 3         # chunks kept behind
 
-@export var base_amp: float = 2.5     # gentle near the start
-@export var max_amp: float = 34.0     # mountainous far out
-@export var ramp_dist: float = 1600.0 # distance over which amplitude ramps up
+@export var base_amp: float = 3.0     # gentle near the start
+@export var max_amp: float = 48.0     # tall but broad/climbable launch ramps far out
+@export var ramp_dist: float = 500.0  # ramps up sooner so air gets fun fast
 
 var _noise := FastNoiseLite.new()
 var _rough := FastNoiseLite.new()
@@ -26,8 +26,8 @@ func _ready() -> void:
 	_noise.seed = 1234
 	_noise.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
 	_noise.fractal_type = FastNoiseLite.FRACTAL_FBM
-	_noise.frequency = 0.010
-	_noise.fractal_octaves = 4
+	_noise.frequency = 0.006
+	_noise.fractal_octaves = 3
 	_rough.seed = 99
 	_rough.noise_type = FastNoiseLite.TYPE_SIMPLEX
 	_rough.frequency = 0.05
@@ -42,7 +42,7 @@ func height_at(x: float, z: float) -> float:
 	var d: float = maxf(0.0, -z)
 	var amp: float = lerpf(base_amp, max_amp, clamp(d / ramp_dist, 0.0, 1.0))
 	var n: float = _noise.get_noise_2d(x, z)            # -1..1, broad rolling hills
-	var r: float = _rough.get_noise_2d(x, z) * 0.25     # finer chop, scaled in far out
+	var r: float = _rough.get_noise_2d(x, z) * 0.12     # gentle chop so ramps stay smooth
 	var rough_mix: float = clamp(d / ramp_dist, 0.0, 1.0)
 	return (n + r * rough_mix) * amp
 

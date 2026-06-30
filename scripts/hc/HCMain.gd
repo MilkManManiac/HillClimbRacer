@@ -127,8 +127,10 @@ func _update_hud() -> void:
 	var fuel: float = _car.get("fuel")
 	var health: float = _car.get("health")
 	var dist: float = _car.get("distance")
-	_fuel_bar.size.x = 220.0 * clamp(fuel / 100.0, 0.0, 1.0)
-	_health_bar.size.x = 220.0 * clamp(health / 100.0, 0.0, 1.0)
+	var maxfuel: float = _car.get("max_fuel")
+	var maxhp: float = _car.get("max_health")
+	_fuel_bar.size.x = 220.0 * clamp(fuel / maxf(maxfuel, 1.0), 0.0, 1.0)
+	_health_bar.size.x = 220.0 * clamp(health / maxf(maxhp, 1.0), 0.0, 1.0)
 	var air: String = "  ✈ AIR" if _car.get("airborne") else ""
 	_info.text = "%d m    %d km/h%s" % [int(dist), int(_car.call("get_speed_kmh")), air]
 	if _car.get("dead"):
