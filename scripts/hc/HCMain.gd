@@ -22,14 +22,17 @@ var _score_lbl: Label
 var _trick_lbl: Label
 
 # --- economy / upgrades ------------------------------------------------------
-const UP_KEYS := ["engine", "fuel", "suspension", "wheels", "wings", "ailerons", "dive", "rockets"]
-const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "suspension": "Suspension", "wheels": "Bigger Wheels", "wings": "Wings", "ailerons": "Ailerons", "dive": "Dive Power", "rockets": "Rockets"}
-const UP_BASECOST := {"engine": 160, "fuel": 130, "suspension": 150, "wheels": 170, "wings": 150, "ailerons": 140, "dive": 130, "rockets": 180}
+const UP_KEYS := ["engine", "fuel", "suspension", "wheels", "wings", "ailerons", "dive", "rockets", "stretch", "wide", "sidecar", "antigrav"]
+const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "suspension": "Suspension", "wheels": "Bigger Wheels", "wings": "Wings", "ailerons": "Ailerons", "dive": "Dive Power", "rockets": "Rockets", "stretch": "Stretch (Limo)", "wide": "Wide Stance", "sidecar": "Sidecar", "antigrav": "Anti-Grav"}
+const UP_BASECOST := {"engine": 160, "fuel": 130, "suspension": 150, "wheels": 170, "wings": 150, "ailerons": 140, "dive": 130, "rockets": 180, "stretch": 200, "wide": 190, "sidecar": 220, "antigrav": 210}
 const UP_MAX := 6
 var money: int = 0
-var _levels := {"engine": 0, "fuel": 0, "suspension": 0, "wheels": 0, "wings": 0, "ailerons": 0, "dive": 0, "rockets": 0}
+var _levels := {"engine": 0, "fuel": 0, "suspension": 0, "wheels": 0, "wings": 0, "ailerons": 0, "dive": 0, "rockets": 0, "stretch": 0, "wide": 0, "sidecar": 0, "antigrav": 0}
 var _was_dead := false
 var _respawning := false
+var _shake := 0.0           # camera shake magnitude (decays)
+var _shake_off := Vector3.ZERO
+var _fov_punch := 0.0       # transient FOV kick on hard landings
 var _shop: Control
 var _shop_header: Label
 var _shop_money: Label
@@ -71,6 +74,7 @@ func _setup_terrain_and_car() -> void:
 	_car.global_position = _start
 	_terrain.call("set_target", _car)
 	_car.connect("gap_failed", _on_car_gap_failed)
+	_car.connect("landed", _on_car_landed)
 
 func _setup_camera() -> void:
 	_cam = Camera3D.new()
@@ -98,6 +102,8 @@ func _process(delta: float) -> void:
 		_show_shop()
 
 func _update_camera(delta: float) -> void:
+	# remove last frame's shake offset so it doesn't accumulate into the smoothing
+	_cam.global_position -= _shake_off
 	# heading from horizontal velocity (stable during flips); fall back to last heading
 	var vel: Vector3 = _car.linear_velocity
 	var vh := Vector3(vel.x, 0, vel.z)
@@ -132,21 +138,38 @@ func _update_camera(delta: float) -> void:
 			up_ref = _cam_heading if _cam_heading.length() > 0.1 else Vector3.FORWARD
 		var t := _cam.global_transform.looking_at(look, up_ref)
 		_cam.global_transform.basis = _cam.global_transform.basis.slerp(t.basis, 1.0 - exp(-8.0 * delta))
-	# FOV widens with speed for a sense of pace
+	# FOV widens with speed (and harder while boosting) for a sense of pace
 	var spd: float = _car.linear_velocity.length()
+	var boosting: bool = bool(_car.get("boosting"))
 	var target_fov: float = lerpf(70.0, 92.0, clamp(spd / 42.0, 0.0, 1.0))
+	target_fov += (9.0 if boosting else 0.0) + _fov_punch
 	_cam.fov = lerpf(_cam.fov, target_fov, 1.0 - exp(-4.0 * delta))
+	_fov_punch *= exp(-7.0 * delta)
+	# rockets rumble the camera; landings (above) add a one-shot jolt. Apply + decay.
+	if boosting:
+		_shake = maxf(_shake, 0.11)
+	_shake_off = Vector3(randf_range(-1.0, 1.0), randf_range(-1.0, 1.0), randf_range(-1.0, 1.0)) * _shake
+	_cam.global_position += _shake_off
+	_shake *= exp(-7.0 * delta)
 
 func _restart() -> void:
 	_apply_upgrades()
 	_car.call("reset_run", _start)
 	_cam.global_position = _start + Vector3(0, 6, 12)
 	_cam_heading = Vector3(0, 0, -1)
+	_shake = 0.0
+	_shake_off = Vector3.ZERO
+	_fov_punch = 0.0
 	_was_dead = false
 	if _shop:
 		_shop.visible = false
 
 # --- gap wipeout: slow-mo plunge, then drop back at the last checkpoint -------
+
+## A landing kicks the camera: shake + a quick FOV punch, both scaled by impact.
+func _on_car_landed(impact: float, _air_time: float) -> void:
+	_shake = maxf(_shake, clampf(impact * 0.018, 0.0, 0.6))
+	_fov_punch = maxf(_fov_punch, clampf(impact * 0.5, 0.0, 12.0))
 
 func _on_car_gap_failed(can_respawn: bool) -> void:
 	if not can_respawn or _respawning:
@@ -201,6 +224,15 @@ func _apply_upgrades() -> void:
 	# Rockets: rear nozzles + boost thrust (hold Ctrl)
 	if _car.has_method("apply_rockets"):
 		_car.call("apply_rockets", _levels.rockets)
+	# Chassis conversions: Stretch (longer) + Wide (wider track)
+	if _car.has_method("apply_chassis"):
+		_car.call("apply_chassis", _levels.stretch, _levels.wide)
+	# Sidecar: a second car bolted on the side
+	if _car.has_method("apply_sidecar"):
+		_car.call("apply_sidecar", _levels.sidecar)
+	# Anti-grav: floaty moon-jump hang time
+	if _car.has_method("apply_antigrav"):
+		_car.call("apply_antigrav", _levels.antigrav)
 
 func _build_shop() -> void:
 	var layer := CanvasLayer.new()

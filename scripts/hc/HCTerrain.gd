@@ -22,9 +22,9 @@ const BEHIND := 3
 # --- gap / checkpoint schedule (jump the hole or fall in) --------------------
 @export var gap_start_dist: float = 300.0    # pure hills before this; first gap here
 @export var gap_spacing: float = 230.0       # distance between gap centers
-@export var gap_base_width: float = 13.0     # void width at the first gap
-@export var gap_grow: float = 2.5            # +void width per gap index
-@export var gap_max_width: float = 44.0
+@export var gap_base_width: float = 20.0     # void width at the first gap
+@export var gap_grow: float = 3.5            # +void width per gap index
+@export var gap_max_width: float = 64.0
 @export var ramp_len: float = 22.0           # launch-ramp run-up length (telegraph)
 @export var ramp_rise: float = 6.0           # how high the lip kicks the nose
 @export var land_len: float = 32.0           # flat landing platform past the void
@@ -74,14 +74,20 @@ func _gap_for_z(z: float) -> Dictionary:
 	var center_z: float = -center_d
 	var lip_z: float = center_z + void_w * 0.5
 	var far_z: float = center_z - void_w * 0.5
+	var ramp0: float = lip_z + ramp_len
+	# one shared "table" height for the whole gap so takeoff and landing match
+	# (no impossible taller-on-one-side peak). Sampled from the natural hills at
+	# the approach so it blends in smoothly.
+	var level: float = _terrain_height(0.0, ramp0)
 	return {
 		"idx": idx,
 		"void_w": void_w,
 		"center_z": center_z,
 		"lip_z": lip_z,
 		"far_z": far_z,
-		"ramp_z0": lip_z + ramp_len,
+		"ramp_z0": ramp0,
 		"land_z1": far_z - land_len,
+		"level": level,
 	}
 
 ## Final height: rolling hills, with gaps carved over the road (ramp -> void ->
@@ -97,13 +103,26 @@ func height_at(x: float, z: float) -> float:
 	var gy: float = base
 	var lip_z: float = g.lip_z
 	var far_z: float = g.far_z
-	if z <= g.ramp_z0 and z > lip_z:
-		var t: float = (g.ramp_z0 - z) / ramp_len          # 0 at ramp start, 1 at lip
-		gy = base + smoothstep(0.0, 1.0, t) * ramp_rise
+	var ramp0: float = g.ramp_z0
+	var land1: float = g.land_z1
+	var lvl: float = g.level
+	var blend := 16.0
+	if z > ramp0 and z <= ramp0 + blend:
+		# ease the natural hills up to the flat table level on approach
+		var f: float = (ramp0 + blend - z) / blend          # 0 -> 1 toward the ramp
+		gy = lerpf(base, lvl, smoothstep(0.0, 1.0, f))
+	elif z <= ramp0 and z > lip_z:
+		# launch ramp: rises ramp_rise ABOVE the table level (kick), then a clean lip
+		var t: float = (ramp0 - z) / ramp_len               # 0 at ramp start, 1 at lip
+		gy = lvl + smoothstep(0.0, 1.0, t) * ramp_rise
 	elif z <= lip_z and z >= far_z:
 		gy = pit_floor                                      # the void
-	elif z < far_z and z >= g.land_z1:
-		gy = 0.0                                            # flat landing platform
+	elif z < far_z and z >= land1:
+		gy = lvl                                            # landing == takeoff height
+	elif z < land1 and z >= land1 - blend:
+		# ease the landing platform back down to the natural hills
+		var f2: float = (z - (land1 - blend)) / blend       # 1 at platform -> 0 below
+		gy = lerpf(base, lvl, smoothstep(0.0, 1.0, f2))
 	return lerpf(base, gy, on_road)
 
 func _physics_process(_delta: float) -> void:
@@ -179,10 +198,30 @@ func _build_chunk(key: Vector2i) -> Node3D:
 	add_child(container)
 	return container
 
+# Biome palette [ground, road] cycling with distance so progress is visible.
+const BIOMES := [
+	[Color(0.28, 0.44, 0.20), Color(0.16, 0.16, 0.18)],   # meadow
+	[Color(0.76, 0.66, 0.42), Color(0.30, 0.25, 0.20)],   # desert
+	[Color(0.86, 0.88, 0.92), Color(0.30, 0.30, 0.34)],   # snow
+	[Color(0.27, 0.12, 0.10), Color(0.12, 0.10, 0.11)],   # volcanic
+]
+const BIOME_LEN := 280.0   # meters per biome before it crossfades to the next
+
+func _biome(z: float) -> Array:
+	var d: float = maxf(0.0, -z)
+	var phase: float = d / BIOME_LEN
+	var i: int = int(floor(phase)) % BIOMES.size()
+	var j: int = (i + 1) % BIOMES.size()
+	var f: float = smoothstep(0.7, 1.0, phase - floor(phase))   # hold, then quick crossfade
+	var a: Array = BIOMES[i]
+	var b: Array = BIOMES[j]
+	return [(a[0] as Color).lerp(b[0], f), (a[1] as Color).lerp(b[1], f)]
+
 func _color_for(x: float, _y: float, z: float) -> Color:
 	var ax := absf(x)
-	var asphalt := Color(0.16, 0.16, 0.18)
-	var grass := Color(0.28, 0.44, 0.20)
+	var pal := _biome(z)
+	var grass: Color = pal[0]
+	var asphalt: Color = pal[1]
 	var edge := smoothstep(road_half_width - 2.0, road_half_width + 2.0, ax)
 	# gap dressing: hazard stripes up the launch ramp, bright pad on the landing
 	var g := _gap_for_z(z)

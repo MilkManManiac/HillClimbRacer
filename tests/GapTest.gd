@@ -22,24 +22,27 @@ func _ready() -> void:
 	if g.is_empty():
 		print("[gap] FAIL: no gap at first center"); fails += 1
 	else:
-		var void_w: float = g.void_w
-		# void floor on the road
+		var lvl: float = g.level
+		# void floor sits well below the gap table level
 		var hy_void: float = t.call("height_at", 0.0, float(g.center_z))
-		if hy_void > -20.0:
-			print("[gap] FAIL: void not carved (h=%.1f, expected deep)" % hy_void); fails += 1
-		# ramp rises toward the lip
+		if hy_void > lvl - 20.0:
+			print("[gap] FAIL: void not carved (h=%.1f, level=%.1f)" % [hy_void, lvl]); fails += 1
+		# ramp rises above the table level toward the lip
 		var hy_ramp: float = t.call("height_at", 0.0, float(g.lip_z) + 2.0)
-		var hy_flat: float = t.call("height_at", 0.0, float(g.ramp_z0) + 6.0)
-		if hy_ramp <= hy_flat:
-			print("[gap] FAIL: ramp does not rise (ramp=%.1f flat=%.1f)" % [hy_ramp, hy_flat]); fails += 1
-		# landing platform is flat (~0) just past the far edge
-		var hy_land: float = t.call("height_at", 0.0, float(g.far_z) - 4.0)
-		if absf(hy_land) > 1.5:
-			print("[gap] FAIL: landing not flat (h=%.2f)" % hy_land); fails += 1
+		if hy_ramp <= lvl + 1.0:
+			print("[gap] FAIL: ramp does not kick up (ramp=%.1f level=%.1f)" % [hy_ramp, lvl]); fails += 1
+		# landing platform is flat at the table level just past the far edge
+		var hy_land: float = t.call("height_at", 0.0, float(g.far_z) - 6.0)
+		if absf(hy_land - lvl) > 1.5:
+			print("[gap] FAIL: landing not at table level (land=%.2f level=%.2f)" % [hy_land, lvl]); fails += 1
+		# THE KEY ONE: takeoff and landing must be at (nearly) the same height
+		var hy_takeoff: float = t.call("height_at", 0.0, float(g.ramp_z0) + 9.0)   # approach plateau
+		if absf(hy_takeoff - hy_land) > 2.5:
+			print("[gap] FAIL: takeoff/landing height mismatch (takeoff=%.2f land=%.2f)" % [hy_takeoff, hy_land]); fails += 1
 		# the SIDES (off road) must NOT be carved into the void
 		var side_x: float = t.get("road_half_width") + t.get("edge_falloff") + 8.0
 		var hy_side: float = t.call("height_at", side_x, float(g.center_z))
-		if hy_side < -20.0:
+		if hy_side < lvl - 20.0:
 			print("[gap] FAIL: void carved off-road (side h=%.1f)" % hy_side); fails += 1
 
 	# 3) ramp and landing of the same gap map to the same idx (the round() fix)
