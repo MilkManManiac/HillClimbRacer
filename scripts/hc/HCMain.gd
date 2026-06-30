@@ -73,7 +73,7 @@ const VEHICLES := {
 		"fuel_base": 100.0, "fuel_per": 110.0, "fuel_burn": 1.5,
 		# small starting wheels (wheel_rad) that grow a LOT per level (wheel_per),
 		# with ride height (susp) lifting to match so the truck towers when maxed.
-		"land_base": 17.0, "susp_rest": 0.85, "susp_per": 0.34, "wheel_rad": 0.5, "wheel_per": 0.38,
+		"land_base": 11.0, "susp_rest": 0.85, "susp_per": 0.34, "wheel_rad": 0.5, "wheel_per": 0.38,
 		"health_base": 165.0, "grip": 12.0, "gravity": 20.0, "steer": 0.34,
 	},
 }
@@ -90,6 +90,8 @@ var _shop_header: Label
 var _shop_money: Label
 var _shop_rows := {}
 var _veh_rows := {}
+var _reset_btn: Button
+var _reset_armed := false   # fresh-start needs a confirm click so it's not a mis-tap
 
 func _ready() -> void:
 	_init_levels()
@@ -424,11 +426,21 @@ func _build_shop() -> void:
 		_shop_rows[key] = {"label": lbl, "desc": desc, "buy": buy}
 
 	var restart := Button.new()
-	restart.text = "RESTART  (Enter)"
+	restart.text = "RETRY  (Enter)  —  keeps your garage"
 	restart.custom_minimum_size = Vector2(0, 46)
 	restart.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	restart.pressed.connect(_restart)
 	box.add_child(restart)
+
+	# Fresh start: wipe ALL progress (money, every vehicle's upgrades, unlocks) and
+	# return to the starter Hot Rod. Two-click confirm so it can't be a mis-tap.
+	_reset_btn = Button.new()
+	_reset_btn.text = "🔄 NEW GAME  —  wipe ALL upgrades & money"
+	_reset_btn.custom_minimum_size = Vector2(0, 40)
+	_reset_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_reset_btn.add_theme_color_override("font_color", Color(1.0, 0.62, 0.55))
+	_reset_btn.pressed.connect(_on_reset_pressed)
+	box.add_child(_reset_btn)
 
 func _shop_label(parent: Node, text: String, size: int, col: Color) -> Label:
 	var l := Label.new()
@@ -482,7 +494,13 @@ func _swap_vehicle(vk: String) -> void:
 	if _terrain.is_connected("pickup_collected", _on_pickup_collected):
 		_terrain.disconnect("pickup_collected", _on_pickup_collected)
 	if _car:
-		_car.queue_free()
+		# detach IMMEDIATELY (not just queue_free) so the old ride — and its
+		# visible upgrade parts like wings — vanish this frame instead of lingering
+		# in the scene behind the shop until the deferred free finally runs.
+		var old: Node = _car
+		old.remove_from_group("car")
+		remove_child(old)
+		old.queue_free()
 	_car = RigidBody3D.new()
 	_car.set_script(HCCarScript)
 	_car.set("vehicle_type", _vehicle)
@@ -503,7 +521,32 @@ func _swap_vehicle(vk: String) -> void:
 	if was_visible:
 		_refresh_shop()
 
+## Fresh-start button: first press arms (asks to confirm), second press wipes.
+func _on_reset_pressed() -> void:
+	if not _reset_armed:
+		_reset_armed = true
+		_reset_btn.text = "⚠ CONFIRM — wipe EVERYTHING?"
+		return
+	_fresh_start()
+
+## Wipe all persistent progress and rebuild as the starter Hot Rod.
+func _fresh_start() -> void:
+	_reset_armed = false
+	money = 0
+	_last_earned = 0
+	_shop_summary = ""
+	_init_levels()                                    # zero every vehicle's tree
+	_owned = {"hotrod": true, "monster": false}       # relock everything but the starter
+	_swap_vehicle("hotrod")                           # rebuild the car clean + re-apply zeros
+	if _reset_btn:
+		_reset_btn.text = "🔄 NEW GAME  —  wipe ALL upgrades & money"
+	_refresh_shop()
+
 func _refresh_shop() -> void:
+	# any other shop action cancels a pending fresh-start confirmation
+	if _reset_armed and _reset_btn:
+		_reset_armed = false
+		_reset_btn.text = "🔄 NEW GAME  —  wipe ALL upgrades & money"
 	var bank := "TOTAL MONEY:  $%d   (kept between tries)" % money
 	_shop_money.text = (_shop_summary + "\n" + bank) if _shop_summary != "" else bank
 	for vk in VEH_KEYS:

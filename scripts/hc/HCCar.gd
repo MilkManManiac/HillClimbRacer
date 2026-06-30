@@ -93,16 +93,28 @@ var _falling_out: bool = false  # fell in; awaiting respawn (suspends anti-tunne
 # holds just the structural geometry (mass, collision box, wheel track) so the
 # two stay decoupled. Switch vehicles = HCMain frees & recreates the car node.
 @export var vehicle_type: String = "hotrod"
+# INVARIANT: the box bottom (col_y - col.y/2) MUST sit BELOW the wheel-ray origin
+# (local y=0.5). If the box catches the car deeper than that, the ray origins drop
+# under the ground when the car bottoms out, the rays stop seeing ground, the
+# suspension switches off, and the car deadlocks sunk-and-undriveable. Box LENGTH
+# (col.z) is free to trim for facet-snag relief — only the height/col_y matter here.
 const VSPEC := {
-	"hotrod":  {"mass": 850.0,  "col": Vector3(1.9, 0.9, 4.0), "col_y": 0.7,  "fx": 0.9, "fz": 1.4,  "wheelbase": 2.8},
-	"monster": {"mass": 2400.0, "col": Vector3(3.0, 1.8, 5.4), "col_y": 1.3,  "fx": 1.7, "fz": 2.05, "wheelbase": 4.1},
+	"hotrod":  {"mass": 850.0,  "col": Vector3(1.9, 0.9, 3.6), "col_y": 0.7, "fx": 0.9, "fz": 1.4,  "wheelbase": 2.8},
+	"monster": {"mass": 2400.0, "col": Vector3(3.0, 1.8, 4.8), "col_y": 1.3, "fx": 1.7, "fz": 2.05, "wheelbase": 4.1},
 }
 var _vs: Dictionary = VSPEC["hotrod"]
+var _part_scale: float = 1.0   # bolt-on upgrade parts are scaled up to fit a bigger ride
 
 func _ready() -> void:
 	add_to_group("car")   # so world pickups (HCPickup Area3D) can identify the player body
 	_vs = VSPEC.get(vehicle_type, VSPEC["hotrod"])
 	mass = float(_vs.mass)
+	# per-wheel suspension cap MUST scale with weight, else a heavy ride (monster
+	# truck) can't generate enough force to hold itself up — it bottoms out, the
+	# chassis drags, suspension feels dead, and landings never compress. ~13x mass
+	# over 4 wheels gives comfortable headroom above gravity (mass * gravity_force).
+	suspension_max_force = mass * 13.0
+	_part_scale = 1.5 if vehicle_type == "monster" else 1.0   # fit parts to the big truck
 	can_sleep = false
 	continuous_cd = true
 	gravity_scale = 0.0          # we apply gravity manually; avoid double gravity
@@ -129,6 +141,7 @@ func _ready() -> void:
 	_build_cans()
 	_build_dust()
 	_build_rockets()
+	_fit_parts()   # raise/scale the bolt-on upgrade parts to fit this vehicle
 	# sidecar removed for now (functions kept dormant; not built/applied)
 
 func _physics_process(delta: float) -> void:
@@ -434,6 +447,35 @@ func _update_wheel_visual(i: int, ray: RayCast3D) -> void:
 		wy = base.y - suspension_rest         # hang at rest droop in the air
 	wm.position = Vector3(base.x, wy, base.z)
 
+## Raise/spread the bolt-on upgrade parts (wings, rudder, rockets, engine, cage,
+## cans, air-brake) so they sit on a bigger ride instead of clustering at hot-rod
+## scale near the wheels. Positions are multiplied by the monster hull's scale-up so
+## each part lands at the analogous spot; the scale itself comes from _part_scale
+## (baked into apply_wings/apply_rockets/apply_engine) or set directly here for the
+## visibility-only parts (cage / cans / air-brake) whose apply_* never touch scale.
+func _fit_parts() -> void:
+	if vehicle_type != "monster":
+		return
+	var pp := Vector3(1.5, 1.65, 1.4)   # mirror the hull scale so parts track the body
+	var move: Array = []
+	move.append_array(_wings)
+	move.append_array(_rockets)
+	for c in _cans:
+		move.append(c)
+	for n in [_rudder, _engine, _airbrake, _cage]:
+		if n:
+			move.append(n)
+	for n in move:
+		n.position = n.position * pp
+	# parts whose apply_* set only visibility must be enlarged here
+	var sc := Vector3(_part_scale, _part_scale, _part_scale)
+	if _cage:
+		_cage.scale = sc
+	if _airbrake:
+		_airbrake.scale = sc
+	for c in _cans:
+		c.scale = sc
+
 func _suspend(ray: RayCast3D, up: Vector3, vel: Vector3) -> bool:
 	ray.force_raycast_update()
 	if not ray.is_colliding():
@@ -443,7 +485,7 @@ func _suspend(ray: RayCast3D, up: Vector3, vel: Vector3) -> bool:
 	var compression: float = clamp((suspension_rest - dist) / suspension_rest, -0.3, 1.0)
 	var vdot := up.dot(vel)
 	var force: float = (compression * suspension_stiff - vdot * suspension_damp) * mass * 0.25
-	force = clampf(force, -2000.0, suspension_max_force)
+	force = clampf(force, -mass * 2.5, suspension_max_force)
 	apply_force(up * force, origin - global_position)
 	return true
 
@@ -988,7 +1030,7 @@ func _build_engine() -> void:
 func apply_engine(level: int) -> void:
 	if _engine == null:
 		return
-	var s: float = 0.55 + float(level) * 0.16
+	var s: float = (0.55 + float(level) * 0.16) * _part_scale
 	_engine.scale = Vector3(s, s, s)
 
 # --- roll cage (Suspension upgrade) -----------------------------------------
@@ -1221,7 +1263,7 @@ func _build_rockets() -> void:
 func apply_rockets(level: int) -> void:
 	for r in _rockets:
 		r.visible = level > 0
-		var s: float = 0.7 + float(level) * 0.13
+		var s: float = (0.7 + float(level) * 0.13) * _part_scale
 		r.scale = Vector3(s, s, s)
 	# small air nudge (gravity force is ~14450, so even maxed this barely lifts)
 	boost_force = 0.0 if level == 0 else (3500.0 + float(level) * 1800.0)
@@ -1291,7 +1333,7 @@ func _build_wings() -> void:
 ## for a frame on the freshly-spawned interpolated body ("wings on a fresh start").
 func apply_wings(level: int) -> void:
 	var show: bool = level > 0
-	var f: float = clampf(float(level) * 0.22, 0.0, 1.4)
+	var f: float = clampf(float(level) * 0.22, 0.0, 1.4) * _part_scale
 	for w in _wings:
 		w.visible = show
 		w.scale = Vector3(f, f, f)
