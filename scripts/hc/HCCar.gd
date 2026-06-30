@@ -87,20 +87,24 @@ func _physics_process(delta: float) -> void:
 	# --- gravity ------------------------------------------------------------
 	apply_central_force(Vector3.DOWN * gravity_force * mass)
 
-	# --- dive (hold Shift): weight + nose-down ------------------------------
-	var diving := Input.is_key_pressed(KEY_SHIFT)
+	# --- dive (hold Space): weight + nose-down ------------------------------
+	var diving := Input.is_key_pressed(KEY_SPACE)
 	if diving:
 		apply_central_force(Vector3.DOWN * dive_force * mass)
 
-	var throttle := Input.get_action_strength("accelerate")
+	# gas pedal = Left Shift (W also drives on the ground); brake = S; A/D steer/roll
+	var drive := maxf(Input.get_action_strength("accelerate"), (1.0 if Input.is_key_pressed(KEY_SHIFT) else 0.0))
 	var braking := Input.get_action_strength("brake")
 	var steer_in := Input.get_axis("turn_right", "turn_left")
+	var pitch_in := 0.0
+	if Input.is_key_pressed(KEY_W): pitch_in += 1.0
+	if Input.is_key_pressed(KEY_S): pitch_in -= 1.0
 
 	if _grounded:
 		# drive / brake (fuel-gated)
-		if fuel > 0.0 and throttle > 0.01 and fwd_speed < max_speed:
-			apply_central_force(fwd * throttle * engine_force)
-			fuel -= delta * (0.8 + throttle * 2.2)
+		if fuel > 0.0 and drive > 0.01 and fwd_speed < max_speed:
+			apply_central_force(fwd * drive * engine_force)
+			fuel -= delta * (0.8 + drive * 2.2)
 		elif braking > 0.01:
 			if fwd_speed > 0.5:
 				apply_central_force(-fwd * brake_force * braking)
@@ -122,7 +126,7 @@ func _physics_process(delta: float) -> void:
 			angular_velocity.y = (fwd_speed / wheelbase) * tan(ang)
 	else:
 		# --- airborne: full manual 3-axis (no assist) ----------------------
-		var pitch := throttle - braking            # W nose up / S nose down
+		var pitch := pitch_in                      # W nose up / S nose down
 		if diving:
 			pitch -= 1.0                           # dive also pitches the nose down
 		var yaw := 0.0
@@ -131,6 +135,10 @@ func _physics_process(delta: float) -> void:
 		apply_torque(right * pitch * air_pitch_torque * mass)
 		apply_torque(fwd * -steer_in * air_roll_torque * mass)
 		apply_torque(up * yaw * air_yaw_torque * mass)
+		# arrest rotation quickly once the controls are released
+		var rot_input: float = absf(pitch) + absf(steer_in) + absf(yaw)
+		if rot_input < 0.15:
+			angular_velocity = angular_velocity.lerp(Vector3.ZERO, 1.0 - exp(-10.0 * delta))
 
 	# --- recover (R): ease upright + small lift ----------------------------
 	if Input.is_key_pressed(KEY_R):

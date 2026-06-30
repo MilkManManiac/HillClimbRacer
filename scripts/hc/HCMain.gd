@@ -120,7 +120,7 @@ func _setup_hud() -> void:
 	hint.position = Vector2(28, -34)
 	hint.add_theme_font_size_override("font_size", 13)
 	hint.add_theme_color_override("font_color", Color(0.8, 0.8, 0.85))
-	hint.text = "W/S throttle  •  A/D steer  •  air: W/S pitch, A/D roll, Q/E yaw  •  Shift dive  •  R recover  •  Enter restart"
+	hint.text = "Shift = drive  •  S brake  •  A/D steer  •  air: W/S pitch, A/D roll, Q/E yaw  •  Space dive  •  R recover  •  Enter restart"
 	layer.add_child(hint)
 
 func _bar_bg(layer: CanvasLayer, pos: Vector2, col: Color) -> void:
