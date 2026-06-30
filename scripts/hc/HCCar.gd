@@ -40,6 +40,7 @@ var dead: bool = false
 var score: float = 0.0
 var trick_text: String = ""
 var _trick_timer: float = 0.0
+var terrain: Node3D   # set by HCMain; used to catch ground tunneling
 
 var _rays: Array[RayCast3D] = []
 var _grounded: bool = false
@@ -170,6 +171,17 @@ func _physics_process(delta: float) -> void:
 		_trick_timer -= delta
 		if _trick_timer <= 0.0:
 			trick_text = ""
+
+	# anti-tunnel safety: if a hard landing punched us through the ground, pop back up
+	if terrain and not dead:
+		var th: float = terrain.call("height_at", global_position.x, global_position.z)
+		if global_position.y < th - 1.0:
+			var p := global_position
+			p.y = th + 0.6
+			global_position = p
+			if linear_velocity.y < 0.0:
+				linear_velocity.y = 0.0
+			reset_physics_interpolation()
 
 	# --- fuel/health bookkeeping -------------------------------------------
 	# crash if you land/roll off the road (past the rails)

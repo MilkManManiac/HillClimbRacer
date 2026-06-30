@@ -21,12 +21,31 @@ var _big: Label
 var _score_lbl: Label
 var _trick_lbl: Label
 
+# --- economy / upgrades ------------------------------------------------------
+const UP_KEYS := ["engine", "fuel", "suspension", "grip", "air"]
+const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "suspension": "Suspension", "grip": "Grip", "air": "Air Control"}
+const UP_BASECOST := {"engine": 160, "fuel": 130, "suspension": 150, "grip": 120, "air": 140}
+const UP_MAX := 6
+var money: int = 0
+var _levels := {"engine": 0, "fuel": 0, "suspension": 0, "grip": 0, "air": 0}
+var _was_dead := false
+var _shop: Control
+var _shop_header: Label
+var _shop_money: Label
+var _shop_rows := {}
+
 func _ready() -> void:
 	_setup_sky()
 	_setup_terrain_and_car()
 	_setup_camera()
 	_setup_hud()
+	_build_shop()
+	_apply_upgrades()
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
+
+func _input(event: InputEvent) -> void:
+	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_ENTER:
+		_restart()
 
 func _setup_sky() -> void:
 	var sky := Node3D.new()
@@ -42,6 +61,7 @@ func _setup_terrain_and_car() -> void:
 	_car.set_script(HCCarScript)
 	add_child(_car)
 	_car.set("road_half", _terrain.get("road_half_width"))
+	_car.set("terrain", _terrain)
 	# place start above the terrain so it drops onto it
 	_start.y = _terrain.call("height_at", 0.0, 0.0) + 4.0
 	_car.global_position = _start
@@ -61,8 +81,12 @@ func _process(delta: float) -> void:
 		return
 	_update_camera(delta)
 	_update_hud()
-	if _car.get("dead") and Input.is_key_pressed(KEY_ENTER):
-		_restart()
+	# on death, bank the run's score into money and open the shop
+	var d: bool = _car.get("dead")
+	if d and not _was_dead:
+		_was_dead = true
+		money += int(_car.get("score"))
+		_show_shop()
 
 func _update_camera(delta: float) -> void:
 	# heading from horizontal velocity (stable during flips); fall back to last heading
@@ -97,9 +121,107 @@ func _update_camera(delta: float) -> void:
 	_cam.fov = lerpf(_cam.fov, target_fov, 1.0 - exp(-4.0 * delta))
 
 func _restart() -> void:
+	_apply_upgrades()
 	_car.call("reset_run", _start)
 	_cam.global_position = _start + Vector3(0, 6, 12)
 	_cam_heading = Vector3(0, 0, -1)
+	_was_dead = false
+	if _shop:
+		_shop.visible = false
+
+# --- upgrade shop ------------------------------------------------------------
+
+func _cost(key: String) -> int:
+	return int(UP_BASECOST[key] * pow(1.7, _levels[key]))
+
+func _apply_upgrades() -> void:
+	if _car == null:
+		return
+	_car.set("engine_force", 19000.0 + _levels.engine * 3500.0)
+	_car.set("max_speed", 125.0 + _levels.engine * 7.0)
+	_car.set("max_fuel", 600.0 + _levels.fuel * 240.0)
+	_car.set("land_damage_speed", 12.0 + _levels.suspension * 5.0)
+	_car.set("grip", 8.5 + _levels.grip * 0.9)
+	_car.set("air_pitch_torque", 11.0 + _levels.air * 2.0)
+	_car.set("air_roll_torque", 9.0 + _levels.air * 1.6)
+	_car.set("air_yaw_torque", 6.0 + _levels.air * 1.2)
+
+func _build_shop() -> void:
+	var layer := CanvasLayer.new()
+	layer.layer = 10
+	add_child(layer)
+	_shop = Control.new()
+	_shop.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_shop.visible = false
+	layer.add_child(_shop)
+	var dim := ColorRect.new()
+	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	dim.color = Color(0, 0, 0, 0.6)
+	_shop.add_child(dim)
+	var box := VBoxContainer.new()
+	box.set_anchors_preset(Control.PRESET_CENTER)
+	box.position = Vector2(-220, -200)
+	box.custom_minimum_size = Vector2(440, 0)
+	box.add_theme_constant_override("separation", 10)
+	_shop.add_child(box)
+	_shop_header = _shop_label(box, "", 26, Color(1, 0.8, 0.4))
+	_shop_money = _shop_label(box, "", 24, Color(1, 0.95, 0.5))
+	for key in UP_KEYS:
+		var row := HBoxContainer.new()
+		row.custom_minimum_size = Vector2(440, 0)
+		row.add_theme_constant_override("separation", 12)
+		box.add_child(row)
+		var lbl := Label.new()
+		lbl.custom_minimum_size = Vector2(260, 0)
+		lbl.add_theme_font_size_override("font_size", 19)
+		row.add_child(lbl)
+		var btn := Button.new()
+		btn.custom_minimum_size = Vector2(150, 0)
+		btn.pressed.connect(_buy.bind(key))
+		row.add_child(btn)
+		_shop_rows[key] = {"label": lbl, "btn": btn}
+	var restart := Button.new()
+	restart.text = "RESTART  (Enter)"
+	restart.custom_minimum_size = Vector2(440, 44)
+	restart.pressed.connect(_restart)
+	box.add_child(restart)
+
+func _shop_label(parent: Node, text: String, size: int, col: Color) -> Label:
+	var l := Label.new()
+	l.text = text
+	l.add_theme_font_size_override("font_size", size)
+	l.add_theme_color_override("font_color", col)
+	parent.add_child(l)
+	return l
+
+func _show_shop() -> void:
+	_shop_header.text = "WRECKED  —  %d m   (banked +%d)" % [int(_car.get("distance")), int(_car.get("score"))]
+	_shop.visible = true
+	_refresh_shop()
+
+func _refresh_shop() -> void:
+	_shop_money.text = "MONEY: $%d" % money
+	for key in UP_KEYS:
+		var lvl: int = _levels[key]
+		var row: Dictionary = _shop_rows[key]
+		row.label.text = "%s   Lv %d/%d" % [UP_NAME[key], lvl, UP_MAX]
+		if lvl >= UP_MAX:
+			row.btn.text = "MAX"
+			row.btn.disabled = true
+		else:
+			var c: int = _cost(key)
+			row.btn.text = "Buy  $%d" % c
+			row.btn.disabled = money < c
+
+func _buy(key: String) -> void:
+	if _levels[key] >= UP_MAX:
+		return
+	var c: int = _cost(key)
+	if money >= c:
+		money -= c
+		_levels[key] += 1
+		_apply_upgrades()
+		_refresh_shop()
 
 # --- HUD ---------------------------------------------------------------------
 
@@ -171,7 +293,4 @@ func _update_hud() -> void:
 	_info.text = "%d m    %d km/h%s" % [int(dist), int(_car.call("get_speed_kmh")), air]
 	_score_lbl.text = "SCORE %d" % int(_car.get("score"))
 	_trick_lbl.text = _car.get("trick_text")
-	if _car.get("dead"):
-		_big.text = "WRECKED — %d m\nPress Enter to restart" % int(dist)
-	else:
-		_big.text = ""
+	_big.text = ""   # the shop panel now handles the death screen
