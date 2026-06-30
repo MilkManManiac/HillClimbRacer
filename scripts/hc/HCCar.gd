@@ -11,16 +11,18 @@ const GlbUtil := preload("res://scripts/GlbUtil.gd")
 const CAR_GLB := "res://assets/car/kenney_sedan_cc0.glb"
 
 # --- tunables ---
-@export var engine_force: float = 12500.0
-@export var max_speed: float = 92.0
+@export var engine_force: float = 16500.0
+@export var max_speed: float = 112.0
 @export var brake_force: float = 5500.0
 @export var grip: float = 8.5
+@export var slide_factor: float = 0.7      # how much grip you lose turning hard at speed (slides)
 @export var wheelbase: float = 2.8
-@export var max_steer_angle: float = 0.55
-@export var gravity_force: float = 24.0
+@export var max_steer_angle: float = 0.4   # smaller = gentler turns
+@export var steer_rate: float = 3.0        # lower = slower steering response
+@export var gravity_force: float = 17.0    # lower = floatier, more hang time
 @export var suspension_rest: float = 0.55
-@export var suspension_stiff: float = 130.0
-@export var suspension_damp: float = 9.0
+@export var suspension_stiff: float = 95.0
+@export var suspension_damp: float = 6.0
 @export var dive_force: float = 26.0       # downward push when diving
 @export var air_pitch_torque: float = 11.0
 @export var air_roll_torque: float = 9.0
@@ -107,12 +109,16 @@ func _physics_process(delta: float) -> void:
 		else:
 			apply_central_force(-fwd * fwd_speed * 0.5 * mass * 0.02)
 		fuel -= delta * 0.2   # idle burn
-		# grip: kill sideways slide
-		apply_central_force(-right * right.dot(vel) * grip * mass)
+		# smoothed steering (slower response than raw input)
+		_steer = lerpf(_steer, steer_in, 1.0 - exp(-steer_rate * delta))
+		var k: float = clamp(speed / max_speed, 0.0, 1.0)
+		# grip: kill sideways slide, but turning hard at speed loses grip -> it slides out
+		var slide: float = clamp(absf(_steer) * k, 0.0, 1.0)
+		var grip_eff: float = grip * (1.0 - slide_factor * slide)
+		apply_central_force(-right * right.dot(vel) * grip_eff * mass)
 		# steering (bicycle model)
 		if absf(fwd_speed) > 0.4:
-			var k: float = clamp(speed / max_speed, 0.0, 1.0)
-			var ang: float = steer_in * max_steer_angle * (1.0 - k * 0.45)
+			var ang: float = _steer * max_steer_angle * (1.0 - k * 0.4)
 			angular_velocity.y = (fwd_speed / wheelbase) * tan(ang)
 	else:
 		# --- airborne: full manual 3-axis (no assist) ----------------------

@@ -68,8 +68,23 @@ func _update_camera(delta: float) -> void:
 	if vh.length() > 2.0:
 		_cam_heading = _cam_heading.lerp(vh.normalized(), 1.0 - exp(-3.0 * delta))
 	var target := _car.global_position
-	var want := target - _cam_heading * 11.0 + Vector3(0, 5.0, 0)
-	_cam.global_position = _cam.global_position.lerp(want, 1.0 - exp(-6.0 * delta))
+	var want := target - _cam_heading * 12.0 + Vector3(0, 6.0, 0)
+	# don't let terrain block the view of the car: raycast from the car toward the camera
+	# and pull the camera in front of any hill in the way
+	var ss := _car.get_world_3d().direct_space_state
+	var from := target + Vector3(0, 2.0, 0)
+	var q := PhysicsRayQueryParameters3D.create(from, want, 1, [_car.get_rid()])
+	var hit := ss.intersect_ray(q)
+	var blocked := not hit.is_empty()
+	if blocked:
+		want = from.lerp(hit.position, 0.82)
+	# never let the camera dip below the terrain surface
+	var floor_y: float = _terrain.call("height_at", want.x, want.z) + 3.0
+	if want.y < floor_y:
+		want.y = floor_y
+	# snap in faster when blocked so the car never disappears
+	var snap: float = 16.0 if blocked else 6.0
+	_cam.global_position = _cam.global_position.lerp(want, 1.0 - exp(-snap * delta))
 	var look := target + Vector3(0, 1.0, 0)
 	var t := _cam.global_transform.looking_at(look, Vector3.UP)
 	_cam.global_transform.basis = _cam.global_transform.basis.slerp(t.basis, 1.0 - exp(-8.0 * delta))
