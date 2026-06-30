@@ -22,12 +22,12 @@ var _score_lbl: Label
 var _trick_lbl: Label
 
 # --- economy / upgrades ------------------------------------------------------
-const UP_KEYS := ["engine", "fuel", "suspension", "wheels", "air", "center", "dive"]
-const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "suspension": "Suspension", "wheels": "Bigger Wheels", "air": "Air Control", "center": "Air Guidance", "dive": "Dive Power"}
-const UP_BASECOST := {"engine": 160, "fuel": 130, "suspension": 150, "wheels": 170, "air": 140, "center": 150, "dive": 130}
+const UP_KEYS := ["engine", "fuel", "suspension", "wheels", "wings", "ailerons", "dive"]
+const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "suspension": "Suspension", "wheels": "Bigger Wheels", "wings": "Wings", "ailerons": "Ailerons", "dive": "Dive Power"}
+const UP_BASECOST := {"engine": 160, "fuel": 130, "suspension": 150, "wheels": 170, "wings": 150, "ailerons": 140, "dive": 130}
 const UP_MAX := 6
 var money: int = 0
-var _levels := {"engine": 0, "fuel": 0, "suspension": 0, "wheels": 0, "air": 0, "center": 0, "dive": 0}
+var _levels := {"engine": 0, "fuel": 0, "suspension": 0, "wheels": 0, "wings": 0, "ailerons": 0, "dive": 0}
 var _was_dead := false
 var _shop: Control
 var _shop_header: Label
@@ -151,12 +151,11 @@ func _apply_upgrades() -> void:
 	_car.set("wheel_radius", 0.5 + _levels.wheels * 0.12)
 	if _car.has_method("apply_wheel_size"):
 		_car.call("apply_wheel_size")
-	_car.set("air_pitch_torque", 11.0 + _levels.air * 2.0)
-	_car.set("air_roll_torque", 9.0 + _levels.air * 1.6)
-	_car.set("air_yaw_torque", 6.0 + _levels.air * 1.2)
-	_car.set("center_assist", _levels.center * 1.0)        # air auto-center (downscaled)
+	# Wings = lift/air time; Ailerons (gated behind Wings) = control surfaces + guidance + sharper air
 	if _car.has_method("apply_wings"):
-		_car.call("apply_wings")
+		_car.call("apply_wings", _levels.wings)
+	if _car.has_method("apply_ailerons"):
+		_car.call("apply_ailerons", _levels.ailerons)
 	_car.set("dive_force", 30.0 + _levels.dive * 16.0)     # heavier dive to time ramps
 	# Suspension also = roll cage + more health (frame/armor)
 	_car.set("max_health", 100.0 + _levels.suspension * 18.0)
@@ -206,7 +205,7 @@ func _build_shop() -> void:
 		plus.custom_minimum_size = Vector2(54, 0)
 		plus.pressed.connect(_set_level.bind(key, 1))
 		row.add_child(plus)
-		_shop_rows[key] = {"label": lbl}
+		_shop_rows[key] = {"label": lbl, "plus": plus}
 	var restart := Button.new()
 	restart.text = "RESTART  (Enter)"
 	restart.custom_minimum_size = Vector2(440, 44)
@@ -239,10 +238,16 @@ func _refresh_shop() -> void:
 	for key in UP_KEYS:
 		var lvl: int = _levels[key]
 		var row: Dictionary = _shop_rows[key]
-		row.label.text = "%s   Lv %d/%d" % [UP_NAME[key], lvl, UP_MAX]
+		var locked: bool = key == "ailerons" and _levels.wings == 0
+		row.label.text = "%s   Lv %d/%d%s" % [UP_NAME[key], lvl, UP_MAX, "   (needs Wings)" if locked else ""]
+		row.plus.disabled = locked
 
 func _set_level(key: String, delta: int) -> void:
+	if key == "ailerons" and delta > 0 and _levels.wings == 0:
+		return   # ailerons are gated behind Wings
 	_levels[key] = clampi(_levels[key] + delta, 0, UP_MAX)
+	if key == "wings" and _levels.wings == 0:
+		_levels.ailerons = 0   # no wings -> no ailerons
 	_apply_upgrades()
 	_refresh_shop()
 

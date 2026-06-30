@@ -6,7 +6,7 @@ func _ready() -> void:
 func _process(_d: float) -> void:
 	_rf += 1
 	if _rf == 20:
-		for k in ["center","wheels","engine","suspension","fuel","dive"]:
+		for k in ["wings","ailerons","suspension","wheels","engine"]:
 			_root.call("_set_level", k, 6)
 	if _rf > 40: Input.action_press("accelerate")
 	if _rf == 200 and not _done:

@@ -56,6 +56,7 @@ var _cage: Node3D
 var _airbrake: Node3D
 var _cans: Array[MeshInstance3D] = []
 var _dust: GPUParticles3D
+var wing_lift: float = 0.0          # lift from Wings upgrade (air time)
 var _grounded: bool = false
 var _steer: float = 0.0
 var _air_time: float = 0.0
@@ -181,10 +182,11 @@ func _physics_process(delta: float) -> void:
 		var rot_input: float = absf(pitch) + absf(steer_in) + absf(qe)
 		if rot_input < 0.15:
 			angular_velocity = angular_velocity.lerp(Vector3.ZERO, 1.0 - exp(-10.0 * delta))
-		# WINGS: lift -> more air time the bigger they are (Air Guidance level)
+		# WINGS: lift -> more air time the bigger the wings
+		if wing_lift > 0.001:
+			apply_central_force(Vector3.UP * wing_lift * mass)
+		# AILERONS/RUDDER: a gentle correction back toward the road center (x=0)
 		if center_assist > 0.001:
-			apply_central_force(Vector3.UP * center_assist * 1.3 * mass)
-			# RUDDER/AILERONS: a gentle correction back toward the road center (x=0)
 			var corr: float = clampf(-global_position.x * 0.18, -0.6, 0.6) * center_assist
 			apply_central_force(Vector3((corr - linear_velocity.x * center_assist * 0.22) * mass, 0.0, 0.0))
 
@@ -426,14 +428,22 @@ func _tube(parent: Node3D, a: Vector3, b: Vector3, r: float, mat: Material) -> v
 func _build_cage() -> void:
 	_cage = Node3D.new()
 	add_child(_cage)
-	var mat := _metal(Color(0.14, 0.14, 0.16))
-	var corners := [Vector3(-0.78, 0, -0.4), Vector3(0.78, 0, -0.4), Vector3(-0.78, 0, 0.95), Vector3(0.78, 0, 0.95)]
-	for c in corners:
-		_tube(_cage, c + Vector3(0, 1.05, 0), c + Vector3(0, 1.85, 0), 0.05, mat)
-	_tube(_cage, Vector3(-0.78, 1.85, -0.4), Vector3(0.78, 1.85, -0.4), 0.05, mat)
-	_tube(_cage, Vector3(-0.78, 1.85, 0.95), Vector3(0.78, 1.85, 0.95), 0.05, mat)
-	_tube(_cage, Vector3(-0.78, 1.85, -0.4), Vector3(-0.78, 1.85, 0.95), 0.05, mat)
-	_tube(_cage, Vector3(0.78, 1.85, -0.4), Vector3(0.78, 1.85, 0.95), 0.05, mat)
+	var mat := _metal(Color(0.13, 0.13, 0.15))
+	var hx := 1.32      # outside the body width so it's visible
+	var zf := -1.75     # front
+	var zr := 1.75      # rear
+	var yb := 0.35
+	var yt := 2.3
+	var bot := [Vector3(-hx, yb, zf), Vector3(hx, yb, zf), Vector3(-hx, yb, zr), Vector3(hx, yb, zr)]
+	var top := [Vector3(-hx, yt, zf), Vector3(hx, yt, zf), Vector3(-hx, yt, zr), Vector3(hx, yt, zr)]
+	for i in range(4):
+		_tube(_cage, bot[i], top[i], 0.06, mat)   # 4 corner posts
+	_tube(_cage, top[0], top[1], 0.06, mat)        # top front
+	_tube(_cage, top[2], top[3], 0.06, mat)        # top rear
+	_tube(_cage, top[0], top[2], 0.06, mat)        # top left
+	_tube(_cage, top[1], top[3], 0.06, mat)        # top right
+	_tube(_cage, bot[0], bot[2], 0.06, mat)        # bottom left rail
+	_tube(_cage, bot[1], bot[3], 0.06, mat)        # bottom right rail
 	apply_cage(0)
 
 func apply_cage(level: int) -> void:
@@ -510,26 +520,38 @@ func _build_dust() -> void:
 	_dust.draw_pass_1 = qm
 	add_child(_dust)
 
+## A flat delta wing that tapers from the body out to a point, with a slight dihedral.
+func _wing_mesh(side: float) -> ArrayMesh:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var ox := side
+	var rf := Vector3(0.15 * ox, 0.0, -1.0)    # root front (at the body)
+	var rb := Vector3(0.15 * ox, 0.0, 1.25)    # root back
+	var tip := Vector3(2.9 * ox, 0.32, 0.1)    # wide span, upswept point
+	st.add_vertex(rf)
+	st.add_vertex(rb)
+	st.add_vertex(tip)
+	st.generate_normals()
+	return st.commit()
+
 func _build_wings() -> void:
 	for side in [-1.0, 1.0]:
 		var pivot := Node3D.new()
 		pivot.position = Vector3(0.95 * side, 0.85, 0.0)
 		add_child(pivot)
 		var wm := MeshInstance3D.new()
-		var bm := BoxMesh.new()
-		bm.size = Vector3(1.6, 0.08, 1.5)
-		wm.mesh = bm
-		wm.position = Vector3(0.9 * side, 0.0, 0.0)   # extends outward from the body
-		wm.rotation_degrees = Vector3(0, 0, -6.0 * side)  # slight upward tilt
-		wm.material_override = _metal(Color(0.72, 0.74, 0.8))
+		wm.mesh = _wing_mesh(side)
+		var wmat := _metal(Color(0.72, 0.74, 0.8))
+		wmat.cull_mode = BaseMaterial3D.CULL_DISABLED
+		wm.material_override = wmat
 		pivot.add_child(wm)
-		# aileron flap, hinged at the wing's trailing edge (tilts with roll input)
+		# aileron flap on the wing's trailing edge (tilts with roll input)
 		var hinge := Node3D.new()
-		hinge.position = Vector3(0.9 * side, 0.0, 0.72)
+		hinge.position = Vector3(1.2 * side, 0.0, 1.0)
 		pivot.add_child(hinge)
 		var flap := MeshInstance3D.new()
 		var fm := BoxMesh.new()
-		fm.size = Vector3(0.9, 0.06, 0.32)
+		fm.size = Vector3(1.3, 0.05, 0.3)
 		flap.mesh = fm
 		flap.material_override = _metal(Color(0.55, 0.56, 0.6))
 		flap.position = Vector3(0, 0, 0.18)
@@ -538,7 +560,7 @@ func _build_wings() -> void:
 		_wings.append(pivot)
 	# rudder: rear vertical fin (tilts with yaw input)
 	var rhinge := Node3D.new()
-	rhinge.position = Vector3(0, 1.25, 1.5)
+	rhinge.position = Vector3(0, 1.25, 1.6)
 	add_child(rhinge)
 	var fin := MeshInstance3D.new()
 	var finm := BoxMesh.new()
@@ -548,15 +570,29 @@ func _build_wings() -> void:
 	fin.position = Vector3(0, 0.3, 0.1)
 	rhinge.add_child(fin)
 	_rudder = rhinge
-	apply_wings()
+	apply_wings(0)
+	apply_ailerons(0)
 
-## Wing/rudder size scales with the Air Guidance level (via center_assist). 0 = hidden.
-func apply_wings() -> void:
-	var f: float = clampf(center_assist * 0.21, 0.0, 1.5)
+## Wing size + lift scale with the Wings upgrade. 0 = hidden.
+func apply_wings(level: int) -> void:
+	var f: float = clampf(float(level) * 0.22, 0.0, 1.4)
 	for w in _wings:
 		w.scale = Vector3(f, f, f)
 	if _rudder:
 		_rudder.scale = Vector3(f, f, f)
+	wing_lift = float(level) * 1.4
+
+## Ailerons + rudder (gated behind Wings): show the control surfaces and add the
+## center-guidance + sharper air rotation. Size follows the wing scale.
+func apply_ailerons(level: int) -> void:
+	for a in _ailerons:
+		a.visible = level > 0
+	if _rudder:
+		_rudder.visible = level > 0
+	center_assist = float(level) * 1.1
+	air_pitch_torque = 11.0 + float(level) * 2.0
+	air_roll_torque = 9.0 + float(level) * 1.6
+	air_yaw_torque = 6.0 + float(level) * 1.2
 
 ## Tilt the control surfaces with the air inputs (cosmetic feedback).
 func _animate_surfaces(delta: float) -> void:
