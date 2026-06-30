@@ -158,6 +158,14 @@ func _apply_upgrades() -> void:
 	if _car.has_method("apply_wings"):
 		_car.call("apply_wings")
 	_car.set("dive_force", 30.0 + _levels.dive * 16.0)     # heavier dive to time ramps
+	# Suspension also = roll cage + more health (frame/armor)
+	_car.set("max_health", 100.0 + _levels.suspension * 18.0)
+	if _car.has_method("apply_cage"):
+		_car.call("apply_cage", _levels.suspension)
+	if _car.has_method("apply_cans"):
+		_car.call("apply_cans", _levels.fuel)
+	if _car.has_method("apply_airbrake"):
+		_car.call("apply_airbrake", _levels.dive)
 
 func _build_shop() -> void:
 	var layer := CanvasLayer.new()

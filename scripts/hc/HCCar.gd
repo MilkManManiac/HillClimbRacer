@@ -52,6 +52,10 @@ var _wings: Array[Node3D] = []
 var _ailerons: Array[Node3D] = []
 var _rudder: Node3D
 var _engine: Node3D
+var _cage: Node3D
+var _airbrake: Node3D
+var _cans: Array[MeshInstance3D] = []
+var _dust: GPUParticles3D
 var _grounded: bool = false
 var _steer: float = 0.0
 var _air_time: float = 0.0
@@ -81,6 +85,10 @@ func _ready() -> void:
 	_build_body()
 	_build_wings()
 	_build_engine()
+	_build_cage()
+	_build_airbrake()
+	_build_cans()
+	_build_dust()
 
 func _physics_process(delta: float) -> void:
 	if dead:
@@ -111,10 +119,11 @@ func _physics_process(delta: float) -> void:
 	# --- gravity ------------------------------------------------------------
 	apply_central_force(Vector3.DOWN * gravity_force * mass)
 
-	# --- dive (hold Space): weight + nose-down ------------------------------
-	var diving := Input.is_key_pressed(KEY_SPACE)
+	# --- dive (hold Space): drop faster, burns fuel -------------------------
+	var diving := Input.is_key_pressed(KEY_SPACE) and fuel > 0.0
 	if diving:
 		apply_central_force(Vector3.DOWN * dive_force * mass)
+		fuel -= delta * 9.0   # the drop costs fuel
 
 	# gas pedal = Left Shift (W also drives on the ground); brake = S; A/D steer/roll
 	var drive := maxf(Input.get_action_strength("accelerate"), (1.0 if Input.is_key_pressed(KEY_SHIFT) else 0.0))
@@ -161,9 +170,7 @@ func _physics_process(delta: float) -> void:
 			angular_velocity.y = (fwd_speed / wheelbase) * tan(ang)
 	else:
 		# --- airborne: full manual 3-axis (no assist) ----------------------
-		var pitch := pitch_in                      # W nose up / S nose down
-		if diving:
-			pitch -= 1.0                           # dive also pitches the nose down
+		var pitch := pitch_in                      # W nose down / S nose up (Space no longer pitches)
 		var qe := 0.0
 		if Input.is_key_pressed(KEY_Q): qe += 1.0
 		if Input.is_key_pressed(KEY_E): qe -= 1.0
@@ -257,6 +264,10 @@ func _on_land(vel: Vector3) -> void:
 		else:
 			trick_text = "SLOPPY LANDING!"
 			_trick_timer = 1.4
+	# kick up dust on a real landing
+	if _dust and _air_time > 0.3:
+		_dust.global_position = global_position + Vector3(0, -0.3, 0)
+		_dust.restart()
 	_air_time = 0.0
 	_flip_accum = 0.0
 
@@ -395,6 +406,110 @@ func apply_engine(level: int) -> void:
 	var s: float = 0.55 + float(level) * 0.16
 	_engine.scale = Vector3(s, s, s)
 
+# --- roll cage (Suspension upgrade) -----------------------------------------
+func _tube(parent: Node3D, a: Vector3, b: Vector3, r: float, mat: Material) -> void:
+	var mi := MeshInstance3D.new()
+	var cm := CylinderMesh.new()
+	cm.top_radius = r
+	cm.bottom_radius = r
+	cm.height = a.distance_to(b)
+	mi.mesh = cm
+	mi.material_override = mat
+	mi.position = (a + b) * 0.5
+	var d := b - a
+	if absf(d.x) > absf(d.y) and absf(d.x) > absf(d.z):
+		mi.rotation_degrees = Vector3(0, 0, 90)
+	elif absf(d.z) > absf(d.y):
+		mi.rotation_degrees = Vector3(90, 0, 0)
+	parent.add_child(mi)
+
+func _build_cage() -> void:
+	_cage = Node3D.new()
+	add_child(_cage)
+	var mat := _metal(Color(0.14, 0.14, 0.16))
+	var corners := [Vector3(-0.78, 0, -0.4), Vector3(0.78, 0, -0.4), Vector3(-0.78, 0, 0.95), Vector3(0.78, 0, 0.95)]
+	for c in corners:
+		_tube(_cage, c + Vector3(0, 1.05, 0), c + Vector3(0, 1.85, 0), 0.05, mat)
+	_tube(_cage, Vector3(-0.78, 1.85, -0.4), Vector3(0.78, 1.85, -0.4), 0.05, mat)
+	_tube(_cage, Vector3(-0.78, 1.85, 0.95), Vector3(0.78, 1.85, 0.95), 0.05, mat)
+	_tube(_cage, Vector3(-0.78, 1.85, -0.4), Vector3(-0.78, 1.85, 0.95), 0.05, mat)
+	_tube(_cage, Vector3(0.78, 1.85, -0.4), Vector3(0.78, 1.85, 0.95), 0.05, mat)
+	apply_cage(0)
+
+func apply_cage(level: int) -> void:
+	if _cage:
+		_cage.visible = level > 0
+
+# --- air-brake flap (Dive upgrade) ------------------------------------------
+func _build_airbrake() -> void:
+	_airbrake = Node3D.new()
+	_airbrake.position = Vector3(0, 1.35, 1.55)
+	add_child(_airbrake)
+	var mi := MeshInstance3D.new()
+	var bm := BoxMesh.new()
+	bm.size = Vector3(1.2, 0.5, 0.06)
+	mi.mesh = bm
+	mi.material_override = _metal(Color(0.85, 0.5, 0.18), 0.5)
+	mi.position = Vector3(0, 0.25, 0.05)
+	_airbrake.add_child(mi)
+	apply_airbrake(0)
+
+func apply_airbrake(level: int) -> void:
+	if _airbrake:
+		_airbrake.visible = level > 0
+
+# --- jerry cans (Fuel Tank upgrade) -----------------------------------------
+func _build_cans() -> void:
+	for i in range(6):
+		var mi := MeshInstance3D.new()
+		var bm := BoxMesh.new()
+		bm.size = Vector3(0.26, 0.34, 0.2)
+		mi.mesh = bm
+		var m := StandardMaterial3D.new()
+		m.albedo_color = Color(0.7, 0.15, 0.12)
+		m.roughness = 0.7
+		mi.material_override = m
+		var col := i % 3
+		var rz := i / 3
+		mi.position = Vector3(-0.5 + col * 0.5, 1.05, 1.0 + rz * 0.32)
+		mi.visible = false
+		add_child(mi)
+		_cans.append(mi)
+	apply_cans(0)
+
+func apply_cans(level: int) -> void:
+	for i in range(_cans.size()):
+		_cans[i].visible = i < level
+
+# --- landing dust -----------------------------------------------------------
+func _build_dust() -> void:
+	_dust = GPUParticles3D.new()
+	_dust.amount = 24
+	_dust.lifetime = 0.6
+	_dust.one_shot = true
+	_dust.emitting = false
+	_dust.explosiveness = 0.85
+	_dust.local_coords = false
+	var pm := ParticleProcessMaterial.new()
+	pm.direction = Vector3(0, 1, 0)
+	pm.spread = 65.0
+	pm.gravity = Vector3(0, -3, 0)
+	pm.initial_velocity_min = 1.5
+	pm.initial_velocity_max = 3.5
+	pm.scale_min = 0.4
+	pm.scale_max = 1.0
+	_dust.process_material = pm
+	var qm := QuadMesh.new()
+	qm.size = Vector2(0.5, 0.5)
+	var dm := StandardMaterial3D.new()
+	dm.albedo_color = Color(0.62, 0.57, 0.47, 0.6)
+	dm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	dm.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+	dm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	qm.material = dm
+	_dust.draw_pass_1 = qm
+	add_child(_dust)
+
 func _build_wings() -> void:
 	for side in [-1.0, 1.0]:
 		var pivot := Node3D.new()
@@ -454,6 +569,9 @@ func _animate_surfaces(delta: float) -> void:
 	for i in range(_ailerons.size()):
 		var sgn: float = -1.0 if i == 0 else 1.0
 		_ailerons[i].rotation.x = lerp_angle(_ailerons[i].rotation.x, roll_in * 0.6 * sgn, 1.0 - exp(-12.0 * delta))
+	if _airbrake and _airbrake.visible:
+		var brake_ang: float = deg_to_rad(72.0) if Input.is_key_pressed(KEY_SPACE) else 0.0
+		_airbrake.rotation.x = lerp_angle(_airbrake.rotation.x, brake_ang, 1.0 - exp(-14.0 * delta))
 
 func _hide_glb_wheels(node: Node) -> void:
 	if str(node.name).to_lower().contains("wheel") and node is Node3D:
