@@ -6,8 +6,10 @@ extends Node3D
 const SkyScript := preload("res://scripts/Sky.gd")
 const HCTerrainScript := preload("res://scripts/hc/HCTerrain.gd")
 const HCCarScript := preload("res://scripts/hc/HCCar.gd")
+const HCAudioScript := preload("res://scripts/hc/HCAudio.gd")
 
 var _car: RigidBody3D
+var _audio: Node
 var _terrain: Node3D
 var _cam: Camera3D
 var _cam_heading := Vector3(0, 0, -1)
@@ -22,12 +24,13 @@ var _score_lbl: Label
 var _trick_lbl: Label
 
 # --- economy / upgrades ------------------------------------------------------
-const UP_KEYS := ["engine", "fuel", "fueleff", "suspension", "wheels", "wings", "ailerons", "dive", "rockets", "stretch", "wide"]
-const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "fueleff": "Fuel Economy", "suspension": "Suspension", "wheels": "Bigger Wheels", "wings": "Wings", "ailerons": "Ailerons", "dive": "Dive Power", "rockets": "Rockets", "stretch": "Stretch (Limo)", "wide": "Wide Stance"}
+const UP_KEYS := ["engine", "fuel", "fueleff", "cashmult", "suspension", "wheels", "wings", "ailerons", "dive", "rockets", "stretch", "wide"]
+const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "fueleff": "Fuel Economy", "cashmult": "Sponsor Decals", "suspension": "Suspension", "wheels": "Bigger Wheels", "wings": "Wings", "ailerons": "Ailerons", "dive": "Dive Power", "rockets": "Rockets", "stretch": "Stretch (Limo)", "wide": "Wide Stance"}
 const UP_DESC := {
 	"engine": "More power & higher top speed",
 	"fuel": "Bigger tank — more total fuel",
 	"fueleff": "Burns fuel slower (better mileage)",
+	"cashmult": "Earn more cash per metre (+25%/lvl)",
 	"suspension": "Roll cage, armor (+HP), softer landings",
 	"wheels": "Taller wheels, more ground clearance",
 	"wings": "Lift = more air time off jumps",
@@ -37,13 +40,46 @@ const UP_DESC := {
 	"stretch": "Limo: longer wheelbase, lazier turns",
 	"wide": "Wider stance, harder to roll over",
 }
-const UP_BASECOST := {"engine": 320, "fuel": 260, "fueleff": 240, "suspension": 340, "wheels": 280, "wings": 380, "ailerons": 340, "dive": 300, "rockets": 420, "stretch": 360, "wide": 320}
+const UP_BASECOST := {"engine": 320, "fuel": 260, "fueleff": 240, "cashmult": 400, "suspension": 340, "wheels": 280, "wings": 380, "ailerons": 340, "dive": 300, "rockets": 420, "stretch": 360, "wide": 320}
 const UP_COSTMULT := 1.9   # each level costs 1.9x the last — costs ramp hard
 const UP_MAX := 6
 const MONEY_PER_M := 1.0    # money earned = metres travelled down the track
 var money: int = 0
 var _last_earned: int = 0
-var _levels := {"engine": 0, "fuel": 0, "fueleff": 0, "suspension": 0, "wheels": 0, "wings": 0, "ailerons": 0, "dive": 0, "rockets": 0, "stretch": 0, "wide": 0}
+# upgrade levels are PER-VEHICLE — each ride has its own upgrade tree, so buying a
+# new vehicle starts it fresh. _levels always points at the active ride's dict.
+var _all_levels := {}
+var _levels := {}
+
+# --- vehicles ----------------------------------------------------------------
+# Per-ride tuning. HCCar.VSPEC holds the matching geometry (mass, wheel track,
+# body). Upgrade levels are SHARED across vehicles; these bases make the same
+# level feel different per ride. _vehicle = the active one; _owned tracks unlocks.
+const VEHICLES := {
+	"hotrod": {
+		"name": "Hot Rod", "price": 0,
+		"desc": "Balanced convertible — light, quick, gets big air.",
+		"engine_base": 8000.0, "engine_per": 3600.0,
+		"speed_base": 30.0, "speed_per": 15.0,
+		"fuel_base": 70.0, "fuel_per": 95.0, "fuel_burn": 1.0,
+		"land_base": 9.0, "susp_rest": 0.55, "susp_per": 0.18, "wheel_rad": 0.5, "wheel_per": 0.12,
+		"health_base": 100.0, "grip": 8.5, "gravity": 17.0, "steer": 0.4,
+	},
+	"monster": {
+		"name": "Monster Truck", "price": 2800,
+		"desc": "Giant heavy 4x4 — climbs anything & hard to flip, but slow, thirsty, bad in the air. Starts on dinky wheels; the Bigger Wheels upgrade makes them RIDICULOUSLY huge.",
+		"engine_base": 15000.0, "engine_per": 5400.0,
+		"speed_base": 26.0, "speed_per": 11.0,
+		"fuel_base": 100.0, "fuel_per": 110.0, "fuel_burn": 1.5,
+		# small starting wheels (wheel_rad) that grow a LOT per level (wheel_per),
+		# with ride height (susp) lifting to match so the truck towers when maxed.
+		"land_base": 17.0, "susp_rest": 0.85, "susp_per": 0.34, "wheel_rad": 0.5, "wheel_per": 0.38,
+		"health_base": 165.0, "grip": 12.0, "gravity": 20.0, "steer": 0.34,
+	},
+}
+const VEH_KEYS := ["hotrod", "monster"]
+var _vehicle := "hotrod"
+var _owned := {"hotrod": true, "monster": false}
 var _was_dead := false
 var _respawning := false
 var _shake := 0.0           # camera shake magnitude (decays)
@@ -53,8 +89,10 @@ var _shop: Control
 var _shop_header: Label
 var _shop_money: Label
 var _shop_rows := {}
+var _veh_rows := {}
 
 func _ready() -> void:
+	_init_levels()
 	_setup_sky()
 	_setup_terrain_and_car()
 	_setup_camera()
@@ -82,6 +120,7 @@ func _setup_terrain_and_car() -> void:
 	add_child(_terrain)
 	_car = RigidBody3D.new()
 	_car.set_script(HCCarScript)
+	_car.set("vehicle_type", _vehicle)   # set BEFORE add_child so _ready builds the right ride
 	add_child(_car)
 	_car.set("road_half", _terrain.get("road_half_width"))
 	_car.set("terrain", _terrain)
@@ -91,6 +130,10 @@ func _setup_terrain_and_car() -> void:
 	_terrain.call("set_target", _car)
 	_car.connect("gap_failed", _on_car_gap_failed)
 	_car.connect("landed", _on_car_landed)
+	_terrain.connect("pickup_collected", _on_pickup_collected)
+	# audio intentionally OFF for now (user will source better sounds later). The
+	# HCAudio synth + all play_* calls stay guarded by `if _audio:` so leaving
+	# _audio null = fully silent; flip this back on by instancing HCAudioScript here.
 
 func _setup_camera() -> void:
 	_cam = Camera3D.new()
@@ -114,8 +157,10 @@ func _process(delta: float) -> void:
 	var d: bool = _car.get("dead")
 	if d and not _was_dead:
 		_was_dead = true
-		_last_earned = int(float(_car.get("distance")) * MONEY_PER_M)
+		_last_earned = int(float(_car.get("distance")) * MONEY_PER_M * _cash_mult())
 		money += _last_earned
+		if _audio:
+			_audio.call("play_wreck")
 		_show_shop()
 
 func _update_camera(delta: float) -> void:
@@ -193,28 +238,68 @@ func _on_car_landed(impact: float, _air_time: float) -> void:
 func _on_car_gap_failed(_can_respawn: bool) -> void:
 	_shake = maxf(_shake, 0.5)
 
+## Sponsor Decals upgrade: scales all cash earned (distance payout + coins).
+func _cash_mult() -> float:
+	return 1.0 + float(_levels.cashmult) * 0.25
+
+## A world pickup (HCPickup, re-emitted by the terrain) was driven through.
+func _on_pickup_collected(kind: String, value: float) -> void:
+	match kind:
+		"coin":
+			money += int(value * _cash_mult())
+			if _audio:
+				_audio.call("play_coin")
+		"fuel":
+			var mf: float = _car.get("max_fuel")
+			_car.set("fuel", minf(float(_car.get("fuel")) + value, mf))
+			if _audio:
+				_audio.call("play_coin")
+		"nitro":
+			# concentrated boost juice + a quick forward kick
+			var mf2: float = _car.get("max_fuel")
+			_car.set("fuel", minf(float(_car.get("fuel")) + value, mf2))
+			if is_instance_valid(_car) and not bool(_car.get("dead")):
+				_car.apply_central_impulse(-_car.global_transform.basis.z * value * 120.0)
+			if _audio:
+				_audio.call("play_coin")
+
 # --- upgrade shop ------------------------------------------------------------
 
 func _cost(key: String) -> int:
 	return int(UP_BASECOST[key] * pow(UP_COSTMULT, _levels[key]))
 
+## One zeroed upgrade dict per vehicle; _levels points at the active ride's.
+func _init_levels() -> void:
+	for vk in VEH_KEYS:
+		var d := {}
+		for k in UP_KEYS:
+			d[k] = 0
+		_all_levels[vk] = d
+	_levels = _all_levels[_vehicle]
+
 func _apply_upgrades() -> void:
 	if _car == null:
 		return
+	var v: Dictionary = VEHICLES[_vehicle]   # per-ride bases; upgrades ramp on top
 	# starter is intentionally weak/slow; upgrades ramp it up hard
-	_car.set("engine_force", 8000.0 + _levels.engine * 3600.0)
-	_car.set("max_speed", 30.0 + _levels.engine * 15.0)
+	_car.set("engine_force", float(v.engine_base) + _levels.engine * float(v.engine_per))
+	_car.set("max_speed", float(v.speed_base) + _levels.engine * float(v.speed_per))
 	if _car.has_method("apply_engine"):
 		_car.call("apply_engine", _levels.engine)
 	# fuel is the run timer — VERY low stock so you can barely move; two upgrades fix it:
-	#   Fuel Tank = capacity, Fuel Economy = slower burn (multiplier dropped here)
-	_car.set("max_fuel", 70.0 + _levels.fuel * 95.0)
-	_car.set("fuel_eff", maxf(1.0 - _levels.fueleff * 0.12, 0.28))
+	#   Fuel Tank = capacity, Fuel Economy = slower burn. Heavy rides drink more (fuel_burn).
+	_car.set("max_fuel", float(v.fuel_base) + _levels.fuel * float(v.fuel_per))
+	_car.set("fuel_eff", float(v.fuel_burn) * maxf(1.0 - _levels.fueleff * 0.12, 0.28))
+	# intrinsic handling per ride (grip/gravity/steer); not touched by upgrades
+	_car.set("grip", float(v.grip))
+	_car.set("gravity_force", float(v.gravity))
+	_car.set("max_steer_angle", float(v.steer))
 	# hard landings hurt sooner unless you buy Suspension/Wheels
-	_car.set("land_damage_speed", 9.0 + _levels.suspension * 5.0 + _levels.wheels * 2.0)
-	# Bigger Wheels: more ride height + larger wheels (clearance over bumps)
-	_car.set("suspension_rest", 0.55 + _levels.wheels * 0.18)
-	_car.set("wheel_radius", 0.5 + _levels.wheels * 0.12)
+	_car.set("land_damage_speed", float(v.land_base) + _levels.suspension * 5.0 + _levels.wheels * 2.0)
+	# Bigger Wheels: more ride height + larger wheels (clearance over bumps).
+	# Per-ride growth — the monster's wheels balloon dramatically.
+	_car.set("suspension_rest", float(v.susp_rest) + _levels.wheels * float(v.susp_per))
+	_car.set("wheel_radius", float(v.wheel_rad) + _levels.wheels * float(v.wheel_per))
 	if _car.has_method("apply_wheel_size"):
 		_car.call("apply_wheel_size")
 	# Wings = lift/air time; Ailerons (gated behind Wings) = control surfaces + guidance + sharper air
@@ -224,7 +309,7 @@ func _apply_upgrades() -> void:
 		_car.call("apply_ailerons", _levels.ailerons)
 	_car.set("dive_force", 30.0 + _levels.dive * 16.0)     # heavier dive to time ramps
 	# Suspension also = roll cage + more health (frame/armor)
-	_car.set("max_health", 100.0 + _levels.suspension * 18.0)
+	_car.set("max_health", float(v.health_base) + _levels.suspension * 18.0)
 	if _car.has_method("apply_cage"):
 		_car.call("apply_cage", _levels.suspension)
 	if _car.has_method("apply_cans"):
@@ -271,14 +356,48 @@ func _build_shop() -> void:
 	var sep := HSeparator.new()
 	box.add_child(sep)
 
+	# everything scrollable lives in ONE list (vehicles + upgrades) so it can never
+	# run off the panel; the scroll flexes to fill, keeping Restart pinned below.
 	var scroll := ScrollContainer.new()
-	scroll.custom_minimum_size = Vector2(504, 460)
+	scroll.custom_minimum_size = Vector2(504, 360)
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	box.add_child(scroll)
 	var list := VBoxContainer.new()
 	list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	list.add_theme_constant_override("separation", 6)
 	scroll.add_child(list)
+
+	# --- vehicle selector (unlock/select a ride) -------------------------------
+	_shop_label(list, "GARAGE — pick your ride", 15, Color(0.8, 0.85, 1.0))
+	for vk in VEH_KEYS:
+		var vrow := HBoxContainer.new()
+		vrow.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		vrow.add_theme_constant_override("separation", 10)
+		list.add_child(vrow)
+		var vinfo := VBoxContainer.new()
+		vinfo.custom_minimum_size = Vector2(360, 0)
+		vinfo.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		vinfo.add_theme_constant_override("separation", 0)
+		vrow.add_child(vinfo)
+		var vlbl := Label.new()
+		vlbl.add_theme_font_size_override("font_size", 17)
+		vinfo.add_child(vlbl)
+		var vdesc := Label.new()
+		vdesc.text = VEHICLES[vk].desc
+		vdesc.add_theme_font_size_override("font_size", 12)
+		vdesc.add_theme_color_override("font_color", Color(0.62, 0.64, 0.7))
+		vdesc.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		vdesc.custom_minimum_size = Vector2(360, 0)
+		vinfo.add_child(vdesc)
+		var vbuy := Button.new()
+		vbuy.custom_minimum_size = Vector2(110, 40)
+		vbuy.pressed.connect(_on_vehicle_button.bind(vk))
+		vrow.add_child(vbuy)
+		_veh_rows[vk] = {"label": vlbl, "buy": vbuy}
+	var sep2 := HSeparator.new()
+	list.add_child(sep2)
+	_shop_label(list, "UPGRADES", 15, Color(0.8, 0.85, 1.0))
 
 	for key in UP_KEYS:
 		var row := HBoxContainer.new()
@@ -336,9 +455,74 @@ func _toggle_shop() -> void:
 		_shop_summary = ""
 		_refresh_shop()
 
+## Vehicle row button: select if owned, otherwise buy if affordable.
+func _on_vehicle_button(vk: String) -> void:
+	if _audio:
+		_audio.call("play_click")
+	if _vehicle == vk:
+		return
+	if bool(_owned.get(vk, false)):
+		_swap_vehicle(vk)
+		return
+	var price: int = int(VEHICLES[vk].price)
+	if money < price:
+		return
+	money -= price
+	_owned[vk] = true
+	if _audio:
+		_audio.call("play_cash")
+	_swap_vehicle(vk)
+
+## Rebuild the car node as a different ride (vehicles aren't hot-swappable in
+## place — geometry differs — so we free & recreate, then re-wire and re-apply).
+func _swap_vehicle(vk: String) -> void:
+	_vehicle = vk
+	_levels = _all_levels[vk]   # switch to this ride's own upgrade tree
+	var was_visible := _shop and _shop.visible
+	if _terrain.is_connected("pickup_collected", _on_pickup_collected):
+		_terrain.disconnect("pickup_collected", _on_pickup_collected)
+	if _car:
+		_car.queue_free()
+	_car = RigidBody3D.new()
+	_car.set_script(HCCarScript)
+	_car.set("vehicle_type", _vehicle)
+	add_child(_car)
+	_car.set("road_half", _terrain.get("road_half_width"))
+	_car.set("terrain", _terrain)
+	_start.y = _terrain.call("height_at", 0.0, 0.0) + 4.0
+	_car.global_position = _start
+	_terrain.call("set_target", _car)
+	_car.connect("gap_failed", _on_car_gap_failed)
+	_car.connect("landed", _on_car_landed)
+	_terrain.connect("pickup_collected", _on_pickup_collected)
+	if _audio:
+		_audio.call("setup", _car)   # re-point the engine synth at the new body
+	_apply_upgrades()
+	_cam_heading = Vector3(0, 0, -1)
+	_was_dead = false
+	if was_visible:
+		_refresh_shop()
+
 func _refresh_shop() -> void:
 	var bank := "TOTAL MONEY:  $%d   (kept between tries)" % money
 	_shop_money.text = (_shop_summary + "\n" + bank) if _shop_summary != "" else bank
+	for vk in VEH_KEYS:
+		var vrow: Dictionary = _veh_rows[vk]
+		vrow.label.text = VEHICLES[vk].name
+		var vbuy: Button = vrow.buy
+		if _vehicle == vk:
+			vbuy.text = "DRIVING"
+			vbuy.disabled = true
+			vrow.label.add_theme_color_override("font_color", Color(0.6, 1.0, 0.7))
+		elif bool(_owned.get(vk, false)):
+			vbuy.text = "SELECT"
+			vbuy.disabled = false
+			vrow.label.add_theme_color_override("font_color", Color(1, 1, 1))
+		else:
+			var price: int = int(VEHICLES[vk].price)
+			vbuy.text = "$%d" % price
+			vbuy.disabled = money < price
+			vrow.label.add_theme_color_override("font_color", Color(0.8, 0.82, 0.86))
 	for key in UP_KEYS:
 		var lvl: int = _levels[key]
 		var row: Dictionary = _shop_rows[key]
@@ -360,6 +544,8 @@ func _refresh_shop() -> void:
 			buy.disabled = money < c
 
 func _buy(key: String) -> void:
+	if _audio:
+		_audio.call("play_click")
 	if _levels[key] >= UP_MAX:
 		return
 	if key == "ailerons" and _levels.wings == 0:
@@ -369,6 +555,8 @@ func _buy(key: String) -> void:
 		return
 	money -= c
 	_levels[key] += 1
+	if _audio:
+		_audio.call("play_cash")
 	_apply_upgrades()
 	_refresh_shop()
 

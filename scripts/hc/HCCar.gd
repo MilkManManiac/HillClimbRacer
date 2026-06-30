@@ -87,8 +87,22 @@ var gaps_cleared: int = 0
 var _gap_armed: bool = false    # airborne over a void, outcome pending
 var _falling_out: bool = false  # fell in; awaiting respawn (suspends anti-tunnel)
 
+# --- vehicle identity --------------------------------------------------------
+# Which ride this body is. Set by HCMain BEFORE add_child (so _ready builds the
+# right geometry). HCMain.VEHICLES holds the handling/economy tuning; VSPEC here
+# holds just the structural geometry (mass, collision box, wheel track) so the
+# two stay decoupled. Switch vehicles = HCMain frees & recreates the car node.
+@export var vehicle_type: String = "hotrod"
+const VSPEC := {
+	"hotrod":  {"mass": 850.0,  "col": Vector3(1.9, 0.9, 4.0), "col_y": 0.7,  "fx": 0.9, "fz": 1.4,  "wheelbase": 2.8},
+	"monster": {"mass": 2400.0, "col": Vector3(3.0, 1.8, 5.4), "col_y": 1.3,  "fx": 1.7, "fz": 2.05, "wheelbase": 4.1},
+}
+var _vs: Dictionary = VSPEC["hotrod"]
+
 func _ready() -> void:
-	mass = 850.0
+	add_to_group("car")   # so world pickups (HCPickup Area3D) can identify the player body
+	_vs = VSPEC.get(vehicle_type, VSPEC["hotrod"])
+	mass = float(_vs.mass)
 	can_sleep = false
 	continuous_cd = true
 	gravity_scale = 0.0          # we apply gravity manually; avoid double gravity
@@ -135,9 +149,11 @@ func _physics_process(delta: float) -> void:
 	# --- suspension + ground detection -------------------------------------
 	var was_grounded := _grounded
 	_grounded = false
-	for ray in _rays:
+	for i in range(_rays.size()):
+		var ray := _rays[i]
 		if _suspend(ray, up, vel):
 			_grounded = true
+		_update_wheel_visual(i, ray)   # keep the visible wheel on the ground (no sinking)
 	if _sidecar_on and _sidecar_ray and _suspend(_sidecar_ray, up, vel):
 		_grounded = true
 	airborne = not _grounded
@@ -399,6 +415,25 @@ func respawn_at(z: float) -> void:
 # --- build -------------------------------------------------------------------
 
 ## One raycast wheel's suspension push. Returns true if it's touching ground.
+## Place a visible wheel so its bottom rides on the actual ray contact point. The
+## body compresses under load (rest length > contact distance), so a STATIC wheel
+## offset would sink the wheel into the ground by the compression amount. Following
+## the contact each frame keeps the tyre planted; when airborne it hangs at droop.
+func _update_wheel_visual(i: int, ray: RayCast3D) -> void:
+	if i >= _wheel_meshes.size():
+		return
+	var wm := _wheel_meshes[i]
+	var base: Vector3 = _wheel_positions[i]
+	var reach: float = suspension_rest + wheel_radius + 0.35
+	var wy: float
+	if ray.is_colliding():
+		var d: float = ray.global_position.distance_to(ray.get_collision_point())
+		d = clampf(d, 0.0, reach)
+		wy = base.y - d + wheel_radius        # wheel centre = contact + radius (bottom on ground)
+	else:
+		wy = base.y - suspension_rest         # hang at rest droop in the air
+	wm.position = Vector3(base.x, wy, base.z)
+
 func _suspend(ray: RayCast3D, up: Vector3, vel: Vector3) -> bool:
 	ray.force_raycast_update()
 	if not ray.is_colliding():
@@ -415,14 +450,14 @@ func _suspend(ray: RayCast3D, up: Vector3, vel: Vector3) -> bool:
 func _build_collision() -> void:
 	_col_shape = CollisionShape3D.new()
 	_col_box = BoxShape3D.new()
-	_col_box.size = Vector3(1.9, 0.9, 4.0)
+	_col_box.size = _vs.col
 	_col_shape.shape = _col_box
-	_col_shape.position = Vector3(0, 0.7, 0)
+	_col_shape.position = Vector3(0, float(_vs.col_y), 0)
 	add_child(_col_shape)
 
 func _build_rays() -> void:
-	var fx := 0.9
-	var fz := 1.4
+	var fx: float = _vs.fx
+	var fz: float = _vs.fz
 	_wheel_positions = [Vector3(-fx, 0.5, -fz), Vector3(fx, 0.5, -fz), Vector3(-fx, 0.5, fz), Vector3(fx, 0.5, fz)]
 	for pos in _wheel_positions:
 		var ray := RayCast3D.new()
@@ -481,6 +516,9 @@ func _panel(parent: Node3D, size: Vector3, pos: Vector3, col: Color, rough := 0.
 func _build_body() -> void:
 	_body = Node3D.new()
 	add_child(_body)
+	if vehicle_type == "monster":
+		_build_monster_body()
+		return
 	var red := Color(0.86, 0.11, 0.09)        # saturated hot-rod paint
 	var red_dk := Color(0.5, 0.07, 0.06)       # shadowed paint for steps
 	var dark := Color(0.09, 0.09, 0.11)
@@ -534,6 +572,69 @@ func _build_body() -> void:
 	_build_exhausts()
 	_build_windshield()
 	_build_cockpit()
+
+## A boxy lifted 4x4 — a deliberately different silhouette from the hot-rod so the
+## Monster Truck reads at a glance: tall slab cab, roll bar with light pod, flat
+## bed, chunky guards. The huge wheels + ride height come from its VEHICLES tuning
+## (big wheel_radius / suspension_rest), so this just builds the shell. Faces -Z.
+func _build_monster_body() -> void:
+	# Build into a scaled HULL child so the whole truck is silly-big, while the
+	# parent _body stays unit-scaled for the Stretch/Wide chassis upgrades to scale.
+	var hull := Node3D.new()
+	hull.scale = Vector3(1.45, 1.65, 1.4)   # extra-tall, chunky monster proportions
+	_body.add_child(hull)
+	var body := Color(0.13, 0.45, 0.85)        # blue truck paint
+	var body_dk := Color(0.08, 0.28, 0.55)
+	var dark := Color(0.08, 0.08, 0.1)
+	var rubber := Color(0.05, 0.05, 0.06)
+
+	# --- heavy frame rails / skid plate (ties body to the tall stance) ---------
+	_panel(hull, Vector3(2.0, 0.3, 4.0), Vector3(0, 0.5, 0), dark, 0.8)
+	for sx in [-1.0, 1.0]:
+		_panel(hull, Vector3(0.18, 0.42, 3.8), Vector3(0.92 * sx, 0.55, 0), rubber, 0.85)
+
+	# --- flat cargo bed at the rear --------------------------------------------
+	_panel(hull, Vector3(2.1, 0.5, 1.8), Vector3(0, 0.95, 1.2), body, 0.45, 0.3)
+	_panel(hull, Vector3(2.1, 0.34, 0.16), Vector3(0, 1.25, 2.05), body_dk, 0.45)   # tailgate
+	for sx in [-1.0, 1.0]:
+		_panel(hull, Vector3(0.16, 0.34, 1.8), Vector3(1.0 * sx, 1.25, 1.2), body_dk, 0.45)   # bed walls
+
+	# --- tall boxy cab ----------------------------------------------------------
+	_panel(hull, Vector3(2.1, 1.0, 1.9), Vector3(0, 1.2, -0.7), body, 0.4, 0.3)     # cab lower
+	_panel(hull, Vector3(1.96, 0.7, 1.7), Vector3(0, 1.95, -0.6), body, 0.4, 0.3)   # cab upper / greenhouse
+	# wrap windows (glass band around the upper cab)
+	var glass := _glass(0.32)
+	for win in [Vector3(0, 1.98, -1.46), Vector3(0, 1.98, 0.28)]:
+		var w := _panel(hull, Vector3(1.7, 0.55, 0.06), win, Color(1,1,1), 0.05)
+		w.material_override = glass
+	for sx in [-1.0, 1.0]:
+		var ws := _panel(hull, Vector3(0.06, 0.5, 1.6), Vector3(0.99 * sx, 1.98, -0.6), Color(1,1,1), 0.05)
+		ws.material_override = glass
+	_panel(hull, Vector3(2.0, 0.16, 1.8), Vector3(0, 2.34, -0.6), body_dk, 0.4)     # roof cap
+
+	# --- hood + grille up front -------------------------------------------------
+	_panel(hull, Vector3(2.0, 0.55, 1.3), Vector3(0, 1.18, -2.05), body, 0.4, 0.3)
+	_panel(hull, Vector3(1.8, 0.5, 0.18), Vector3(0, 1.12, -2.74), dark, 0.5)        # grille
+	for gx in [-0.6, -0.2, 0.2, 0.6]:
+		_emit_panel(hull, Vector3(0.12, 0.42, 0.06), Vector3(gx, 1.12, -2.8), Color(0.9, 0.95, 1.0), 0.6)
+	# headlights
+	for sx in [-1.0, 1.0]:
+		_emit_panel(hull, Vector3(0.34, 0.26, 0.1), Vector3(0.74 * sx, 1.2, -2.78), Color(1.0, 0.96, 0.8), 2.2)
+
+	# --- roll bar over the bed with a light pod (classic monster look) ----------
+	for sx in [-1.0, 1.0]:
+		_chrome_cyl(hull, 0.07, 1.2, Vector3(0.85 * sx, 1.9, 0.9), Vector3(0, 0, 0))
+	_chrome_cyl(hull, 0.07, 1.7, Vector3(0, 2.5, 0.9), Vector3(0, 0, 90))            # top cross bar
+	_panel(hull, Vector3(1.5, 0.26, 0.3), Vector3(0, 2.62, 0.9), dark, 0.4)          # light pod
+	for lx in [-0.55, -0.18, 0.18, 0.55]:
+		_emit_panel(hull, Vector3(0.28, 0.22, 0.12), Vector3(lx, 2.62, 0.74), Color(1.0, 0.98, 0.85), 2.6)
+
+	# --- chunky bumpers / nerf bars --------------------------------------------
+	_chrome_cyl(hull, 0.11, 2.1, Vector3(0, 0.9, -2.95), Vector3(0, 0, 90))          # front bar
+	_chrome_cyl(hull, 0.11, 2.1, Vector3(0, 0.95, 2.25), Vector3(0, 0, 90))          # rear bar
+	# exhaust stacks up the back of the cab
+	for sx in [-1.0, 1.0]:
+		_chrome_cyl(hull, 0.1, 1.3, Vector3(0.8 * sx, 2.0, 0.2), Vector3(0, 0, 0))
 
 # --- body-detail helpers -----------------------------------------------------
 
@@ -777,15 +878,16 @@ func _build_cockpit() -> void:
 func apply_chassis(stretch: int, wide: int) -> void:
 	var sx: float = 1.0 + float(wide) * 0.16
 	var sz: float = 1.0 + float(stretch) * 0.28
+	var base_col: Vector3 = _vs.col    # scale from THIS vehicle's geometry, not hot-rod's
 	if _col_box:
-		_col_box.size = Vector3(1.9 * sx, 0.9, 4.0 * sz)
-	var fx: float = 0.9 * sx
-	var fz: float = 1.4 * sz
+		_col_box.size = Vector3(base_col.x * sx, base_col.y, base_col.z * sz)
+	var fx: float = float(_vs.fx) * sx
+	var fz: float = float(_vs.fz) * sz
 	_wheel_positions = [Vector3(-fx, 0.5, -fz), Vector3(fx, 0.5, -fz), Vector3(-fx, 0.5, fz), Vector3(fx, 0.5, fz)]
 	for i in range(_rays.size()):
 		_rays[i].position = _wheel_positions[i]
 	apply_wheel_size()                 # repositions wheel meshes from _wheel_positions
-	wheelbase = 2.8 * sz               # longer = lazier, more stable steering
+	wheelbase = float(_vs.wheelbase) * sz   # longer = lazier, more stable steering
 	if _body:
 		_body.scale = Vector3(sx, 1.0, sz)
 
@@ -1147,6 +1249,7 @@ func _build_wings() -> void:
 	for side in [-1.0, 1.0]:
 		var pivot := Node3D.new()
 		pivot.position = Vector3(0.95 * side, 0.85, 0.0)
+		pivot.visible = false   # stays hidden until the Wings upgrade is bought
 		add_child(pivot)
 		var wm := MeshInstance3D.new()
 		wm.mesh = _wing_mesh(side)
@@ -1170,6 +1273,7 @@ func _build_wings() -> void:
 	# rudder: rear vertical fin (tilts with yaw input)
 	var rhinge := Node3D.new()
 	rhinge.position = Vector3(0, 1.25, 1.6)
+	rhinge.visible = false   # shown only with the Ailerons upgrade
 	add_child(rhinge)
 	var fin := MeshInstance3D.new()
 	var finm := BoxMesh.new()
@@ -1183,9 +1287,13 @@ func _build_wings() -> void:
 	apply_ailerons(0)
 
 ## Wing size + lift scale with the Wings upgrade. 0 = hidden.
+## Hide with `visible` (not just scale 0) — a zero-scaled but visible node can flash
+## for a frame on the freshly-spawned interpolated body ("wings on a fresh start").
 func apply_wings(level: int) -> void:
+	var show: bool = level > 0
 	var f: float = clampf(float(level) * 0.22, 0.0, 1.4)
 	for w in _wings:
+		w.visible = show
 		w.scale = Vector3(f, f, f)
 	if _rudder:
 		_rudder.scale = Vector3(f, f, f)

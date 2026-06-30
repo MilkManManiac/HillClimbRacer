@@ -5,11 +5,28 @@ extends Node3D
 ## line the road edges (collision) so you can't drive off; jump them and land off-road
 ## and you crash. Chunks stream in ahead and free behind; solid HeightMapShape3D collision.
 
+## Re-emitted when the car drives through a pickup, so HCMain only connects here once.
+signal pickup_collected(kind: String, value: float)
+
+const HCPickup := preload("res://scripts/hc/HCPickup.gd")
+
 const CHUNK := 64.0
 const RES := 40           # grid cells per chunk side (higher = smoother, no facet snags)
 const LAT := 2            # lateral chunks each side (road is narrow, don't need many)
 const AHEAD := 8          # chunks streamed ahead (fog hides further; fewer = lighter)
 const BEHIND := 2
+
+# --- collectible pickups (coins / fuel / nitro), main-thread streamed ----------
+const PICKUP_LOOKAHEAD := 220.0   # spawn pickups up to this far ahead of the car
+const PICKUP_BEHIND := 70.0       # free pickups once they're this far behind
+const COIN_STEP := 15.0           # centerline coin spacing along the road
+const COIN_VALUE := 20.0          # cash per coin
+const FUEL_VALUE := 25.0          # fuel units per can
+const NITRO_VALUE := 30.0         # nitro/boost per bottle
+const FUEL_SLOT := 10             # a fuel can every Nth coin slot (~150 m)
+const NITRO_SLOT := 13            # a nitro bottle every Nth coin slot (~195 m)
+const ARC_COINS := 6              # coins strung over each gap jump
+const ARC_PEAK := 7.0             # arc apex height above the table level
 
 @export var base_amp: float = 3.0
 @export var max_amp: float = 20.0            # gentler peaks so slopes stay shallow (long jumps)
@@ -23,9 +40,9 @@ const BEHIND := 2
 @export var gap_start_dist: float = 360.0    # pure hills before this; first gap here
 @export var gap_spacing: float = 340.0       # distance to the SECOND gap (base spacing)
 @export var gap_spacing_grow: float = 110.0  # +distance to each next gap (pits get rarer the further you go)
-@export var gap_base_width: float = 34.0     # void width at the first gap
-@export var gap_grow: float = 8.0            # +void width per gap index (harder to clear over distance)
-@export var gap_max_width: float = 120.0
+@export var gap_base_width: float = 44.0     # void width at the first gap
+@export var gap_grow: float = 14.0           # +void width per gap index (harder to clear over distance)
+@export var gap_max_width: float = 200.0
 @export var ramp_len: float = 26.0           # launch-ramp run-up length (telegraph)
 @export var ramp_rise: float = 8.0           # how high the lip kicks the nose
 @export var land_len: float = 36.0           # flat landing platform past the void
@@ -41,6 +58,14 @@ var _last_barrier_cz := 999999
 var _pending := {}            # keys with a build task in flight
 var _done: Array = []         # built chunk data awaiting main-thread insertion
 var _done_mutex := Mutex.new()
+
+# pickup streaming (all main-thread): a frontier z we've spawned up to, the live
+# nodes (for behind-cleanup), and the gap indices whose arc we've already strung.
+var _pickups_root: Node3D
+var _pickup_frontier: float = 0.0
+var _pickup_init := false
+var _pickups: Array[Node3D] = []
+var _gap_arcs := {}
 
 func _ready() -> void:
 	_noise = _new_noise()   # single source of truth (workers use the same config)
@@ -182,6 +207,88 @@ func _update_chunks(initial: bool) -> void:
 	if initial or pz != _last_barrier_cz:
 		_last_barrier_cz = pz
 		_rebuild_barriers(pz)
+	_update_pickups()
+
+# --- pickups (main thread only: Area3D nodes can't be built in a worker task) --
+
+## Walk the spawn frontier forward of the car, dropping coins / fuel / nitro along
+## the centerline and stringing coin arcs over any gap jump, then free everything
+## that has fallen well behind. No-ops safely when no target is set (e.g. GapTest).
+func _update_pickups() -> void:
+	if _target == null:
+		return
+	if _pickups_root == null:
+		_pickups_root = Node3D.new()
+		add_child(_pickups_root)
+	var tz: float = _target.global_position.z
+	if not _pickup_init:
+		# start the frontier at the car so we only ever spawn ahead (toward -z)
+		_pickup_frontier = snappedf(tz, COIN_STEP)
+		_pickup_init = true
+	# advance the frontier toward -z until we've filled the lookahead window
+	var limit: float = tz - PICKUP_LOOKAHEAD
+	while _pickup_frontier > limit:
+		_pickup_frontier -= COIN_STEP
+		_spawn_at_z(_pickup_frontier)
+	# free pickups that have dropped behind the car (more positive z)
+	var behind: float = tz + PICKUP_BEHIND
+	var kept: Array[Node3D] = []
+	for p in _pickups:
+		if is_instance_valid(p):
+			if p.global_position.z > behind:
+				p.queue_free()
+			else:
+				kept.append(p)
+	_pickups = kept
+
+## Decide what (if anything) sits at this centerline z, plus seed a gap arc once.
+func _spawn_at_z(z: float) -> void:
+	var g := _gap_for_z(z)
+	if not g.is_empty():
+		if not _gap_arcs.has(g.idx):
+			_gap_arcs[g.idx] = true
+			_spawn_gap_arc(g)
+		# don't drop ground coins into the void itself — the arc covers that span
+		if z <= g.lip_z and z >= g.far_z:
+			return
+	var slot: int = int(round(absf(z) / COIN_STEP))
+	var kind := "coin"
+	var value := COIN_VALUE
+	if slot % NITRO_SLOT == 0:
+		kind = "nitro"
+		value = NITRO_VALUE
+	elif slot % FUEL_SLOT == 0:
+		kind = "fuel"
+		value = FUEL_VALUE
+	# gentle lateral weave for coins so the line isn't a dead-straight rail
+	var x := 0.0
+	if kind == "coin":
+		x = float((slot % 3) - 1) * (road_half_width * 0.45)
+	var y: float = height_at(x, z) + 1.4
+	_add_pickup(kind, value, Vector3(x, y, z))
+
+## A short parabola of coins arching from the near lip over the void to the far
+## edge, peaking above the table level so a clean jump scoops the lot.
+func _spawn_gap_arc(g: Dictionary) -> void:
+	var lvl: float = g.level
+	var lip_z: float = g.lip_z
+	var far_z: float = g.far_z
+	for i in range(ARC_COINS):
+		var t: float = float(i) / float(ARC_COINS - 1)   # 0 at lip -> 1 at far edge
+		var z: float = lerpf(lip_z, far_z, t)
+		var y: float = lvl + ARC_PEAK * 4.0 * t * (1.0 - t) + 1.4
+		_add_pickup("coin", COIN_VALUE, Vector3(0.0, y, z))
+
+## Instantiate one pickup, position it, track it, and bridge its signal upward.
+func _add_pickup(kind: String, value: float, pos: Vector3) -> void:
+	var pu := HCPickup.make(kind, value)
+	_pickups_root.add_child(pu)
+	pu.global_position = pos
+	pu.collected.connect(_on_pickup_collected)
+	_pickups.append(pu)
+
+func _on_pickup_collected(kind: String, value: float) -> void:
+	pickup_collected.emit(kind, value)
 
 ## Runs on a worker thread: builds the mesh + heights (the expensive part) off the
 ## main thread, then queues the result for insertion.
