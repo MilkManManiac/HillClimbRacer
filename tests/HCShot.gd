@@ -1,13 +1,17 @@
 extends Node
 var _rf := 0
 var _done := false
+var _root: Node
 func _ready() -> void:
-	add_child(load("res://scenes/HillClimb.tscn").instantiate())
+	_root = load("res://scenes/HillClimb.tscn").instantiate()
+	add_child(_root)
 func _process(_d: float) -> void:
 	_rf += 1
-	if _rf > 30:
+	if _rf == 20:
+		_root.call("_set_level", "center", 6)   # max Air Guidance -> big wings
+	if _rf > 40:
 		Input.action_press("accelerate")
-	if _rf == 220 and not _done:
+	if _rf == 200 and not _done:
 		_done = true
 		await RenderingServer.frame_post_draw
 		get_viewport().get_texture().get_image().save_png("res://hc.png")

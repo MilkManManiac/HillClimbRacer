@@ -152,7 +152,9 @@ func _apply_upgrades() -> void:
 	_car.set("air_pitch_torque", 11.0 + _levels.air * 2.0)
 	_car.set("air_roll_torque", 9.0 + _levels.air * 1.6)
 	_car.set("air_yaw_torque", 6.0 + _levels.air * 1.2)
-	_car.set("center_assist", _levels.center * 2.0)        # air auto-center strength
+	_car.set("center_assist", _levels.center * 1.0)        # air auto-center (downscaled)
+	if _car.has_method("apply_wings"):
+		_car.call("apply_wings")
 	_car.set("dive_force", 30.0 + _levels.dive * 16.0)     # heavier dive to time ramps
 
 func _build_shop() -> void:

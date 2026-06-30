@@ -48,6 +48,7 @@ var terrain: Node3D   # set by HCMain; used to catch ground tunneling
 var _rays: Array[RayCast3D] = []
 var _wheel_meshes: Array[MeshInstance3D] = []
 var _wheel_positions: Array[Vector3] = []
+var _wings: Array[Node3D] = []
 var _grounded: bool = false
 var _steer: float = 0.0
 var _air_time: float = 0.0
@@ -75,6 +76,7 @@ func _ready() -> void:
 	_build_collision()
 	_build_rays()
 	_build_body()
+	_build_wings()
 
 func _physics_process(delta: float) -> void:
 	if dead:
@@ -168,10 +170,10 @@ func _physics_process(delta: float) -> void:
 		var rot_input: float = absf(pitch) + absf(steer_in) + absf(qe)
 		if rot_input < 0.15:
 			angular_velocity = angular_velocity.lerp(Vector3.ZERO, 1.0 - exp(-10.0 * delta))
-		# air-guidance upgrade: a slow correction back toward the road center (x=0)
+		# air-guidance upgrade: a gentle correction back toward the road center (x=0)
 		if center_assist > 0.001:
-			var corr: float = clampf(-global_position.x * 0.3, -1.0, 1.0) * center_assist
-			apply_central_force(Vector3((corr - linear_velocity.x * center_assist * 0.4) * mass, 0.0, 0.0))
+			var corr: float = clampf(-global_position.x * 0.18, -0.6, 0.6) * center_assist
+			apply_central_force(Vector3((corr - linear_velocity.x * center_assist * 0.22) * mass, 0.0, 0.0))
 
 	# keep a hard landing from flinging the car into a glitchy spin (only on the ground)
 	if _grounded and angular_velocity.length() > 5.0:
@@ -334,6 +336,32 @@ func _build_body() -> void:
 		mi.material_override = m
 		mi.position = Vector3(0, 0.7, 0)
 		add_child(mi)
+
+func _build_wings() -> void:
+	for side in [-1.0, 1.0]:
+		var pivot := Node3D.new()
+		pivot.position = Vector3(0.95 * side, 0.85, 0.0)
+		add_child(pivot)
+		var wm := MeshInstance3D.new()
+		var bm := BoxMesh.new()
+		bm.size = Vector3(1.6, 0.08, 1.5)
+		wm.mesh = bm
+		wm.position = Vector3(0.9 * side, 0.0, 0.0)   # extends outward from the body
+		wm.rotation_degrees = Vector3(0, 0, -6.0 * side)  # slight upward tilt
+		var m := StandardMaterial3D.new()
+		m.albedo_color = Color(0.72, 0.74, 0.8)
+		m.metallic = 0.6
+		m.roughness = 0.35
+		wm.material_override = m
+		pivot.add_child(wm)
+		_wings.append(pivot)
+	apply_wings()
+
+## Wing size scales with the Air Guidance level (via center_assist). 0 = hidden.
+func apply_wings() -> void:
+	var f: float = clampf(center_assist * 0.16, 0.0, 1.2)
+	for w in _wings:
+		w.scale = Vector3(f, f, f)
 
 func _hide_glb_wheels(node: Node) -> void:
 	if str(node.name).to_lower().contains("wheel") and node is Node3D:
