@@ -37,6 +37,9 @@ var health: float = 100.0
 var distance: float = 0.0
 var airborne: bool = false
 var dead: bool = false
+var score: float = 0.0
+var trick_text: String = ""
+var _trick_timer: float = 0.0
 
 var _rays: Array[RayCast3D] = []
 var _grounded: bool = false
@@ -157,6 +160,12 @@ func _physics_process(delta: float) -> void:
 		_on_land(vel)
 	_last_up = up
 
+	# trick popup timer
+	if _trick_timer > 0.0:
+		_trick_timer -= delta
+		if _trick_timer <= 0.0:
+			trick_text = ""
+
 	# --- fuel/health bookkeeping -------------------------------------------
 	# crash if you land/roll off the road (past the rails)
 	if _grounded and absf(global_position.x) > road_half + 1.5:
@@ -174,6 +183,21 @@ func _on_land(vel: Vector3) -> void:
 	var dmg: float = impact * 1.6 + flat_pen * 35.0 * clamp(_air_time, 0.0, 1.5)
 	if dmg > 1.0:
 		health -= dmg
+	# trick scoring: a clean landing confirms the combo (airtime + flips)
+	var off_road := absf(global_position.x) > road_half
+	if _air_time > 0.45 and not off_road:
+		if uprightness > 0.45:
+			var flips := int(_flip_accum / 320.0)
+			var bonus: float = _air_time * 60.0 + float(flips) * 250.0
+			score += bonus
+			var label := ""
+			if flips >= 1:
+				label = "%dx FLIP  " % flips
+			trick_text = "%s%.1fs AIR   +%d" % [label, _air_time, int(bonus)]
+			_trick_timer = 2.2
+		else:
+			trick_text = "SLOPPY LANDING!"
+			_trick_timer = 1.4
 	_air_time = 0.0
 	_flip_accum = 0.0
 
@@ -182,7 +206,11 @@ func reset_run(start: Vector3) -> void:
 	fuel = max_fuel
 	health = max_health
 	distance = 0.0
+	score = 0.0
+	trick_text = ""
+	_trick_timer = 0.0
 	_air_time = 0.0
+	_flip_accum = 0.0
 	linear_velocity = Vector3.ZERO
 	angular_velocity = Vector3.ZERO
 	global_transform = Transform3D(Basis(), start)

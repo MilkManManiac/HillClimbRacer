@@ -78,7 +78,7 @@ func _build_environment() -> void:
 
 	# light atmospheric haze + god rays (volumetric) and aerial depth fog
 	env.volumetric_fog_enabled = true
-	env.volumetric_fog_density = 0.009
+	env.volumetric_fog_density = 0.004
 	env.volumetric_fog_albedo = Color(0.9, 0.85, 0.8)
 	env.set("volumetric_fog_anisotropy", 0.7)
 	env.set("volumetric_fog_gi_inject", 1.0)
@@ -86,8 +86,8 @@ func _build_environment() -> void:
 
 	env.fog_enabled = true
 	env.fog_mode = Environment.FOG_MODE_DEPTH
-	env.fog_density = 0.003
-	env.fog_aerial_perspective = 0.4
+	env.fog_density = 0.0012
+	env.fog_aerial_perspective = 0.3
 	env.set("fog_sun_scatter", 0.3)
 	env.fog_sky_affect = 0.5
 

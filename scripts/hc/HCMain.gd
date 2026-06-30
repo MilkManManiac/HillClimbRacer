@@ -18,6 +18,8 @@ var _fuel_bar: ColorRect
 var _health_bar: ColorRect
 var _info: Label
 var _big: Label
+var _score_lbl: Label
+var _trick_lbl: Label
 
 func _ready() -> void:
 	_setup_sky()
@@ -89,6 +91,10 @@ func _update_camera(delta: float) -> void:
 	var look := target + Vector3(0, 1.0, 0)
 	var t := _cam.global_transform.looking_at(look, Vector3.UP)
 	_cam.global_transform.basis = _cam.global_transform.basis.slerp(t.basis, 1.0 - exp(-8.0 * delta))
+	# FOV widens with speed for a sense of pace
+	var spd: float = _car.linear_velocity.length()
+	var target_fov: float = lerpf(70.0, 92.0, clamp(spd / 42.0, 0.0, 1.0))
+	_cam.fov = lerpf(_cam.fov, target_fov, 1.0 - exp(-4.0 * delta))
 
 func _restart() -> void:
 	_car.call("reset_run", _start)
@@ -116,6 +122,20 @@ func _setup_hud() -> void:
 	_big.add_theme_font_size_override("font_size", 26)
 	_big.add_theme_color_override("font_color", Color(1, 1, 0.7))
 	layer.add_child(_big)
+	_score_lbl = Label.new()
+	_score_lbl.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	_score_lbl.position = Vector2(-200, 28)
+	_score_lbl.add_theme_font_size_override("font_size", 24)
+	_score_lbl.add_theme_color_override("font_color", Color(1, 0.95, 0.5))
+	layer.add_child(_score_lbl)
+	_trick_lbl = Label.new()
+	_trick_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	_trick_lbl.position = Vector2(-240, 120)
+	_trick_lbl.custom_minimum_size = Vector2(480, 0)
+	_trick_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_trick_lbl.add_theme_font_size_override("font_size", 32)
+	_trick_lbl.add_theme_color_override("font_color", Color(0.6, 1.0, 0.7))
+	layer.add_child(_trick_lbl)
 	var hint := Label.new()
 	hint.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
 	hint.position = Vector2(28, -34)
@@ -149,6 +169,8 @@ func _update_hud() -> void:
 	_health_bar.size.x = 220.0 * clamp(health / maxf(maxhp, 1.0), 0.0, 1.0)
 	var air: String = "  ✈ AIR" if _car.get("airborne") else ""
 	_info.text = "%d m    %d km/h%s" % [int(dist), int(_car.call("get_speed_kmh")), air]
+	_score_lbl.text = "SCORE %d" % int(_car.get("score"))
+	_trick_lbl.text = _car.get("trick_text")
 	if _car.get("dead"):
 		_big.text = "WRECKED — %d m\nPress Enter to restart" % int(dist)
 	else:
