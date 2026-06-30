@@ -49,6 +49,9 @@ var _rays: Array[RayCast3D] = []
 var _wheel_meshes: Array[MeshInstance3D] = []
 var _wheel_positions: Array[Vector3] = []
 var _wings: Array[Node3D] = []
+var _ailerons: Array[Node3D] = []
+var _rudder: Node3D
+var _engine: Node3D
 var _grounded: bool = false
 var _steer: float = 0.0
 var _air_time: float = 0.0
@@ -77,6 +80,7 @@ func _ready() -> void:
 	_build_rays()
 	_build_body()
 	_build_wings()
+	_build_engine()
 
 func _physics_process(delta: float) -> void:
 	if dead:
@@ -170,8 +174,10 @@ func _physics_process(delta: float) -> void:
 		var rot_input: float = absf(pitch) + absf(steer_in) + absf(qe)
 		if rot_input < 0.15:
 			angular_velocity = angular_velocity.lerp(Vector3.ZERO, 1.0 - exp(-10.0 * delta))
-		# air-guidance upgrade: a gentle correction back toward the road center (x=0)
+		# WINGS: lift -> more air time the bigger they are (Air Guidance level)
 		if center_assist > 0.001:
+			apply_central_force(Vector3.UP * center_assist * 1.3 * mass)
+			# RUDDER/AILERONS: a gentle correction back toward the road center (x=0)
 			var corr: float = clampf(-global_position.x * 0.18, -0.6, 0.6) * center_assist
 			apply_central_force(Vector3((corr - linear_velocity.x * center_assist * 0.22) * mass, 0.0, 0.0))
 
@@ -191,6 +197,8 @@ func _physics_process(delta: float) -> void:
 		if up.dot(Vector3.UP) < 0.3:
 			apply_central_force(Vector3.UP * 8.0 * mass)
 		health -= delta * 4.0   # recovering costs a little
+
+	_animate_surfaces(delta)
 
 	# --- air-time + flip tracking (for later trick scoring) ----------------
 	if airborne:
@@ -313,6 +321,7 @@ func apply_wheel_size() -> void:
 		var cyl: CylinderMesh = wm.mesh
 		cyl.top_radius = wheel_radius
 		cyl.bottom_radius = wheel_radius
+		cyl.height = clampf(wheel_radius * 0.72, 0.3, 1.05)   # taller wheels are also wider
 		var base: Vector3 = _wheel_positions[i]
 		# bottom of wheel sits at the rest ground level (local y = 0.5 - suspension_rest)
 		wm.position = Vector3(base.x, 0.5 - suspension_rest + wheel_radius, base.z)
@@ -337,6 +346,55 @@ func _build_body() -> void:
 		mi.position = Vector3(0, 0.7, 0)
 		add_child(mi)
 
+func _metal(col: Color, rough := 0.35) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = col
+	m.metallic = 0.7
+	m.roughness = rough
+	return m
+
+## A blower/supercharger + intake trumpets + side exhausts on the hood; grows with Engine.
+func _build_engine() -> void:
+	_engine = Node3D.new()
+	_engine.position = Vector3(0, 1.0, -1.4)
+	add_child(_engine)
+	var blk := MeshInstance3D.new()
+	var bm := BoxMesh.new()
+	bm.size = Vector3(0.62, 0.36, 0.72)
+	blk.mesh = bm
+	blk.material_override = _metal(Color(0.12, 0.12, 0.14))
+	blk.position = Vector3(0, 0.22, 0)
+	_engine.add_child(blk)
+	for sx in [-0.16, 0.16]:
+		var stk := MeshInstance3D.new()
+		var cm := CylinderMesh.new()
+		cm.top_radius = 0.1
+		cm.bottom_radius = 0.06
+		cm.height = 0.22
+		stk.mesh = cm
+		stk.material_override = _metal(Color(0.6, 0.6, 0.66), 0.25)
+		stk.position = Vector3(sx, 0.5, 0)
+		_engine.add_child(stk)
+	for sx2 in [-0.55, 0.55]:
+		var pipe := MeshInstance3D.new()
+		var pm := CylinderMesh.new()
+		pm.top_radius = 0.06
+		pm.bottom_radius = 0.07
+		pm.height = 1.3
+		pipe.mesh = pm
+		pipe.material_override = _metal(Color(0.72, 0.72, 0.74), 0.25)
+		pipe.rotation_degrees = Vector3(90, 0, 0)
+		pipe.position = Vector3(sx2, -0.05, 0.7)
+		_engine.add_child(pipe)
+	apply_engine(0)
+
+## Engine grows bigger/meaner with level.
+func apply_engine(level: int) -> void:
+	if _engine == null:
+		return
+	var s: float = 0.55 + float(level) * 0.16
+	_engine.scale = Vector3(s, s, s)
+
 func _build_wings() -> void:
 	for side in [-1.0, 1.0]:
 		var pivot := Node3D.new()
@@ -348,20 +406,54 @@ func _build_wings() -> void:
 		wm.mesh = bm
 		wm.position = Vector3(0.9 * side, 0.0, 0.0)   # extends outward from the body
 		wm.rotation_degrees = Vector3(0, 0, -6.0 * side)  # slight upward tilt
-		var m := StandardMaterial3D.new()
-		m.albedo_color = Color(0.72, 0.74, 0.8)
-		m.metallic = 0.6
-		m.roughness = 0.35
-		wm.material_override = m
+		wm.material_override = _metal(Color(0.72, 0.74, 0.8))
 		pivot.add_child(wm)
+		# aileron flap, hinged at the wing's trailing edge (tilts with roll input)
+		var hinge := Node3D.new()
+		hinge.position = Vector3(0.9 * side, 0.0, 0.72)
+		pivot.add_child(hinge)
+		var flap := MeshInstance3D.new()
+		var fm := BoxMesh.new()
+		fm.size = Vector3(0.9, 0.06, 0.32)
+		flap.mesh = fm
+		flap.material_override = _metal(Color(0.55, 0.56, 0.6))
+		flap.position = Vector3(0, 0, 0.18)
+		hinge.add_child(flap)
+		_ailerons.append(hinge)
 		_wings.append(pivot)
+	# rudder: rear vertical fin (tilts with yaw input)
+	var rhinge := Node3D.new()
+	rhinge.position = Vector3(0, 1.25, 1.5)
+	add_child(rhinge)
+	var fin := MeshInstance3D.new()
+	var finm := BoxMesh.new()
+	finm.size = Vector3(0.08, 0.6, 0.7)
+	fin.mesh = finm
+	fin.material_override = _metal(Color(0.7, 0.72, 0.78))
+	fin.position = Vector3(0, 0.3, 0.1)
+	rhinge.add_child(fin)
+	_rudder = rhinge
 	apply_wings()
 
-## Wing size scales with the Air Guidance level (via center_assist). 0 = hidden.
+## Wing/rudder size scales with the Air Guidance level (via center_assist). 0 = hidden.
 func apply_wings() -> void:
-	var f: float = clampf(center_assist * 0.16, 0.0, 1.2)
+	var f: float = clampf(center_assist * 0.21, 0.0, 1.5)
 	for w in _wings:
 		w.scale = Vector3(f, f, f)
+	if _rudder:
+		_rudder.scale = Vector3(f, f, f)
+
+## Tilt the control surfaces with the air inputs (cosmetic feedback).
+func _animate_surfaces(delta: float) -> void:
+	var yaw_in := Input.get_axis("turn_right", "turn_left")
+	var roll_in := 0.0
+	if Input.is_key_pressed(KEY_Q): roll_in += 1.0
+	if Input.is_key_pressed(KEY_E): roll_in -= 1.0
+	if _rudder:
+		_rudder.rotation.y = lerp_angle(_rudder.rotation.y, yaw_in * 0.5, 1.0 - exp(-12.0 * delta))
+	for i in range(_ailerons.size()):
+		var sgn: float = -1.0 if i == 0 else 1.0
+		_ailerons[i].rotation.x = lerp_angle(_ailerons[i].rotation.x, roll_in * 0.6 * sgn, 1.0 - exp(-12.0 * delta))
 
 func _hide_glb_wheels(node: Node) -> void:
 	if str(node.name).to_lower().contains("wheel") and node is Node3D:

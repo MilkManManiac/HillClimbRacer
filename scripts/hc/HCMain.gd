@@ -142,6 +142,8 @@ func _apply_upgrades() -> void:
 		return
 	_car.set("engine_force", 19000.0 + _levels.engine * 3500.0)
 	_car.set("max_speed", 125.0 + _levels.engine * 7.0)
+	if _car.has_method("apply_engine"):
+		_car.call("apply_engine", _levels.engine)
 	_car.set("max_fuel", 600.0 + _levels.fuel * 240.0)
 	_car.set("land_damage_speed", 12.0 + _levels.suspension * 5.0 + _levels.wheels * 2.0)
 	# Bigger Wheels: more ride height + larger wheels (clearance over bumps)

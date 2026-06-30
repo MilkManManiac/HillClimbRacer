@@ -8,9 +8,10 @@ func _ready() -> void:
 func _process(_d: float) -> void:
 	_rf += 1
 	if _rf == 20:
-		_root.call("_set_level", "center", 6)   # max Air Guidance -> big wings
-	if _rf > 40:
-		Input.action_press("accelerate")
+		_root.call("_set_level", "center", 6)
+		_root.call("_set_level", "wheels", 6)
+		_root.call("_set_level", "engine", 6)
+	if _rf > 40: Input.action_press("accelerate")
 	if _rf == 200 and not _done:
 		_done = true
 		await RenderingServer.frame_post_draw
