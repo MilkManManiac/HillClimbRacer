@@ -53,6 +53,7 @@ var _ailerons: Array[Node3D] = []
 var _rudder: Node3D
 var _engine: Node3D
 var _cage: Node3D
+var _cage_tiers: Array[Node3D] = []
 var _airbrake: Node3D
 var _cans: Array[MeshInstance3D] = []
 var _dust: GPUParticles3D
@@ -173,8 +174,8 @@ func _physics_process(delta: float) -> void:
 		# --- airborne: full manual 3-axis (no assist) ----------------------
 		var pitch := pitch_in                      # W nose down / S nose up (Space no longer pitches)
 		var qe := 0.0
-		if Input.is_key_pressed(KEY_Q): qe += 1.0
-		if Input.is_key_pressed(KEY_E): qe -= 1.0
+		if Input.is_key_pressed(KEY_Q): qe -= 1.0
+		if Input.is_key_pressed(KEY_E): qe += 1.0
 		apply_torque(right * pitch * air_pitch_torque * mass)   # W/S = pitch
 		apply_torque(up * steer_in * air_yaw_torque * mass)     # A/D = yaw (rotate)
 		apply_torque(fwd * qe * air_roll_torque * mass)         # Q/E = roll
@@ -428,27 +429,64 @@ func _tube(parent: Node3D, a: Vector3, b: Vector3, r: float, mat: Material) -> v
 func _build_cage() -> void:
 	_cage = Node3D.new()
 	add_child(_cage)
+	for _i in range(6):
+		var t := Node3D.new()
+		_cage.add_child(t)
+		_cage_tiers.append(t)
 	var mat := _metal(Color(0.13, 0.13, 0.15))
-	var hx := 1.32      # outside the body width so it's visible
-	var zf := -1.75     # front
-	var zr := 1.75      # rear
+	var hx := 1.32
+	var zf := -1.75
+	var zr := 1.75
 	var yb := 0.35
 	var yt := 2.3
 	var bot := [Vector3(-hx, yb, zf), Vector3(hx, yb, zf), Vector3(-hx, yb, zr), Vector3(hx, yb, zr)]
 	var top := [Vector3(-hx, yt, zf), Vector3(hx, yt, zf), Vector3(-hx, yt, zr), Vector3(hx, yt, zr)]
+	# tier 0 (Lv1): base cage
 	for i in range(4):
-		_tube(_cage, bot[i], top[i], 0.06, mat)   # 4 corner posts
-	_tube(_cage, top[0], top[1], 0.06, mat)        # top front
-	_tube(_cage, top[2], top[3], 0.06, mat)        # top rear
-	_tube(_cage, top[0], top[2], 0.06, mat)        # top left
-	_tube(_cage, top[1], top[3], 0.06, mat)        # top right
-	_tube(_cage, bot[0], bot[2], 0.06, mat)        # bottom left rail
-	_tube(_cage, bot[1], bot[3], 0.06, mat)        # bottom right rail
+		_tube(_cage_tiers[0], bot[i], top[i], 0.06, mat)
+	_tube(_cage_tiers[0], top[0], top[1], 0.06, mat)
+	_tube(_cage_tiers[0], top[2], top[3], 0.06, mat)
+	_tube(_cage_tiers[0], top[0], top[2], 0.06, mat)
+	_tube(_cage_tiers[0], top[1], top[3], 0.06, mat)
+	_tube(_cage_tiers[0], bot[0], bot[2], 0.06, mat)
+	_tube(_cage_tiers[0], bot[1], bot[3], 0.06, mat)
+	# tier 1 (Lv2): side diagonal braces
+	_tube(_cage_tiers[1], bot[0], top[2], 0.05, mat)
+	_tube(_cage_tiers[1], bot[1], top[3], 0.05, mat)
+	# tier 2 (Lv3): rear harness bar + rear X
+	_tube(_cage_tiers[2], Vector3(-hx, yt - 0.5, zr), Vector3(hx, yt - 0.5, zr), 0.05, mat)
+	_tube(_cage_tiers[2], bot[2], top[3], 0.05, mat)
+	_tube(_cage_tiers[2], bot[3], top[2], 0.05, mat)
+	# tier 3 (Lv4): roof X-brace
+	_tube(_cage_tiers[3], top[0], top[3], 0.05, mat)
+	_tube(_cage_tiers[3], top[1], top[2], 0.05, mat)
+	# tier 4 (Lv5): roof light bar
+	var lby := yt + 0.16
+	_tube(_cage_tiers[4], Vector3(-0.9, lby, -0.25), Vector3(0.9, lby, -0.25), 0.05, _metal(Color(0.08, 0.08, 0.09)))
+	for lx in [-0.62, -0.21, 0.21, 0.62]:
+		var light := MeshInstance3D.new()
+		var lbm := BoxMesh.new()
+		lbm.size = Vector3(0.18, 0.13, 0.1)
+		light.mesh = lbm
+		var lm := StandardMaterial3D.new()
+		lm.albedo_color = Color(1, 0.95, 0.6)
+		lm.emission_enabled = true
+		lm.emission = Color(1, 0.95, 0.6)
+		lm.emission_energy_multiplier = 1.6
+		light.material_override = lm
+		light.position = Vector3(lx, lby, -0.25)
+		_cage_tiers[4].add_child(light)
+	# tier 5 (Lv6): chunky front bar + front harness
+	_tube(_cage_tiers[5], bot[0], bot[1], 0.075, mat)
+	_tube(_cage_tiers[5], Vector3(-hx, yt - 0.5, zf), Vector3(hx, yt - 0.5, zf), 0.06, mat)
 	apply_cage(0)
 
 func apply_cage(level: int) -> void:
-	if _cage:
-		_cage.visible = level > 0
+	if _cage == null:
+		return
+	_cage.visible = level > 0
+	for i in range(_cage_tiers.size()):
+		_cage_tiers[i].visible = level > i
 
 # --- air-brake flap (Dive upgrade) ------------------------------------------
 func _build_airbrake() -> void:
@@ -520,17 +558,17 @@ func _build_dust() -> void:
 	_dust.draw_pass_1 = qm
 	add_child(_dust)
 
-## A flat delta wing that tapers from the body out to a point, with a slight dihedral.
+## A normal tapered wing (trapezoid): wide root chord, narrower swept tip, slight dihedral.
 func _wing_mesh(side: float) -> ArrayMesh:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var ox := side
-	var rf := Vector3(0.15 * ox, 0.0, -1.0)    # root front (at the body)
-	var rb := Vector3(0.15 * ox, 0.0, 1.25)    # root back
-	var tip := Vector3(2.9 * ox, 0.32, 0.1)    # wide span, upswept point
-	st.add_vertex(rf)
-	st.add_vertex(rb)
-	st.add_vertex(tip)
+	var rf := Vector3(0.1 * ox, 0.0, -0.7)     # root front (at the body)
+	var rb := Vector3(0.1 * ox, 0.0, 0.55)     # root back (trailing edge)
+	var tf := Vector3(2.5 * ox, 0.22, -0.25)   # tip front (swept + dihedral)
+	var tb := Vector3(2.5 * ox, 0.22, 0.4)     # tip back
+	st.add_vertex(rf); st.add_vertex(rb); st.add_vertex(tb)
+	st.add_vertex(rf); st.add_vertex(tb); st.add_vertex(tf)
 	st.generate_normals()
 	return st.commit()
 
@@ -545,16 +583,16 @@ func _build_wings() -> void:
 		wmat.cull_mode = BaseMaterial3D.CULL_DISABLED
 		wm.material_override = wmat
 		pivot.add_child(wm)
-		# aileron flap on the wing's trailing edge (tilts with roll input)
+		# aileron flap on the wing's trailing (back) edge (tilts with roll input)
 		var hinge := Node3D.new()
-		hinge.position = Vector3(1.2 * side, 0.0, 1.0)
+		hinge.position = Vector3(1.35 * side, 0.13, 0.45)
 		pivot.add_child(hinge)
 		var flap := MeshInstance3D.new()
 		var fm := BoxMesh.new()
-		fm.size = Vector3(1.3, 0.05, 0.3)
+		fm.size = Vector3(1.7, 0.05, 0.28)
 		flap.mesh = fm
-		flap.material_override = _metal(Color(0.55, 0.56, 0.6))
-		flap.position = Vector3(0, 0, 0.18)
+		flap.material_override = _metal(Color(0.5, 0.51, 0.56))
+		flap.position = Vector3(0, 0, 0.15)
 		hinge.add_child(flap)
 		_ailerons.append(hinge)
 		_wings.append(pivot)
@@ -598,8 +636,8 @@ func apply_ailerons(level: int) -> void:
 func _animate_surfaces(delta: float) -> void:
 	var yaw_in := Input.get_axis("turn_right", "turn_left")
 	var roll_in := 0.0
-	if Input.is_key_pressed(KEY_Q): roll_in += 1.0
-	if Input.is_key_pressed(KEY_E): roll_in -= 1.0
+	if Input.is_key_pressed(KEY_Q): roll_in -= 1.0
+	if Input.is_key_pressed(KEY_E): roll_in += 1.0
 	if _rudder:
 		_rudder.rotation.y = lerp_angle(_rudder.rotation.y, yaw_in * 0.5, 1.0 - exp(-12.0 * delta))
 	for i in range(_ailerons.size()):
