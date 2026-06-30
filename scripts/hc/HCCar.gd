@@ -29,6 +29,7 @@ const CAR_GLB := "res://assets/car/kenney_sedan_cc0.glb"
 @export var air_yaw_torque: float = 6.0
 @export var max_fuel: float = 600.0   # generous for the feel/air sandbox (tune later)
 @export var max_health: float = 100.0
+@export var road_half: float = 14.0   # land outside this (jumped the rail) -> crash
 @export var land_damage_speed: float = 12.0  # vertical impact speed before damage starts
 
 var fuel: float = 100.0
@@ -97,8 +98,8 @@ func _physics_process(delta: float) -> void:
 	var braking := Input.get_action_strength("brake")
 	var steer_in := Input.get_axis("turn_right", "turn_left")
 	var pitch_in := 0.0
-	if Input.is_key_pressed(KEY_W): pitch_in += 1.0
-	if Input.is_key_pressed(KEY_S): pitch_in -= 1.0
+	if Input.is_key_pressed(KEY_W): pitch_in -= 1.0   # W = nose down / lean forward
+	if Input.is_key_pressed(KEY_S): pitch_in += 1.0   # S = nose up / lean back
 
 	if _grounded:
 		# drive / brake (fuel-gated)
@@ -157,6 +158,9 @@ func _physics_process(delta: float) -> void:
 	_last_up = up
 
 	# --- fuel/health bookkeeping -------------------------------------------
+	# crash if you land/roll off the road (past the rails)
+	if _grounded and absf(global_position.x) > road_half + 1.5:
+		health = 0.0
 	fuel = maxf(fuel, 0.0)
 	distance = maxf(distance, -global_position.z)
 	if health <= 0.0 or (fuel <= 0.0 and speed < 0.5 and _grounded):

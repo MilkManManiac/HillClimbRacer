@@ -39,6 +39,7 @@ func _setup_terrain_and_car() -> void:
 	_car = RigidBody3D.new()
 	_car.set_script(HCCarScript)
 	add_child(_car)
+	_car.set("road_half", _terrain.get("road_half_width"))
 	# place start above the terrain so it drops onto it
 	_start.y = _terrain.call("height_at", 0.0, 0.0) + 4.0
 	_car.global_position = _start

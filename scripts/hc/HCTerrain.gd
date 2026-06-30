@@ -1,26 +1,29 @@
 extends Node3D
-## Endless forward-corridor heightfield for the Hill-Climb sandbox. Chunks stream in
-## ahead of the car (forward = -Z) and free behind. Terrain amplitude/roughness grows
-## with distance so the run escalates from gentle hills to mountainous big-air terrain.
-## Each chunk has trimesh collision the raycast-wheel car drives on. Invisible side
-## walls keep the car in the lateral band.
+## Endless forward-corridor terrain for the Hill-Climb sandbox. A ROAD runs down the
+## center (x≈0): it rolls up and down over hills (amplitude grows with distance), while
+## the ground to the sides flattens out — hills are only on the road. Guardrail barriers
+## line the road edges (collision) so you can't drive off; jump them and land off-road
+## and you crash. Chunks stream in ahead and free behind; solid HeightMapShape3D collision.
 
-const CHUNK := 64.0       # chunk size (m)
-const RES := 22           # grid cells per chunk side
-const LAT := 3            # chunks each side of centerline -> band width = (2*LAT+1)*CHUNK
-const AHEAD := 11         # chunks generated ahead (in -Z)
-const BEHIND := 3         # chunks kept behind
+const CHUNK := 64.0
+const RES := 30           # grid cells per chunk side (higher = smoother)
+const LAT := 3
+const AHEAD := 11
+const BEHIND := 3
 
-@export var base_amp: float = 3.0     # gentle near the start
-@export var max_amp: float = 48.0     # tall but broad/climbable launch ramps far out
-@export var ramp_dist: float = 500.0  # ramps up sooner so air gets fun fast
+@export var base_amp: float = 3.0
+@export var max_amp: float = 48.0
+@export var ramp_dist: float = 500.0
+@export var road_half_width: float = 14.0   # drivable road half-width
+@export var edge_falloff: float = 16.0       # how fast hills fade to flat off the road
+@export var side_amp: float = 0.10           # leftover hilliness on the flat sides
+@export var rail_height: float = 1.6
 
 var _noise := FastNoiseLite.new()
-var _rough := FastNoiseLite.new()
-var _chunks := {}          # Vector2i(cx,cz) -> MeshInstance3D
+var _chunks := {}
 var _target: Node3D
-var _wall_l: StaticBody3D
-var _wall_r: StaticBody3D
+var _barriers: Array[Node3D] = []
+var _last_barrier_cz := 999999
 
 func _ready() -> void:
 	_noise.seed = 1234
@@ -28,45 +31,37 @@ func _ready() -> void:
 	_noise.fractal_type = FastNoiseLite.FRACTAL_FBM
 	_noise.frequency = 0.011
 	_noise.fractal_octaves = 2
-	_rough.seed = 99
-	_rough.noise_type = FastNoiseLite.TYPE_SIMPLEX
-	_rough.frequency = 0.05
-	_build_walls()
 
 func set_target(t: Node3D) -> void:
 	_target = t
 	_update_chunks(true)
 
-## STRAIGHT ROAD with hills: height depends only on forward distance (z), so the surface
-## is flat across the width and rolls up/down along the road — clean ramps to build speed
-## on downhills and launch off crests. Amplitude grows the further (-Z) you go.
-func height_at(_x: float, z: float) -> float:
+## Height: rolling hills on the road (center), flattening to the sides.
+func height_at(x: float, z: float) -> float:
 	var d: float = maxf(0.0, -z)
 	var amp: float = lerpf(base_amp, max_amp, clamp(d / ramp_dist, 0.0, 1.0))
-	var n: float = _noise.get_noise_1d(z)               # 1D rolling hills along the road
-	return n * amp
+	var prof: float = _noise.get_noise_1d(z)
+	var edge: float = smoothstep(road_half_width, road_half_width + edge_falloff, absf(x))
+	var amp_here: float = lerpf(amp, amp * side_amp, edge)
+	return prof * amp_here
 
 func _physics_process(_delta: float) -> void:
 	if _target:
 		_update_chunks(false)
-		_follow_walls()
 
 # --- streaming ---------------------------------------------------------------
 
 func _update_chunks(initial: bool) -> void:
 	var pz: int = int(floor(_target.global_position.z / CHUNK))
 	var px: int = int(floor(_target.global_position.x / CHUNK))
-	# desired chunk set: lateral band, from BEHIND (+Z) to AHEAD (-Z)
 	var wanted := {}
 	for cz in range(pz - AHEAD, pz + BEHIND + 1):
 		for cx in range(px - LAT, px + LAT + 1):
 			wanted[Vector2i(cx, cz)] = true
-	# free chunks no longer wanted
 	for key in _chunks.keys():
 		if not wanted.has(key):
 			_chunks[key].queue_free()
 			_chunks.erase(key)
-	# build a few new chunks per frame (all of them on the initial pass)
 	var budget := 999 if initial else 3
 	for key in wanted.keys():
 		if budget <= 0:
@@ -74,6 +69,9 @@ func _update_chunks(initial: bool) -> void:
 		if not _chunks.has(key):
 			_chunks[key] = _build_chunk(key)
 			budget -= 1
+	if initial or pz != _last_barrier_cz:
+		_last_barrier_cz = pz
+		_rebuild_barriers(pz)
 
 func _build_chunk(key: Vector2i) -> Node3D:
 	var ox := float(key.x) * CHUNK
@@ -88,8 +86,7 @@ func _build_chunk(key: Vector2i) -> Node3D:
 			var z := oz + float(iz) * step
 			var y := height_at(x, z)
 			heights.append(y)
-			st.set_color(_color_for(y, z))
-			st.set_uv(Vector2(float(ix) / RES, float(iz) / RES))
+			st.set_color(_color_for(x, y))
 			st.add_vertex(Vector3(x, y, z))
 	var row := RES + 1
 	for iz in range(RES):
@@ -107,7 +104,6 @@ func _build_chunk(key: Vector2i) -> Node3D:
 	mi.mesh = st.commit()
 	mi.material_override = _terrain_mat()
 	container.add_child(mi)
-	# solid heightmap collision (robust vs fast landings; trimesh tunnels)
 	var hm := HeightMapShape3D.new()
 	hm.map_width = RES + 1
 	hm.map_depth = RES + 1
@@ -122,23 +118,14 @@ func _build_chunk(key: Vector2i) -> Node3D:
 	add_child(container)
 	return container
 
-func _color_for(y: float, z: float) -> Color:
-	# low-poly tint by height: green -> brown -> rock -> snow on the big stuff
-	var d: float = maxf(0.0, -z)
-	var amp: float = lerpf(base_amp, max_amp, clamp(d / ramp_dist, 0.0, 1.0))
-	var t: float = clamp((y + amp * 0.3) / maxf(amp, 1.0), -1.0, 1.0)
-	var grass := Color(0.30, 0.45, 0.22)
-	var dirt := Color(0.40, 0.33, 0.22)
-	var rock := Color(0.38, 0.37, 0.40)
-	var snow := Color(0.92, 0.94, 0.98)
-	var c: Color
-	if t < 0.2:
-		c = grass.lerp(dirt, clamp(t / 0.2, 0.0, 1.0))
-	elif t < 0.55:
-		c = dirt.lerp(rock, (t - 0.2) / 0.35)
-	else:
-		c = rock.lerp(snow, clamp((t - 0.55) / 0.35, 0.0, 1.0))
-	return c
+func _color_for(x: float, _y: float) -> Color:
+	var ax := absf(x)
+	var asphalt := Color(0.16, 0.16, 0.18)
+	var grass := Color(0.28, 0.44, 0.20)
+	if ax < 0.45:
+		return Color(0.82, 0.70, 0.20)   # center line
+	var edge := smoothstep(road_half_width - 2.0, road_half_width + 2.0, ax)
+	return asphalt.lerp(grass, edge)
 
 var _mat: StandardMaterial3D
 func _terrain_mat() -> StandardMaterial3D:
@@ -148,31 +135,51 @@ func _terrain_mat() -> StandardMaterial3D:
 	_mat.vertex_color_use_as_albedo = true
 	_mat.roughness = 1.0
 	_mat.specular_mode = BaseMaterial3D.SPECULAR_DISABLED
-	_mat.cull_mode = BaseMaterial3D.CULL_DISABLED   # double-sided: fixes see-through faces
+	_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 	return _mat
 
-# --- lateral containment walls ----------------------------------------------
+# --- guardrail barriers (follow the road edge height, stream with the player) -
 
-func _build_walls() -> void:
-	var band := float(LAT) * CHUNK + CHUNK * 0.5
-	_wall_l = _make_wall()
-	_wall_r = _make_wall()
-	_wall_l.position.x = -band
-	_wall_r.position.x = band
+func _rebuild_barriers(pz: int) -> void:
+	for b in _barriers:
+		b.queue_free()
+	_barriers.clear()
+	var z0 := float(pz - AHEAD) * CHUNK
+	var z1 := float(pz + BEHIND + 1) * CHUNK
+	_barriers.append(_build_rail(-road_half_width, z0, z1))
+	_barriers.append(_build_rail(road_half_width, z0, z1))
 
-func _make_wall() -> StaticBody3D:
-	var body := StaticBody3D.new()
-	var cs := CollisionShape3D.new()
-	var box := BoxShape3D.new()
-	box.size = Vector3(2.0, 120.0, 6000.0)
-	cs.shape = box
-	body.add_child(cs)
-	add_child(body)
-	return body
-
-func _follow_walls() -> void:
-	var z := _target.global_position.z
-	_wall_l.position.z = z
-	_wall_r.position.z = z
-	_wall_l.position.y = 40.0
-	_wall_r.position.y = 40.0
+func _build_rail(xpos: float, z0: float, z1: float) -> Node3D:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var step := 4.0
+	var rings := 0
+	var z := z0
+	while z <= z1:
+		var ey := height_at(xpos, z)
+		st.set_color(Color(0.75, 0.75, 0.8))
+		st.add_vertex(Vector3(xpos, ey - 0.3, z))
+		st.set_color(Color(0.9, 0.3, 0.25))
+		st.add_vertex(Vector3(xpos, ey + rail_height, z))
+		rings += 1
+		z += step
+	for r in range(rings - 1):
+		var a := r * 2
+		var b := r * 2 + 1
+		var c := (r + 1) * 2
+		var dd := (r + 1) * 2 + 1
+		st.add_index(a); st.add_index(c); st.add_index(b)
+		st.add_index(b); st.add_index(c); st.add_index(dd)
+	st.generate_normals()
+	var container := Node3D.new()
+	var mi := MeshInstance3D.new()
+	mi.mesh = st.commit()
+	var mat := StandardMaterial3D.new()
+	mat.vertex_color_use_as_albedo = true
+	mat.roughness = 0.6
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	mi.material_override = mat
+	container.add_child(mi)
+	mi.create_trimesh_collision()
+	add_child(container)
+	return container
