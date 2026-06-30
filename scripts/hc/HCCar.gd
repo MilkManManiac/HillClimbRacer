@@ -22,9 +22,10 @@ const CAR_GLB := "res://assets/car/kenney_sedan_cc0.glb"
 @export var gravity_force: float = 17.0    # lower = floatier, more hang time
 @export var suspension_rest: float = 0.55   # ride height (raised by Bigger Wheels)
 @export var wheel_radius: float = 0.5        # visual wheel size + bump reach
-@export var suspension_stiff: float = 95.0
-@export var suspension_damp: float = 6.0
-@export var dive_force: float = 26.0       # downward push when diving
+@export var suspension_stiff: float = 105.0
+@export var suspension_damp: float = 2.2    # low damping = springy bounce on landing
+@export var dive_force: float = 30.0       # downward push when diving (upgradable)
+@export var center_assist: float = 0.0     # air-guidance upgrade: pulls toward road center
 @export var air_pitch_torque: float = 11.0
 @export var air_roll_torque: float = 9.0
 @export var air_yaw_torque: float = 6.0
@@ -158,6 +159,10 @@ func _physics_process(delta: float) -> void:
 		var rot_input: float = absf(pitch) + absf(steer_in) + absf(yaw)
 		if rot_input < 0.15:
 			angular_velocity = angular_velocity.lerp(Vector3.ZERO, 1.0 - exp(-10.0 * delta))
+		# air-guidance upgrade: a slow correction back toward the road center (x=0)
+		if center_assist > 0.001:
+			var corr: float = clampf(-global_position.x * 0.3, -1.0, 1.0) * center_assist
+			apply_central_force(Vector3((corr - linear_velocity.x * center_assist * 0.4) * mass, 0.0, 0.0))
 
 	# soft top-speed cap so downhills don't run away to absurd speeds
 	var soft_cap := 53.0   # m/s (~190 km/h)

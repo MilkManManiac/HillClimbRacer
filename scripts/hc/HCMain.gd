@@ -22,12 +22,12 @@ var _score_lbl: Label
 var _trick_lbl: Label
 
 # --- economy / upgrades ------------------------------------------------------
-const UP_KEYS := ["engine", "fuel", "suspension", "wheels", "grip", "air"]
-const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "suspension": "Suspension", "wheels": "Bigger Wheels", "grip": "Grip", "air": "Air Control"}
-const UP_BASECOST := {"engine": 160, "fuel": 130, "suspension": 150, "wheels": 170, "grip": 120, "air": 140}
+const UP_KEYS := ["engine", "fuel", "suspension", "wheels", "air", "center", "dive"]
+const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "suspension": "Suspension", "wheels": "Bigger Wheels", "air": "Air Control", "center": "Air Guidance", "dive": "Dive Power"}
+const UP_BASECOST := {"engine": 160, "fuel": 130, "suspension": 150, "wheels": 170, "air": 140, "center": 150, "dive": 130}
 const UP_MAX := 6
 var money: int = 0
-var _levels := {"engine": 0, "fuel": 0, "suspension": 0, "wheels": 0, "grip": 0, "air": 0}
+var _levels := {"engine": 0, "fuel": 0, "suspension": 0, "wheels": 0, "air": 0, "center": 0, "dive": 0}
 var _was_dead := false
 var _shop: Control
 var _shop_header: Label
@@ -144,7 +144,6 @@ func _apply_upgrades() -> void:
 	_car.set("max_speed", 125.0 + _levels.engine * 7.0)
 	_car.set("max_fuel", 600.0 + _levels.fuel * 240.0)
 	_car.set("land_damage_speed", 12.0 + _levels.suspension * 5.0 + _levels.wheels * 2.0)
-	_car.set("grip", 8.5 + _levels.grip * 0.9)
 	# Bigger Wheels: more ride height + larger wheels (clearance over bumps)
 	_car.set("suspension_rest", 0.55 + _levels.wheels * 0.18)
 	_car.set("wheel_radius", 0.5 + _levels.wheels * 0.12)
@@ -153,6 +152,8 @@ func _apply_upgrades() -> void:
 	_car.set("air_pitch_torque", 11.0 + _levels.air * 2.0)
 	_car.set("air_roll_torque", 9.0 + _levels.air * 1.6)
 	_car.set("air_yaw_torque", 6.0 + _levels.air * 1.2)
+	_car.set("center_assist", _levels.center * 2.0)        # air auto-center strength
+	_car.set("dive_force", 30.0 + _levels.dive * 16.0)     # heavier dive to time ramps
 
 func _build_shop() -> void:
 	var layer := CanvasLayer.new()

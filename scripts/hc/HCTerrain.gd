@@ -12,10 +12,10 @@ const AHEAD := 11
 const BEHIND := 3
 
 @export var base_amp: float = 3.0
-@export var max_amp: float = 48.0
-@export var ramp_dist: float = 500.0
-@export var road_half_width: float = 14.0   # drivable road half-width
-@export var edge_falloff: float = 16.0       # how fast hills fade to flat off the road
+@export var max_amp: float = 28.0            # lower hills (long flowing jumps, not tall walls)
+@export var ramp_dist: float = 450.0
+@export var road_half_width: float = 28.0    # road twice as wide
+@export var edge_falloff: float = 18.0       # how fast hills fade to flat off the road
 @export var side_amp: float = 0.10           # leftover hilliness on the flat sides
 @export var rail_height: float = 1.6
 
@@ -29,7 +29,7 @@ func _ready() -> void:
 	_noise.seed = 1234
 	_noise.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
 	_noise.fractal_type = FastNoiseLite.FRACTAL_FBM
-	_noise.frequency = 0.008
+	_noise.frequency = 0.005
 	_noise.fractal_octaves = 2
 
 func set_target(t: Node3D) -> void:
