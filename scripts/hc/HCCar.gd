@@ -573,10 +573,13 @@ func _build_body() -> void:
 	# --- main tub: stacked, slightly tapered boxes for a rounded shoulder line ---
 	_panel(_body, Vector3(1.84, 0.42, 3.5), Vector3(0, 0.58, 0), red, 0.35, 0.6)      # body sides
 	_panel(_body, Vector3(1.6, 0.3, 3.4), Vector3(0, 0.86, 0), red, 0.35, 0.6)        # upper shoulder
-	# beveled top edges (prisms) to knock the slab corners off the shoulder
+	# beveled top edges (prisms) to knock the slab corners off the shoulder.
+	# These run FRONT-TO-BACK along the body (length on Z) and roll about Z to chamfer
+	# the top-outer corner. (A 90° YAW here was swinging the 3.4 m length out sideways
+	# into a red plank that looked exactly like a wing on the bare car.)
 	for sx_b in [-1.0, 1.0]:
-		var bev := _prism(_body, Vector3(0.26, 0.22, 3.4), Vector3(0.78 * sx_b, 0.92, 0.0), red, 0.35, 0.6)
-		bev.rotation_degrees = Vector3(0, 90 if sx_b > 0.0 else -90, 0)
+		var bev := _prism(_body, Vector3(0.4, 0.3, 3.4), Vector3(0.74 * sx_b, 0.9, 0.0), red, 0.35, 0.6)
+		bev.rotation_degrees = Vector3(0, 0, -35.0 * sx_b)
 
 	# --- hood: stepped down toward the nose, with a raised center spine ---------
 	_panel(_body, Vector3(1.6, 0.32, 1.25), Vector3(0, 0.82, -1.2), red, 0.32, 0.6)
