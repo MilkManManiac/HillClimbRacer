@@ -531,7 +531,9 @@ func apply_wheel_size() -> void:
 		var cyl: CylinderMesh = wm.mesh
 		cyl.top_radius = wheel_radius
 		cyl.bottom_radius = wheel_radius
-		cyl.height = clampf(wheel_radius * 0.72, 0.3, 1.05)   # taller wheels are also wider
+		# wheels get noticeably WIDER as they grow with the Bigger Wheels upgrade
+		# (cyl height = tyre width, axle along X). Higher cap so maxed wheels read fat.
+		cyl.height = clampf(wheel_radius * 1.15, 0.42, 2.6)
 		var base: Vector3 = _wheel_positions[i]
 		# bottom of wheel sits at the rest ground level (local y = 0.5 - suspension_rest)
 		wm.position = Vector3(base.x, 0.5 - suspension_rest + wheel_radius, base.z)
