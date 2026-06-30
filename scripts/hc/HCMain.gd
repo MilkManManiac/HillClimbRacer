@@ -22,12 +22,27 @@ var _score_lbl: Label
 var _trick_lbl: Label
 
 # --- economy / upgrades ------------------------------------------------------
-const UP_KEYS := ["engine", "fuel", "suspension", "wheels", "wings", "ailerons", "dive", "rockets", "stretch", "wide", "sidecar", "antigrav"]
-const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "suspension": "Suspension", "wheels": "Bigger Wheels", "wings": "Wings", "ailerons": "Ailerons", "dive": "Dive Power", "rockets": "Rockets", "stretch": "Stretch (Limo)", "wide": "Wide Stance", "sidecar": "Sidecar", "antigrav": "Anti-Grav"}
-const UP_BASECOST := {"engine": 160, "fuel": 130, "suspension": 150, "wheels": 170, "wings": 150, "ailerons": 140, "dive": 130, "rockets": 180, "stretch": 200, "wide": 190, "sidecar": 220, "antigrav": 210}
+const UP_KEYS := ["engine", "fuel", "suspension", "wheels", "wings", "ailerons", "dive", "rockets", "stretch", "wide"]
+const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "suspension": "Suspension", "wheels": "Bigger Wheels", "wings": "Wings", "ailerons": "Ailerons", "dive": "Dive Power", "rockets": "Rockets", "stretch": "Stretch (Limo)", "wide": "Wide Stance"}
+const UP_DESC := {
+	"engine": "More power & higher top speed",
+	"fuel": "Bigger tank + visible jerry cans",
+	"suspension": "Roll cage, armor (+HP), softer landings",
+	"wheels": "Taller wheels, more ground clearance",
+	"wings": "Lift = more air time off jumps",
+	"ailerons": "Air control + auto-centering (needs Wings)",
+	"dive": "Hold Space to dive + an air-brake flap",
+	"rockets": "Hold Ctrl: a little air boost (chugs fuel)",
+	"stretch": "Limo: longer wheelbase, lazier turns",
+	"wide": "Wider stance, harder to roll over",
+}
+const UP_BASECOST := {"engine": 140, "fuel": 110, "suspension": 150, "wheels": 120, "wings": 170, "ailerons": 150, "dive": 130, "rockets": 190, "stretch": 160, "wide": 140}
+const UP_COSTMULT := 1.6   # each level costs 1.6x the last
 const UP_MAX := 6
+const MONEY_PER_M := 1.0    # money earned = metres travelled down the track
 var money: int = 0
-var _levels := {"engine": 0, "fuel": 0, "suspension": 0, "wheels": 0, "wings": 0, "ailerons": 0, "dive": 0, "rockets": 0, "stretch": 0, "wide": 0, "sidecar": 0, "antigrav": 0}
+var _last_earned: int = 0
+var _levels := {"engine": 0, "fuel": 0, "suspension": 0, "wheels": 0, "wings": 0, "ailerons": 0, "dive": 0, "rockets": 0, "stretch": 0, "wide": 0}
 var _was_dead := false
 var _respawning := false
 var _shake := 0.0           # camera shake magnitude (decays)
@@ -94,11 +109,12 @@ func _process(delta: float) -> void:
 		return
 	_update_camera(delta)
 	_update_hud()
-	# on death, bank the run's score into money and open the shop
+	# on death, bank money earned from how far down the track you got, open the shop
 	var d: bool = _car.get("dead")
 	if d and not _was_dead:
 		_was_dead = true
-		money += int(_car.get("score"))
+		_last_earned = int(float(_car.get("distance")) * MONEY_PER_M)
+		money += _last_earned
 		_show_shop()
 
 func _update_camera(delta: float) -> void:
@@ -164,44 +180,35 @@ func _restart() -> void:
 	if _shop:
 		_shop.visible = false
 
-# --- gap wipeout: slow-mo plunge, then drop back at the last checkpoint -------
+# --- camera juice ------------------------------------------------------------
 
 ## A landing kicks the camera: shake + a quick FOV punch, both scaled by impact.
 func _on_car_landed(impact: float, _air_time: float) -> void:
 	_shake = maxf(_shake, clampf(impact * 0.018, 0.0, 0.6))
 	_fov_punch = maxf(_fov_punch, clampf(impact * 0.5, 0.0, 12.0))
 
-func _on_car_gap_failed(can_respawn: bool) -> void:
-	if not can_respawn or _respawning:
-		return   # no checkpoint yet -> the car set dead, normal wreck/shop flow
-	_respawning = true
-	Engine.time_scale = 0.35           # slow-mo plunge (the gag)
-	_big.text = "WIPEOUT!"
-	# real-time wait despite the slowed clock (ignore_time_scale = true)
-	await get_tree().create_timer(0.9, true, false, true).timeout
-	Engine.time_scale = 1.0
-	_big.text = ""
-	var cz: float = _car.get("checkpoint_z")
-	_car.call("respawn_at", cz)
-	var cy: float = _terrain.call("height_at", 0.0, cz) + 6.0
-	_cam.global_position = Vector3(0, cy, cz + 12.0)
-	_cam_heading = Vector3(0, 0, -1)
-	_respawning = false
+## Falling into a pit is a wreck like any other — the car sets dead and _process
+## shows the end screen. Just add a jolt here for feel.
+func _on_car_gap_failed(_can_respawn: bool) -> void:
+	_shake = maxf(_shake, 0.5)
 
 # --- upgrade shop ------------------------------------------------------------
 
 func _cost(key: String) -> int:
-	return int(UP_BASECOST[key] * pow(1.7, _levels[key]))
+	return int(UP_BASECOST[key] * pow(UP_COSTMULT, _levels[key]))
 
 func _apply_upgrades() -> void:
 	if _car == null:
 		return
-	_car.set("engine_force", 19000.0 + _levels.engine * 3500.0)
-	_car.set("max_speed", 125.0 + _levels.engine * 7.0)
+	# starter is intentionally weak/slow; upgrades ramp it up hard
+	_car.set("engine_force", 8000.0 + _levels.engine * 3600.0)
+	_car.set("max_speed", 30.0 + _levels.engine * 15.0)
 	if _car.has_method("apply_engine"):
 		_car.call("apply_engine", _levels.engine)
-	_car.set("max_fuel", 600.0 + _levels.fuel * 240.0)
-	_car.set("land_damage_speed", 12.0 + _levels.suspension * 5.0 + _levels.wheels * 2.0)
+	# fuel is the run timer again — tight so it actually matters (gaps refill a bit)
+	_car.set("max_fuel", 220.0 + _levels.fuel * 110.0)
+	# hard landings hurt sooner unless you buy Suspension/Wheels
+	_car.set("land_damage_speed", 9.0 + _levels.suspension * 5.0 + _levels.wheels * 2.0)
 	# Bigger Wheels: more ride height + larger wheels (clearance over bumps)
 	_car.set("suspension_rest", 0.55 + _levels.wheels * 0.18)
 	_car.set("wheel_radius", 0.5 + _levels.wheels * 0.12)
@@ -227,12 +234,6 @@ func _apply_upgrades() -> void:
 	# Chassis conversions: Stretch (longer) + Wide (wider track)
 	if _car.has_method("apply_chassis"):
 		_car.call("apply_chassis", _levels.stretch, _levels.wide)
-	# Sidecar: a second car bolted on the side
-	if _car.has_method("apply_sidecar"):
-		_car.call("apply_sidecar", _levels.sidecar)
-	# Anti-grav: floaty moon-jump hang time
-	if _car.has_method("apply_antigrav"):
-		_car.call("apply_antigrav", _levels.antigrav)
 
 func _build_shop() -> void:
 	var layer := CanvasLayer.new()
@@ -244,39 +245,66 @@ func _build_shop() -> void:
 	layer.add_child(_shop)
 	var dim := ColorRect.new()
 	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
-	dim.color = Color(0, 0, 0, 0.6)
+	dim.color = Color(0, 0, 0, 0.72)
 	_shop.add_child(dim)
+
+	# a fixed-size centered panel; the upgrade list inside scrolls so nothing
+	# can ever run off the bottom of the screen no matter how many upgrades.
+	var panel := PanelContainer.new()
+	panel.set_anchors_preset(Control.PRESET_CENTER)
+	panel.custom_minimum_size = Vector2(540, 620)
+	panel.position = Vector2(-270, -310)
+	_shop.add_child(panel)
+	var pad := MarginContainer.new()
+	for m in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
+		pad.add_theme_constant_override(m, 18)
+	panel.add_child(pad)
 	var box := VBoxContainer.new()
-	box.set_anchors_preset(Control.PRESET_CENTER)
-	box.position = Vector2(-220, -200)
-	box.custom_minimum_size = Vector2(440, 0)
-	box.add_theme_constant_override("separation", 10)
-	_shop.add_child(box)
-	_shop_header = _shop_label(box, "", 26, Color(1, 0.8, 0.4))
-	_shop_money = _shop_label(box, "", 24, Color(1, 0.95, 0.5))
+	box.add_theme_constant_override("separation", 8)
+	pad.add_child(box)
+
+	_shop_header = _shop_label(box, "", 26, Color(1, 0.82, 0.42))
+	_shop_money = _shop_label(box, "", 19, Color(0.65, 1.0, 0.7))
+	var sep := HSeparator.new()
+	box.add_child(sep)
+
+	var scroll := ScrollContainer.new()
+	scroll.custom_minimum_size = Vector2(504, 460)
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	box.add_child(scroll)
+	var list := VBoxContainer.new()
+	list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	list.add_theme_constant_override("separation", 6)
+	scroll.add_child(list)
+
 	for key in UP_KEYS:
 		var row := HBoxContainer.new()
-		row.custom_minimum_size = Vector2(440, 0)
-		row.add_theme_constant_override("separation", 12)
-		box.add_child(row)
+		row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		row.add_theme_constant_override("separation", 10)
+		list.add_child(row)
+		var info := VBoxContainer.new()
+		info.custom_minimum_size = Vector2(360, 0)
+		info.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		info.add_theme_constant_override("separation", 0)
+		row.add_child(info)
 		var lbl := Label.new()
-		lbl.custom_minimum_size = Vector2(260, 0)
-		lbl.add_theme_font_size_override("font_size", 19)
-		row.add_child(lbl)
-		var minus := Button.new()
-		minus.text = "  −  "
-		minus.custom_minimum_size = Vector2(54, 0)
-		minus.pressed.connect(_set_level.bind(key, -1))
-		row.add_child(minus)
-		var plus := Button.new()
-		plus.text = "  +  "
-		plus.custom_minimum_size = Vector2(54, 0)
-		plus.pressed.connect(_set_level.bind(key, 1))
-		row.add_child(plus)
-		_shop_rows[key] = {"label": lbl, "plus": plus}
+		lbl.add_theme_font_size_override("font_size", 18)
+		info.add_child(lbl)
+		var desc := Label.new()
+		desc.text = UP_DESC.get(key, "")
+		desc.add_theme_font_size_override("font_size", 12)
+		desc.add_theme_color_override("font_color", Color(0.62, 0.64, 0.7))
+		info.add_child(desc)
+		var buy := Button.new()
+		buy.custom_minimum_size = Vector2(96, 40)
+		buy.pressed.connect(_buy.bind(key))
+		row.add_child(buy)
+		_shop_rows[key] = {"label": lbl, "desc": desc, "buy": buy}
+
 	var restart := Button.new()
 	restart.text = "RESTART  (Enter)"
-	restart.custom_minimum_size = Vector2(440, 44)
+	restart.custom_minimum_size = Vector2(0, 46)
+	restart.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	restart.pressed.connect(_restart)
 	box.add_child(restart)
 
@@ -288,8 +316,11 @@ func _shop_label(parent: Node, text: String, size: int, col: Color) -> Label:
 	parent.add_child(l)
 	return l
 
+var _shop_summary := ""
+
 func _show_shop() -> void:
-	_shop_header.text = "WRECKED  —  %d m" % int(_car.get("distance"))
+	_shop_header.text = "WRECKED!"
+	_shop_summary = "You reached %d m  —  earned +$%d this run" % [int(_car.get("distance")), _last_earned]
 	_shop.visible = true
 	_refresh_shop()
 
@@ -298,24 +329,43 @@ func _toggle_shop() -> void:
 		return
 	_shop.visible = not _shop.visible
 	if _shop.visible:
-		_shop_header.text = "UPGRADES   (Tab to close)"
+		_shop_header.text = "GARAGE   (Tab to close)"
+		_shop_summary = ""
 		_refresh_shop()
 
 func _refresh_shop() -> void:
-	_shop_money.text = "TEST MODE — upgrade / downgrade freely"
+	var bank := "TOTAL MONEY:  $%d   (kept between tries)" % money
+	_shop_money.text = (_shop_summary + "\n" + bank) if _shop_summary != "" else bank
 	for key in UP_KEYS:
 		var lvl: int = _levels[key]
 		var row: Dictionary = _shop_rows[key]
 		var locked: bool = key == "ailerons" and _levels.wings == 0
-		row.label.text = "%s   Lv %d/%d%s" % [UP_NAME[key], lvl, UP_MAX, "   (needs Wings)" if locked else ""]
-		row.plus.disabled = locked
+		var pips := "●".repeat(lvl) + "○".repeat(UP_MAX - lvl)
+		row.label.text = "%s   %s" % [UP_NAME[key], pips]
+		row.label.add_theme_color_override("font_color", Color(0.55, 0.58, 0.62) if locked else Color(1, 1, 1))
+		row.desc.text = UP_DESC.get(key, "")
+		var buy: Button = row.buy
+		if locked:
+			buy.text = "🔒 Wings"
+			buy.disabled = true
+		elif lvl >= UP_MAX:
+			buy.text = "MAX"
+			buy.disabled = true
+		else:
+			var c: int = _cost(key)
+			buy.text = "$%d" % c
+			buy.disabled = money < c
 
-func _set_level(key: String, delta: int) -> void:
-	if key == "ailerons" and delta > 0 and _levels.wings == 0:
-		return   # ailerons are gated behind Wings
-	_levels[key] = clampi(_levels[key] + delta, 0, UP_MAX)
-	if key == "wings" and _levels.wings == 0:
-		_levels.ailerons = 0   # no wings -> no ailerons
+func _buy(key: String) -> void:
+	if _levels[key] >= UP_MAX:
+		return
+	if key == "ailerons" and _levels.wings == 0:
+		return   # gated behind Wings
+	var c: int = _cost(key)
+	if money < c:
+		return
+	money -= c
+	_levels[key] += 1
 	_apply_upgrades()
 	_refresh_shop()
 
