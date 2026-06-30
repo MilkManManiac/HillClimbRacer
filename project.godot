@@ -8,7 +8,7 @@ config_version=5
 
 config/name="Car Game"
 config/description="Cosmic-horror road trip. Working title."
-run/main_scene="res://scenes/Main.tscn"
+run/main_scene="res://scenes/HillClimb.tscn"
 config/features=PackedStringArray("4.6", "Forward Plus")
 config/icon="res://icon.svg"
 

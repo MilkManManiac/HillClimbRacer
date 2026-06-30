@@ -10,3 +10,4 @@ shot*.png
 # Bulky source asset kit (we only use the extracted GLBs + Textures/colormap.png)
 assets/car/kenney_car-kit/
 assets/**/*.zip
+hc.png
