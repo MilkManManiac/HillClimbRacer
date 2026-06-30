@@ -22,13 +22,14 @@ var _score_lbl: Label
 var _trick_lbl: Label
 
 # --- economy / upgrades ------------------------------------------------------
-const UP_KEYS := ["engine", "fuel", "suspension", "wheels", "wings", "ailerons", "dive"]
-const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "suspension": "Suspension", "wheels": "Bigger Wheels", "wings": "Wings", "ailerons": "Ailerons", "dive": "Dive Power"}
-const UP_BASECOST := {"engine": 160, "fuel": 130, "suspension": 150, "wheels": 170, "wings": 150, "ailerons": 140, "dive": 130}
+const UP_KEYS := ["engine", "fuel", "suspension", "wheels", "wings", "ailerons", "dive", "rockets"]
+const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "suspension": "Suspension", "wheels": "Bigger Wheels", "wings": "Wings", "ailerons": "Ailerons", "dive": "Dive Power", "rockets": "Rockets"}
+const UP_BASECOST := {"engine": 160, "fuel": 130, "suspension": 150, "wheels": 170, "wings": 150, "ailerons": 140, "dive": 130, "rockets": 180}
 const UP_MAX := 6
 var money: int = 0
-var _levels := {"engine": 0, "fuel": 0, "suspension": 0, "wheels": 0, "wings": 0, "ailerons": 0, "dive": 0}
+var _levels := {"engine": 0, "fuel": 0, "suspension": 0, "wheels": 0, "wings": 0, "ailerons": 0, "dive": 0, "rockets": 0}
 var _was_dead := false
+var _respawning := false
 var _shop: Control
 var _shop_header: Label
 var _shop_money: Label
@@ -69,12 +70,17 @@ func _setup_terrain_and_car() -> void:
 	_start.y = _terrain.call("height_at", 0.0, 0.0) + 4.0
 	_car.global_position = _start
 	_terrain.call("set_target", _car)
+	_car.connect("gap_failed", _on_car_gap_failed)
 
 func _setup_camera() -> void:
 	_cam = Camera3D.new()
 	_cam.fov = 70.0
 	_cam.far = 2000.0
 	_cam.current = true
+	# we drive the camera by hand every frame in _process; with the project's
+	# physics_interpolation on, Godot spams "Interpolated Camera3D triggered from
+	# outside physics process". Opt this node out of interpolation to silence it.
+	_cam.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 	add_child(_cam)
 	_cam.global_position = _start + Vector3(0, 6, 12)
 	_cam.look_at(_start, Vector3.UP)
@@ -116,8 +122,16 @@ func _update_camera(delta: float) -> void:
 	var snap: float = 16.0 if blocked else 6.0
 	_cam.global_position = _cam.global_position.lerp(want, 1.0 - exp(-snap * delta))
 	var look := target + Vector3(0, 1.0, 0)
-	var t := _cam.global_transform.looking_at(look, Vector3.UP)
-	_cam.global_transform.basis = _cam.global_transform.basis.slerp(t.basis, 1.0 - exp(-8.0 * delta))
+	var dir := look - _cam.global_position
+	# looking_at() errors if the look direction is parallel to the up vector
+	# (camera ends up directly above/below the car). Skip the degenerate frame,
+	# and fall back to a horizontal up reference when we're near-vertical.
+	if dir.length() > 0.05:
+		var up_ref := Vector3.UP
+		if absf(dir.normalized().dot(Vector3.UP)) > 0.985:
+			up_ref = _cam_heading if _cam_heading.length() > 0.1 else Vector3.FORWARD
+		var t := _cam.global_transform.looking_at(look, up_ref)
+		_cam.global_transform.basis = _cam.global_transform.basis.slerp(t.basis, 1.0 - exp(-8.0 * delta))
 	# FOV widens with speed for a sense of pace
 	var spd: float = _car.linear_velocity.length()
 	var target_fov: float = lerpf(70.0, 92.0, clamp(spd / 42.0, 0.0, 1.0))
@@ -131,6 +145,25 @@ func _restart() -> void:
 	_was_dead = false
 	if _shop:
 		_shop.visible = false
+
+# --- gap wipeout: slow-mo plunge, then drop back at the last checkpoint -------
+
+func _on_car_gap_failed(can_respawn: bool) -> void:
+	if not can_respawn or _respawning:
+		return   # no checkpoint yet -> the car set dead, normal wreck/shop flow
+	_respawning = true
+	Engine.time_scale = 0.35           # slow-mo plunge (the gag)
+	_big.text = "WIPEOUT!"
+	# real-time wait despite the slowed clock (ignore_time_scale = true)
+	await get_tree().create_timer(0.9, true, false, true).timeout
+	Engine.time_scale = 1.0
+	_big.text = ""
+	var cz: float = _car.get("checkpoint_z")
+	_car.call("respawn_at", cz)
+	var cy: float = _terrain.call("height_at", 0.0, cz) + 6.0
+	_cam.global_position = Vector3(0, cy, cz + 12.0)
+	_cam_heading = Vector3(0, 0, -1)
+	_respawning = false
 
 # --- upgrade shop ------------------------------------------------------------
 
@@ -165,6 +198,9 @@ func _apply_upgrades() -> void:
 		_car.call("apply_cans", _levels.fuel)
 	if _car.has_method("apply_airbrake"):
 		_car.call("apply_airbrake", _levels.dive)
+	# Rockets: rear nozzles + boost thrust (hold Ctrl)
+	if _car.has_method("apply_rockets"):
+		_car.call("apply_rockets", _levels.rockets)
 
 func _build_shop() -> void:
 	var layer := CanvasLayer.new()
@@ -291,7 +327,7 @@ func _setup_hud() -> void:
 	hint.position = Vector2(28, -34)
 	hint.add_theme_font_size_override("font_size", 13)
 	hint.add_theme_color_override("font_color", Color(0.8, 0.8, 0.85))
-	hint.text = "Shift drive  •  S brake  •  A/D steer  •  air: W/S pitch, A/D rotate, Q/E roll  •  Space dive  •  R recover  •  Tab upgrades  •  Enter restart"
+	hint.text = "Shift drive  •  S brake  •  A/D steer  •  Ctrl BOOST  •  air: W/S pitch, A/D rotate, Q/E roll  •  Space dive  •  R recover  •  Tab upgrades  •  Enter restart"
 	layer.add_child(hint)
 
 func _bar_bg(layer: CanvasLayer, pos: Vector2, col: Color) -> void:
@@ -321,4 +357,22 @@ func _update_hud() -> void:
 	_info.text = "%d m    %d km/h%s" % [int(dist), int(_car.call("get_speed_kmh")), air]
 	_score_lbl.text = "SCORE %d" % int(_car.get("score"))
 	_trick_lbl.text = _car.get("trick_text")
-	_big.text = ""   # the shop panel now handles the death screen
+	_update_gap_telegraph()
+
+## Warn the player to build speed on a gap run-up (green = you'll make it).
+func _update_gap_telegraph() -> void:
+	if _respawning or bool(_car.get("dead")):
+		return   # _big is owned by the wipeout / death screen
+	var gz: float = _car.global_position.z
+	var g: Dictionary = _terrain.call("_gap_for_z", gz)
+	if g.is_empty() or gz <= g.lip_z or (gz - g.lip_z) > 75.0:
+		_big.text = ""   # not approaching a gap
+		return
+	var v_req: float = 6.0 + float(g.void_w) * 0.9        # m/s needed to clear it
+	var spd: float = _car.linear_velocity.length()
+	if spd >= v_req:
+		_big.text = "SEND IT!  ▶▶"
+		_big.add_theme_color_override("font_color", Color(0.5, 1.0, 0.55))
+	else:
+		_big.text = "⚠ GO FASTER   %d / %d km/h" % [int(spd * 3.6), int(v_req * 3.6)]
+		_big.add_theme_color_override("font_color", Color(1.0, 0.45, 0.4))

@@ -26,6 +26,7 @@ const CAR_GLB := "res://assets/car/kenney_sedan_cc0.glb"
 @export var suspension_damp: float = 3.2    # some bounce, but damped enough not to fling
 @export var suspension_max_force: float = 8500.0   # per-wheel cap so hard landings don't launch
 @export var dive_force: float = 30.0       # downward push when diving (upgradable)
+@export var boost_force: float = 0.0       # rocket thrust along the nose (Rockets upgrade; 0 = none)
 @export var center_assist: float = 0.0     # air-guidance upgrade: pulls toward road center
 @export var air_pitch_torque: float = 11.0
 @export var air_roll_torque: float = 9.0
@@ -57,12 +58,23 @@ var _cage_tiers: Array[Node3D] = []
 var _airbrake: Node3D
 var _cans: Array[MeshInstance3D] = []
 var _dust: GPUParticles3D
+var _rockets: Array[Node3D] = []
+var _rocket_flames: Array[GPUParticles3D] = []
+var boosting: bool = false
 var wing_lift: float = 0.0          # lift from Wings upgrade (air time)
 var _grounded: bool = false
 var _steer: float = 0.0
 var _air_time: float = 0.0
 var _flip_accum: float = 0.0
 var _last_up: Vector3 = Vector3.UP
+
+# --- gap / checkpoint state --------------------------------------------------
+signal gap_cleared(idx: int)
+signal gap_failed(can_respawn: bool)
+var checkpoint_z: float = 0.0   # last cleared gap's far platform (respawn point)
+var gaps_cleared: int = 0
+var _gap_armed: bool = false    # airborne over a void, outcome pending
+var _falling_out: bool = false  # fell in; awaiting respawn (suspends anti-tunnel)
 
 func _ready() -> void:
 	mass = 850.0
@@ -91,6 +103,7 @@ func _ready() -> void:
 	_build_airbrake()
 	_build_cans()
 	_build_dust()
+	_build_rockets()
 
 func _physics_process(delta: float) -> void:
 	if dead:
@@ -126,6 +139,15 @@ func _physics_process(delta: float) -> void:
 	if diving:
 		apply_central_force(Vector3.DOWN * dive_force * mass)
 		fuel -= delta * 9.0   # the drop costs fuel
+
+	# --- rocket BOOST (hold Ctrl): thrust along the nose, burns fuel fast ---
+	# works on the ground (launch speed) AND in the air (push the nose forward
+	# to clear gaps / steer flips). 0 boost_force = no Rockets upgrade yet.
+	boosting = Input.is_key_pressed(KEY_CTRL) and boost_force > 0.0 and fuel > 0.0
+	if boosting:
+		apply_central_force(fwd * boost_force)
+		fuel -= delta * 16.0
+	_update_flames(boosting)
 
 	# gas pedal = Left Shift (W also drives on the ground); brake = S; A/D steer/roll
 	var drive := maxf(Input.get_action_strength("accelerate"), (1.0 if Input.is_key_pressed(KEY_SHIFT) else 0.0))
@@ -196,7 +218,8 @@ func _physics_process(delta: float) -> void:
 		angular_velocity = angular_velocity.normalized() * 5.0
 
 	# soft top-speed cap so downhills don't run away to absurd speeds
-	var soft_cap := 53.0   # m/s (~190 km/h)
+	# (rockets punch well past it — that's the point of boosting)
+	var soft_cap := 78.0 if boosting else 53.0   # m/s
 	if speed > soft_cap:
 		apply_central_force(-vel.normalized() * (speed - soft_cap) * mass * 2.5)
 
@@ -224,8 +247,12 @@ func _physics_process(delta: float) -> void:
 		if _trick_timer <= 0.0:
 			trick_text = ""
 
+	# gap / checkpoint resolution (jump cleared, or fell in)
+	_check_gap()
+
 	# anti-tunnel safety: if a hard landing punched us through the ground, pop back up
-	if terrain and not dead:
+	# (suspended while falling into a gap — we WANT that fall to play out)
+	if terrain and not dead and not _falling_out:
 		var th: float = terrain.call("height_at", global_position.x, global_position.z)
 		if global_position.y < th - 2.5:   # deep last-resort only; box collision handles normal landings
 			var p := global_position
@@ -284,12 +311,71 @@ func reset_run(start: Vector3) -> void:
 	_trick_timer = 0.0
 	_air_time = 0.0
 	_flip_accum = 0.0
+	gaps_cleared = 0
+	checkpoint_z = 0.0
+	_gap_armed = false
+	_falling_out = false
 	linear_velocity = Vector3.ZERO
 	angular_velocity = Vector3.ZERO
 	global_transform = Transform3D(Basis(), start)
 	reset_physics_interpolation()
 
 func get_speed_kmh() -> float: return linear_velocity.length() * 3.6
+
+# --- gaps / checkpoints ------------------------------------------------------
+
+## Arm when airborne over a void; resolve to CLEARED (landed past it) or FAILED (fell in).
+func _check_gap() -> void:
+	if terrain == null or dead or _falling_out:
+		return
+	var z := global_position.z
+	var g: Dictionary = terrain.call("_gap_for_z", z)
+	if not g.is_empty():
+		if z < g.lip_z and z > g.far_z and not _grounded:
+			_gap_armed = true   # over the void
+		elif _gap_armed and z <= g.far_z and _grounded and absf(global_position.x) <= road_half:
+			_on_gap_cleared(int(g.idx))   # landed on the far platform = cleared
+	# fell in: we were over the void and have dropped below the road
+	if _gap_armed and global_position.y < -10.0:
+		_on_gap_failed()
+
+func _on_gap_cleared(idx: int) -> void:
+	_gap_armed = false
+	if idx < gaps_cleared:
+		return   # already credited (no double-pop)
+	gaps_cleared = idx + 1
+	checkpoint_z = global_position.z + 6.0
+	var reward: int = 200 + idx * 75
+	score += reward
+	fuel = minf(fuel + max_fuel * 0.35, max_fuel)   # earned fuel = "keep going" carrot
+	health = minf(health + 15.0, max_health)
+	trick_text = "GAP %d CLEARED   +%d   ⛽+" % [idx + 1, reward]
+	_trick_timer = 2.6
+	gap_cleared.emit(idx)
+
+func _on_gap_failed() -> void:
+	_falling_out = true
+	_gap_armed = false
+	var can_respawn := gaps_cleared > 0
+	gap_failed.emit(can_respawn)
+	if not can_respawn:
+		health = 0.0
+		dead = true   # no checkpoint yet -> normal wreck/shop flow
+
+## Drop the car back in above a cleared checkpoint (called by HCMain after the slow-mo).
+func respawn_at(z: float) -> void:
+	var y := 4.0
+	if terrain:
+		y = terrain.call("height_at", 0.0, z) + 4.0
+	global_transform = Transform3D(Basis(), Vector3(0.0, y, z))
+	linear_velocity = Vector3.ZERO
+	angular_velocity = Vector3.ZERO
+	fuel = maxf(fuel - max_fuel * 0.1, 0.0)   # small penalty for the wipeout
+	_gap_armed = false
+	_falling_out = false
+	_air_time = 0.0
+	_flip_accum = 0.0
+	reset_physics_interpolation()
 
 # --- build -------------------------------------------------------------------
 
@@ -557,6 +643,96 @@ func _build_dust() -> void:
 	qm.material = dm
 	_dust.draw_pass_1 = qm
 	add_child(_dust)
+
+# --- rocket boosters (Rockets upgrade) --------------------------------------
+## Twin nozzles on the tail (+Z, the rear) with a glowing throat and a flame jet.
+func _build_rockets() -> void:
+	for sx in [-0.5, 0.5]:
+		var pivot := Node3D.new()
+		pivot.position = Vector3(sx, 0.7, 1.95)   # rear of the body
+		add_child(pivot)
+		# nozzle bell: a cone flaring toward the back (+Z)
+		var bell := MeshInstance3D.new()
+		var cm := CylinderMesh.new()
+		cm.top_radius = 0.26      # wide mouth (faces back)
+		cm.bottom_radius = 0.12   # narrow throat (faces the body)
+		cm.height = 0.5
+		bell.mesh = cm
+		bell.material_override = _metal(Color(0.18, 0.18, 0.2), 0.3)
+		bell.rotation_degrees = Vector3(90, 0, 0)   # axis along Z
+		bell.position = Vector3(0, 0, 0.25)
+		pivot.add_child(bell)
+		# glowing throat plug (reads as heat even when not boosting)
+		var glow := MeshInstance3D.new()
+		var gm := SphereMesh.new()
+		gm.radius = 0.12
+		gm.height = 0.24
+		glow.mesh = gm
+		var gmat := StandardMaterial3D.new()
+		gmat.albedo_color = Color(1.0, 0.5, 0.15)
+		gmat.emission_enabled = true
+		gmat.emission = Color(1.0, 0.45, 0.12)
+		gmat.emission_energy_multiplier = 2.0
+		glow.material_override = gmat
+		glow.position = Vector3(0, 0, 0.42)
+		pivot.add_child(glow)
+		# flame jet (emits only while boosting)
+		var flame := GPUParticles3D.new()
+		flame.amount = 40
+		flame.lifetime = 0.28
+		flame.local_coords = true   # jet stays aligned out the back as the car rotates
+		flame.emitting = false
+		flame.position = Vector3(0, 0, 0.55)
+		var pm := ParticleProcessMaterial.new()
+		pm.direction = Vector3(0, 0, 1)   # shoot backward (+Z)
+		pm.spread = 9.0
+		pm.initial_velocity_min = 10.0
+		pm.initial_velocity_max = 16.0
+		pm.gravity = Vector3.ZERO
+		pm.scale_min = 0.7
+		pm.scale_max = 1.3
+		var grad := Gradient.new()
+		grad.set_color(0, Color(1.0, 0.95, 0.6, 1.0))   # white-hot core
+		grad.set_color(1, Color(1.0, 0.25, 0.05, 0.0))  # fades to red smoke
+		var gtex := GradientTexture1D.new()
+		gtex.gradient = grad
+		pm.color_ramp = gtex
+		var scurve := Curve.new()
+		scurve.add_point(Vector2(0.0, 0.3))
+		scurve.add_point(Vector2(0.25, 1.0))
+		scurve.add_point(Vector2(1.0, 0.0))
+		var sctex := CurveTexture.new()
+		sctex.curve = scurve
+		pm.scale_curve = sctex
+		flame.process_material = pm
+		var qm := QuadMesh.new()
+		qm.size = Vector2(0.6, 0.6)
+		var fm := StandardMaterial3D.new()
+		fm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		fm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		fm.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+		fm.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+		fm.vertex_color_use_as_albedo = true
+		fm.albedo_color = Color(1, 0.7, 0.3)
+		qm.material = fm
+		flame.draw_pass_1 = qm
+		pivot.add_child(flame)
+		_rocket_flames.append(flame)
+		_rockets.append(pivot)
+	apply_rockets(0)
+
+## Rockets grow + thrust harder with level. 0 = hidden, no boost.
+func apply_rockets(level: int) -> void:
+	for r in _rockets:
+		r.visible = level > 0
+		var s: float = 0.7 + float(level) * 0.13
+		r.scale = Vector3(s, s, s)
+	boost_force = 0.0 if level == 0 else (26000.0 + float(level) * 11000.0)
+
+## Toggle the flame jets (and pulse their rate) with the boost input.
+func _update_flames(on: bool) -> void:
+	for f in _rocket_flames:
+		f.emitting = on
 
 ## A normal tapered wing (trapezoid): wide root chord, narrower swept tip, slight dihedral.
 func _wing_mesh(side: float) -> ArrayMesh:
