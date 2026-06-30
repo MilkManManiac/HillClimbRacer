@@ -174,28 +174,27 @@ func _physics_process(delta: float) -> void:
 	# --- gravity ------------------------------------------------------------
 	apply_central_force(Vector3.DOWN * gravity_force * mass)
 
-	# --- dive (hold Space): drop faster, burns fuel -------------------------
-	var diving := Input.is_key_pressed(KEY_SPACE) and fuel > 0.0
+	# --- dive (hold Space / LB): drop faster, burns fuel --------------------
+	var diving := Input.is_action_pressed("dive") and fuel > 0.0
 	if diving:
 		apply_central_force(Vector3.DOWN * dive_force * mass)
 		fuel -= delta * 9.0 * fuel_eff   # the drop costs fuel
 
-	# --- rocket BOOST (hold Ctrl): thrust along the nose, burns fuel fast ---
+	# --- rocket BOOST (hold Ctrl / RB): thrust along the nose, burns fuel fast ---
 	# works on the ground (launch speed) AND in the air (push the nose forward
 	# to clear gaps / steer flips). 0 boost_force = no Rockets upgrade yet.
-	boosting = Input.is_key_pressed(KEY_CTRL) and boost_force > 0.0 and fuel > 0.0
+	boosting = Input.is_action_pressed("boost") and boost_force > 0.0 and fuel > 0.0
 	if boosting:
 		apply_central_force(fwd * boost_force)
 		fuel -= delta * 45.0 * fuel_eff   # rockets CHUG fuel — short bursts only
 	_update_flames(boosting)
 
-	# gas pedal = Left Shift (W also drives on the ground); brake = S; A/D steer/roll
+	# throttle = RT / W / Shift; brake = LT / S; left stick (A/D) steer & air yaw;
+	# left stick Y (W/S) = air pitch; right stick X (Q/E) = air roll
 	var drive := maxf(Input.get_action_strength("accelerate"), (1.0 if Input.is_key_pressed(KEY_SHIFT) else 0.0))
 	var braking := Input.get_action_strength("brake")
 	var steer_in := Input.get_axis("turn_right", "turn_left")
-	var pitch_in := 0.0
-	if Input.is_key_pressed(KEY_W): pitch_in -= 1.0   # W = nose down / lean forward
-	if Input.is_key_pressed(KEY_S): pitch_in += 1.0   # S = nose up / lean back
+	var pitch_in := Input.get_action_strength("pitch_up") - Input.get_action_strength("pitch_down")
 
 	if _grounded:
 		# drive / brake (fuel-gated)
@@ -234,10 +233,8 @@ func _physics_process(delta: float) -> void:
 			angular_velocity.y = (fwd_speed / wheelbase) * tan(ang)
 	else:
 		# --- airborne: full manual 3-axis (no assist) ----------------------
-		var pitch := pitch_in                      # W nose down / S nose up (Space no longer pitches)
-		var qe := 0.0
-		if Input.is_key_pressed(KEY_Q): qe -= 1.0
-		if Input.is_key_pressed(KEY_E): qe += 1.0
+		var pitch := pitch_in                      # W/left-stick nose down, S nose up
+		var qe := Input.get_action_strength("roll_right") - Input.get_action_strength("roll_left")  # Q/E / right stick
 		apply_torque(right * pitch * air_pitch_torque * mass)   # W/S = pitch
 		apply_torque(up * steer_in * air_yaw_torque * mass)     # A/D = yaw (rotate)
 		apply_torque(fwd * qe * air_roll_torque * mass)         # Q/E = roll
@@ -264,7 +261,7 @@ func _physics_process(delta: float) -> void:
 		apply_central_force(-vel.normalized() * (speed - soft_cap) * mass * 2.5)
 
 	# --- recover (R): ease upright + small lift ----------------------------
-	if Input.is_key_pressed(KEY_R):
+	if Input.is_action_pressed("recover"):
 		var axis := up.cross(Vector3.UP)
 		apply_torque(axis * 6.0 * mass)
 		if up.dot(Vector3.UP) < 0.3:
@@ -1361,16 +1358,14 @@ func apply_ailerons(level: int) -> void:
 ## Tilt the control surfaces with the air inputs (cosmetic feedback).
 func _animate_surfaces(delta: float) -> void:
 	var yaw_in := Input.get_axis("turn_right", "turn_left")
-	var roll_in := 0.0
-	if Input.is_key_pressed(KEY_Q): roll_in -= 1.0
-	if Input.is_key_pressed(KEY_E): roll_in += 1.0
+	var roll_in := Input.get_action_strength("roll_right") - Input.get_action_strength("roll_left")
 	if _rudder:
 		_rudder.rotation.y = lerp_angle(_rudder.rotation.y, yaw_in * 0.5, 1.0 - exp(-12.0 * delta))
 	for i in range(_ailerons.size()):
 		var sgn: float = -1.0 if i == 0 else 1.0
 		_ailerons[i].rotation.x = lerp_angle(_ailerons[i].rotation.x, roll_in * 0.6 * sgn, 1.0 - exp(-12.0 * delta))
 	if _airbrake and _airbrake.visible:
-		var brake_ang: float = deg_to_rad(72.0) if Input.is_key_pressed(KEY_SPACE) else 0.0
+		var brake_ang: float = deg_to_rad(72.0) if Input.is_action_pressed("dive") else 0.0
 		_airbrake.rotation.x = lerp_angle(_airbrake.rotation.x, brake_ang, 1.0 - exp(-14.0 * delta))
 
 func _hide_glb_wheels(node: Node) -> void:

@@ -91,9 +91,12 @@ var _shop_money: Label
 var _shop_rows := {}
 var _veh_rows := {}
 var _reset_btn: Button
+var _restart_btn: Button
 var _reset_armed := false   # fresh-start needs a confirm click so it's not a mis-tap
+var _first_veh_btn: Button   # focus target when the garage opens (gamepad nav)
 
 func _ready() -> void:
+	_setup_input()
 	_init_levels()
 	_setup_sky()
 	_setup_terrain_and_car()
@@ -104,11 +107,58 @@ func _ready() -> void:
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 
 func _input(event: InputEvent) -> void:
-	if event is InputEventKey and event.pressed and not event.echo:
-		if event.keycode == KEY_ENTER:
-			_restart()
-		elif event.keycode == KEY_TAB:
-			_toggle_shop()
+	# works for keyboard (Enter/Tab) AND gamepad (Back / Start) via the input actions
+	if event.is_action_pressed("restart"):
+		_restart()
+	elif event.is_action_pressed("toggle_shop"):
+		_toggle_shop()
+
+# --- input map: keyboard + gamepad, built at runtime so we don't hand-edit the
+# serialized project.godot. Gamepad layout (Xbox): RT throttle, LT brake, left
+# stick steer (and air yaw + pitch), right stick X roll, RB boost, LB dive,
+# Y recover, Start garage, Back retry; shop navigates with d-pad + A.
+func _setup_input() -> void:
+	for a in ["accelerate", "brake", "turn_left", "turn_right"]:
+		if InputMap.has_action(a):
+			InputMap.action_set_deadzone(a, 0.2)   # smooth analog triggers/stick
+	_joy_axis("accelerate", JOY_AXIS_TRIGGER_RIGHT, 1.0)
+	_joy_axis("brake", JOY_AXIS_TRIGGER_LEFT, 1.0)
+	_joy_axis("turn_left", JOY_AXIS_LEFT_X, -1.0)
+	_joy_axis("turn_right", JOY_AXIS_LEFT_X, 1.0)
+	_new_action("boost", 0.5, [_key(KEY_CTRL), _btn(JOY_BUTTON_RIGHT_SHOULDER)])
+	_new_action("dive", 0.5, [_key(KEY_SPACE), _btn(JOY_BUTTON_LEFT_SHOULDER)])
+	_new_action("recover", 0.5, [_key(KEY_R), _btn(JOY_BUTTON_Y)])
+	_new_action("pitch_down", 0.2, [_key(KEY_W), _axis(JOY_AXIS_LEFT_Y, -1.0)])
+	_new_action("pitch_up", 0.2, [_key(KEY_S), _axis(JOY_AXIS_LEFT_Y, 1.0)])
+	_new_action("roll_left", 0.2, [_key(KEY_Q), _axis(JOY_AXIS_RIGHT_X, -1.0)])
+	_new_action("roll_right", 0.2, [_key(KEY_E), _axis(JOY_AXIS_RIGHT_X, 1.0)])
+	_new_action("toggle_shop", 0.5, [_key(KEY_TAB), _btn(JOY_BUTTON_START)])
+	_new_action("restart", 0.5, [_key(KEY_ENTER), _btn(JOY_BUTTON_BACK)])
+	# shop navigation on a gamepad (insurance in case the ui_* defaults were stripped)
+	_joy_btn("ui_accept", JOY_BUTTON_A)
+	_joy_btn("ui_cancel", JOY_BUTTON_B)
+	_joy_btn("ui_up", JOY_BUTTON_DPAD_UP)
+	_joy_btn("ui_down", JOY_BUTTON_DPAD_DOWN)
+	_joy_btn("ui_left", JOY_BUTTON_DPAD_LEFT)
+	_joy_btn("ui_right", JOY_BUTTON_DPAD_RIGHT)
+
+func _key(kc: int) -> InputEventKey:
+	var e := InputEventKey.new(); e.physical_keycode = kc; return e
+func _btn(b: int) -> InputEventJoypadButton:
+	var e := InputEventJoypadButton.new(); e.button_index = b; return e
+func _axis(a: int, v: float) -> InputEventJoypadMotion:
+	var e := InputEventJoypadMotion.new(); e.axis = a; e.axis_value = v; return e
+func _joy_axis(action: String, a: int, v: float) -> void:
+	if InputMap.has_action(action):
+		InputMap.action_add_event(action, _axis(a, v))
+func _joy_btn(action: String, b: int) -> void:
+	if InputMap.has_action(action):
+		InputMap.action_add_event(action, _btn(b))
+func _new_action(nm: String, dz: float, events: Array) -> void:
+	if not InputMap.has_action(nm):
+		InputMap.add_action(nm, dz)
+	for e in events:
+		InputMap.action_add_event(nm, e)
 
 func _setup_sky() -> void:
 	var sky := Node3D.new()
@@ -396,6 +446,8 @@ func _build_shop() -> void:
 		vbuy.custom_minimum_size = Vector2(110, 40)
 		vbuy.pressed.connect(_on_vehicle_button.bind(vk))
 		vrow.add_child(vbuy)
+		if _first_veh_btn == null:
+			_first_veh_btn = vbuy
 		_veh_rows[vk] = {"label": vlbl, "buy": vbuy}
 	var sep2 := HSeparator.new()
 	list.add_child(sep2)
@@ -425,12 +477,12 @@ func _build_shop() -> void:
 		row.add_child(buy)
 		_shop_rows[key] = {"label": lbl, "desc": desc, "buy": buy}
 
-	var restart := Button.new()
-	restart.text = "RETRY  (Enter)  —  keeps your garage"
-	restart.custom_minimum_size = Vector2(0, 46)
-	restart.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	restart.pressed.connect(_restart)
-	box.add_child(restart)
+	_restart_btn = Button.new()
+	_restart_btn.text = "RETRY  (Enter / ⓑ)  —  keeps your garage"
+	_restart_btn.custom_minimum_size = Vector2(0, 46)
+	_restart_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_restart_btn.pressed.connect(_restart)
+	box.add_child(_restart_btn)
 
 	# Fresh start: wipe ALL progress (money, every vehicle's upgrades, unlocks) and
 	# return to the starter Hot Rod. Two-click confirm so it can't be a mis-tap.
@@ -457,15 +509,20 @@ func _show_shop() -> void:
 	_shop_summary = "You reached %d m  —  earned +$%d this run" % [int(_car.get("distance")), _last_earned]
 	_shop.visible = true
 	_refresh_shop()
+	# focus RETRY so a gamepad can just press A to go again (d-pad to browse upgrades)
+	if _restart_btn:
+		_restart_btn.call_deferred("grab_focus")
 
 func _toggle_shop() -> void:
 	if _shop == null:
 		return
 	_shop.visible = not _shop.visible
 	if _shop.visible:
-		_shop_header.text = "GARAGE   (Tab to close)"
+		_shop_header.text = "GARAGE   (Tab / Start to close)"
 		_shop_summary = ""
 		_refresh_shop()
+		if _first_veh_btn:
+			_first_veh_btn.call_deferred("grab_focus")
 
 ## Vehicle row button: select if owned, otherwise buy if affordable.
 func _on_vehicle_button(vk: String) -> void:
@@ -643,7 +700,7 @@ func _setup_hud() -> void:
 	hint.position = Vector2(28, -34)
 	hint.add_theme_font_size_override("font_size", 13)
 	hint.add_theme_color_override("font_color", Color(0.8, 0.8, 0.85))
-	hint.text = "Shift drive  •  S brake  •  A/D steer  •  Ctrl BOOST  •  air: W/S pitch, A/D rotate, Q/E roll  •  Space dive  •  R recover  •  Tab upgrades  •  Enter restart"
+	hint.text = "KB: Shift/W drive • S brake • A/D steer • Ctrl boost • Space dive • R recover • air W/S pitch, Q/E roll • Tab garage • Enter retry\nPad: RT throttle • LT brake • L-stick steer/pitch • R-stick roll • RB boost • LB dive • Y recover • Start garage • Ⓑ retry"
 	layer.add_child(hint)
 
 func _bar_bg(layer: CanvasLayer, pos: Vector2, col: Color) -> void:
