@@ -22,11 +22,12 @@ var _score_lbl: Label
 var _trick_lbl: Label
 
 # --- economy / upgrades ------------------------------------------------------
-const UP_KEYS := ["engine", "fuel", "suspension", "wheels", "wings", "ailerons", "dive", "rockets", "stretch", "wide"]
-const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "suspension": "Suspension", "wheels": "Bigger Wheels", "wings": "Wings", "ailerons": "Ailerons", "dive": "Dive Power", "rockets": "Rockets", "stretch": "Stretch (Limo)", "wide": "Wide Stance"}
+const UP_KEYS := ["engine", "fuel", "fueleff", "suspension", "wheels", "wings", "ailerons", "dive", "rockets", "stretch", "wide"]
+const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "fueleff": "Fuel Economy", "suspension": "Suspension", "wheels": "Bigger Wheels", "wings": "Wings", "ailerons": "Ailerons", "dive": "Dive Power", "rockets": "Rockets", "stretch": "Stretch (Limo)", "wide": "Wide Stance"}
 const UP_DESC := {
 	"engine": "More power & higher top speed",
-	"fuel": "Bigger tank + visible jerry cans",
+	"fuel": "Bigger tank — more total fuel",
+	"fueleff": "Burns fuel slower (better mileage)",
 	"suspension": "Roll cage, armor (+HP), softer landings",
 	"wheels": "Taller wheels, more ground clearance",
 	"wings": "Lift = more air time off jumps",
@@ -36,13 +37,13 @@ const UP_DESC := {
 	"stretch": "Limo: longer wheelbase, lazier turns",
 	"wide": "Wider stance, harder to roll over",
 }
-const UP_BASECOST := {"engine": 140, "fuel": 110, "suspension": 150, "wheels": 120, "wings": 170, "ailerons": 150, "dive": 130, "rockets": 190, "stretch": 160, "wide": 140}
-const UP_COSTMULT := 1.6   # each level costs 1.6x the last
+const UP_BASECOST := {"engine": 320, "fuel": 260, "fueleff": 240, "suspension": 340, "wheels": 280, "wings": 380, "ailerons": 340, "dive": 300, "rockets": 420, "stretch": 360, "wide": 320}
+const UP_COSTMULT := 1.9   # each level costs 1.9x the last — costs ramp hard
 const UP_MAX := 6
 const MONEY_PER_M := 1.0    # money earned = metres travelled down the track
 var money: int = 0
 var _last_earned: int = 0
-var _levels := {"engine": 0, "fuel": 0, "suspension": 0, "wheels": 0, "wings": 0, "ailerons": 0, "dive": 0, "rockets": 0, "stretch": 0, "wide": 0}
+var _levels := {"engine": 0, "fuel": 0, "fueleff": 0, "suspension": 0, "wheels": 0, "wings": 0, "ailerons": 0, "dive": 0, "rockets": 0, "stretch": 0, "wide": 0}
 var _was_dead := false
 var _respawning := false
 var _shake := 0.0           # camera shake magnitude (decays)
@@ -205,8 +206,10 @@ func _apply_upgrades() -> void:
 	_car.set("max_speed", 30.0 + _levels.engine * 15.0)
 	if _car.has_method("apply_engine"):
 		_car.call("apply_engine", _levels.engine)
-	# fuel is the run timer again — tight so it actually matters (gaps refill a bit)
-	_car.set("max_fuel", 220.0 + _levels.fuel * 110.0)
+	# fuel is the run timer — VERY low stock so you can barely move; two upgrades fix it:
+	#   Fuel Tank = capacity, Fuel Economy = slower burn (multiplier dropped here)
+	_car.set("max_fuel", 70.0 + _levels.fuel * 95.0)
+	_car.set("fuel_eff", maxf(1.0 - _levels.fueleff * 0.12, 0.28))
 	# hard landings hurt sooner unless you buy Suspension/Wheels
 	_car.set("land_damage_speed", 9.0 + _levels.suspension * 5.0 + _levels.wheels * 2.0)
 	# Bigger Wheels: more ride height + larger wheels (clearance over bumps)

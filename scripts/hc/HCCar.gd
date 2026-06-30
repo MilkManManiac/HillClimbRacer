@@ -32,6 +32,7 @@ const CAR_GLB := "res://assets/car/kenney_sedan_cc0.glb"
 @export var air_roll_torque: float = 9.0
 @export var air_yaw_torque: float = 6.0
 @export var max_fuel: float = 600.0   # generous for the feel/air sandbox (tune later)
+@export var fuel_eff: float = 1.0     # burn multiplier (1.0 = stock; Efficiency upgrade lowers it)
 @export var max_health: float = 100.0
 @export var road_half: float = 14.0   # land outside this (jumped the rail) -> crash
 @export var land_damage_speed: float = 12.0  # vertical impact speed before damage starts
@@ -148,7 +149,7 @@ func _physics_process(delta: float) -> void:
 	var diving := Input.is_key_pressed(KEY_SPACE) and fuel > 0.0
 	if diving:
 		apply_central_force(Vector3.DOWN * dive_force * mass)
-		fuel -= delta * 9.0   # the drop costs fuel
+		fuel -= delta * 9.0 * fuel_eff   # the drop costs fuel
 
 	# --- rocket BOOST (hold Ctrl): thrust along the nose, burns fuel fast ---
 	# works on the ground (launch speed) AND in the air (push the nose forward
@@ -156,7 +157,7 @@ func _physics_process(delta: float) -> void:
 	boosting = Input.is_key_pressed(KEY_CTRL) and boost_force > 0.0 and fuel > 0.0
 	if boosting:
 		apply_central_force(fwd * boost_force)
-		fuel -= delta * 45.0   # rockets CHUG fuel — short bursts only
+		fuel -= delta * 45.0 * fuel_eff   # rockets CHUG fuel — short bursts only
 	_update_flames(boosting)
 
 	# gas pedal = Left Shift (W also drives on the ground); brake = S; A/D steer/roll
@@ -171,7 +172,7 @@ func _physics_process(delta: float) -> void:
 		# drive / brake (fuel-gated)
 		if fuel > 0.0 and drive > 0.01 and fwd_speed < max_speed:
 			apply_central_force(fwd * drive * engine_force)
-			fuel -= delta * (1.1 + drive * 3.0)
+			fuel -= delta * (2.6 + drive * 7.0) * fuel_eff   # thirsty — fuel pressure forces upgrades
 		elif braking > 0.01:
 			if fwd_speed > 0.5:
 				apply_central_force(-fwd * brake_force * braking)
@@ -179,7 +180,7 @@ func _physics_process(delta: float) -> void:
 				apply_central_force(fwd * -braking * engine_force * 0.4)
 		else:
 			apply_central_force(-fwd * fwd_speed * 0.04 * mass * 0.02)   # tiny coast drag, keeps momentum
-		fuel -= delta * 0.35   # idle burn
+		fuel -= delta * 0.9 * fuel_eff   # idle burn
 		# smoothed steering (slower response than raw input)
 		_steer = lerpf(_steer, steer_in, 1.0 - exp(-steer_rate * delta))
 		var k: float = clamp(speed / max_speed, 0.0, 1.0)

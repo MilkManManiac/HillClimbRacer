@@ -12,7 +12,7 @@ const AHEAD := 8          # chunks streamed ahead (fog hides further; fewer = li
 const BEHIND := 2
 
 @export var base_amp: float = 3.0
-@export var max_amp: float = 28.0            # lower hills (long flowing jumps, not tall walls)
+@export var max_amp: float = 20.0            # gentler peaks so slopes stay shallow (long jumps)
 @export var ramp_dist: float = 450.0
 @export var road_half_width: float = 28.0    # road twice as wide
 @export var edge_falloff: float = 18.0       # how fast hills fade to flat off the road
@@ -20,11 +20,12 @@ const BEHIND := 2
 @export var rail_height: float = 1.6
 
 # --- gap / checkpoint schedule (jump the hole or fall in) --------------------
-@export var gap_start_dist: float = 300.0    # pure hills before this; first gap here
-@export var gap_spacing: float = 230.0       # distance between gap centers
-@export var gap_base_width: float = 30.0     # void width at the first gap
-@export var gap_grow: float = 5.0            # +void width per gap index
-@export var gap_max_width: float = 88.0
+@export var gap_start_dist: float = 360.0    # pure hills before this; first gap here
+@export var gap_spacing: float = 340.0       # distance to the SECOND gap (base spacing)
+@export var gap_spacing_grow: float = 110.0  # +distance to each next gap (pits get rarer the further you go)
+@export var gap_base_width: float = 34.0     # void width at the first gap
+@export var gap_grow: float = 8.0            # +void width per gap index (harder to clear over distance)
+@export var gap_max_width: float = 120.0
 @export var ramp_len: float = 26.0           # launch-ramp run-up length (telegraph)
 @export var ramp_rise: float = 8.0           # how high the lip kicks the nose
 @export var land_len: float = 36.0           # flat landing platform past the void
@@ -42,11 +43,7 @@ var _done: Array = []         # built chunk data awaiting main-thread insertion
 var _done_mutex := Mutex.new()
 
 func _ready() -> void:
-	_noise.seed = 1234
-	_noise.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
-	_noise.fractal_type = FastNoiseLite.FRACTAL_FBM
-	_noise.frequency = 0.005
-	_noise.fractal_octaves = 2
+	_noise = _new_noise()   # single source of truth (workers use the same config)
 
 func set_target(t: Node3D) -> void:
 	_target = t
@@ -59,8 +56,9 @@ func _new_noise() -> FastNoiseLite:
 	n.seed = 1234
 	n.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
 	n.fractal_type = FastNoiseLite.FRACTAL_FBM
-	n.frequency = 0.005
+	n.frequency = 0.0026   # long-wavelength = gradual slopes for long flowing jumps
 	n.fractal_octaves = 2
+	n.fractal_gain = 0.4   # less high-frequency detail = smoother crests
 	return n
 
 ## Rolling-hills base height (road center high, sides flat). No gaps.
@@ -83,12 +81,23 @@ func _gap_for_z(z: float, noise: FastNoiseLite = null) -> Dictionary:
 	var d: float = -z
 	if d < gap_start_dist - gap_spacing * 0.5:
 		return {}
-	# nearest gap center, so a gap's ramp (nearer) and landing (farther) both
-	# resolve to the SAME gap index instead of splitting across schedule cells.
-	var idx: int = int(round((d - gap_start_dist) / gap_spacing))
+	# Progressive schedule: the gap-to-gap spacing widens by gap_spacing_grow each
+	# index, so pits get RARER the further you travel. That makes
+	#   center_d(i) = start + base*i + grow*i*(i-1)/2   (quadratic in i).
+	# Invert that quadratic to find the nearest gap index for this z, then round so
+	# a gap's ramp (nearer) and landing (farther) resolve to the SAME index.
+	var rel: float = d - gap_start_dist
+	var idx: int
+	var a: float = gap_spacing_grow * 0.5
+	if a > 0.0001:
+		var b: float = gap_spacing - a
+		var disc: float = b * b + 4.0 * a * rel
+		idx = int(round((-b + sqrt(maxf(disc, 0.0))) / (2.0 * a)))
+	else:
+		idx = int(round(rel / gap_spacing))
 	if idx < 0:
 		return {}
-	var center_d: float = gap_start_dist + float(idx) * gap_spacing
+	var center_d: float = gap_start_dist + gap_spacing * float(idx) + gap_spacing_grow * float(idx) * float(idx - 1) * 0.5
 	var void_w: float = minf(gap_base_width + float(idx) * gap_grow, gap_max_width)
 	var center_z: float = -center_d
 	var lip_z: float = center_z + void_w * 0.5
