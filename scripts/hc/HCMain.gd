@@ -44,8 +44,11 @@ func _ready() -> void:
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 
 func _input(event: InputEvent) -> void:
-	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_ENTER:
-		_restart()
+	if event is InputEventKey and event.pressed and not event.echo:
+		if event.keycode == KEY_ENTER:
+			_restart()
+		elif event.keycode == KEY_TAB:
+			_toggle_shop()
 
 func _setup_sky() -> void:
 	var sky := Node3D.new()
@@ -180,11 +183,17 @@ func _build_shop() -> void:
 		lbl.custom_minimum_size = Vector2(260, 0)
 		lbl.add_theme_font_size_override("font_size", 19)
 		row.add_child(lbl)
-		var btn := Button.new()
-		btn.custom_minimum_size = Vector2(150, 0)
-		btn.pressed.connect(_buy.bind(key))
-		row.add_child(btn)
-		_shop_rows[key] = {"label": lbl, "btn": btn}
+		var minus := Button.new()
+		minus.text = "  −  "
+		minus.custom_minimum_size = Vector2(54, 0)
+		minus.pressed.connect(_set_level.bind(key, -1))
+		row.add_child(minus)
+		var plus := Button.new()
+		plus.text = "  +  "
+		plus.custom_minimum_size = Vector2(54, 0)
+		plus.pressed.connect(_set_level.bind(key, 1))
+		row.add_child(plus)
+		_shop_rows[key] = {"label": lbl}
 	var restart := Button.new()
 	restart.text = "RESTART  (Enter)"
 	restart.custom_minimum_size = Vector2(440, 44)
@@ -200,33 +209,29 @@ func _shop_label(parent: Node, text: String, size: int, col: Color) -> Label:
 	return l
 
 func _show_shop() -> void:
-	_shop_header.text = "WRECKED  —  %d m   (banked +%d)" % [int(_car.get("distance")), int(_car.get("score"))]
+	_shop_header.text = "WRECKED  —  %d m" % int(_car.get("distance"))
 	_shop.visible = true
 	_refresh_shop()
 
+func _toggle_shop() -> void:
+	if _shop == null:
+		return
+	_shop.visible = not _shop.visible
+	if _shop.visible:
+		_shop_header.text = "UPGRADES   (Tab to close)"
+		_refresh_shop()
+
 func _refresh_shop() -> void:
-	_shop_money.text = "MONEY: $%d" % money
+	_shop_money.text = "TEST MODE — upgrade / downgrade freely"
 	for key in UP_KEYS:
 		var lvl: int = _levels[key]
 		var row: Dictionary = _shop_rows[key]
 		row.label.text = "%s   Lv %d/%d" % [UP_NAME[key], lvl, UP_MAX]
-		if lvl >= UP_MAX:
-			row.btn.text = "MAX"
-			row.btn.disabled = true
-		else:
-			var c: int = _cost(key)
-			row.btn.text = "Buy  $%d" % c
-			row.btn.disabled = money < c
 
-func _buy(key: String) -> void:
-	if _levels[key] >= UP_MAX:
-		return
-	var c: int = _cost(key)
-	if money >= c:
-		money -= c
-		_levels[key] += 1
-		_apply_upgrades()
-		_refresh_shop()
+func _set_level(key: String, delta: int) -> void:
+	_levels[key] = clampi(_levels[key] + delta, 0, UP_MAX)
+	_apply_upgrades()
+	_refresh_shop()
 
 # --- HUD ---------------------------------------------------------------------
 
@@ -268,7 +273,7 @@ func _setup_hud() -> void:
 	hint.position = Vector2(28, -34)
 	hint.add_theme_font_size_override("font_size", 13)
 	hint.add_theme_color_override("font_color", Color(0.8, 0.8, 0.85))
-	hint.text = "Shift = drive  •  S brake  •  A/D steer  •  air: W/S pitch, A/D roll, Q/E yaw  •  Space dive  •  R recover  •  Enter restart"
+	hint.text = "Shift drive  •  S brake  •  A/D steer  •  air: W/S pitch, A/D roll, Q/E yaw  •  Space dive  •  R recover  •  Tab upgrades  •  Enter restart"
 	layer.add_child(hint)
 
 func _bar_bg(layer: CanvasLayer, pos: Vector2, col: Color) -> void:

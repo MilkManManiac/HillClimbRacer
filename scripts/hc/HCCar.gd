@@ -124,10 +124,21 @@ func _physics_process(delta: float) -> void:
 		# smoothed steering (slower response than raw input)
 		_steer = lerpf(_steer, steer_in, 1.0 - exp(-steer_rate * delta))
 		var k: float = clamp(speed / max_speed, 0.0, 1.0)
-		# grip: kill sideways slide, but turning hard at speed loses grip -> it slides out
+		# grip = re-aim horizontal velocity toward the car's heading WITHOUT losing speed
+		# (so a slightly-sideways landing keeps its momentum instead of scrubbing it).
+		# Turning hard at speed grips less -> it slides/drifts.
 		var slide: float = clamp(absf(_steer) * k, 0.0, 1.0)
-		var grip_eff: float = grip * (1.0 - slide_factor * slide)
-		apply_central_force(-right * right.dot(vel) * grip_eff * mass)
+		var align_rate: float = grip * (1.0 - slide_factor * slide)
+		var hv := Vector3(vel.x, 0.0, vel.z)
+		var hspeed := hv.length()
+		var fwd_h := Vector3(fwd.x, 0.0, fwd.z)
+		if hspeed > 1.0 and fwd_h.length() > 0.1:
+			var dir := fwd_h.normalized()
+			if fwd_speed < 0.0:
+				dir = -dir
+			var t: float = clamp(align_rate * delta * 0.5, 0.0, 1.0)
+			var nhv := hv.normalized().slerp(dir, t) * hspeed
+			linear_velocity = Vector3(nhv.x, vel.y, nhv.z)
 		# steering (bicycle model)
 		if absf(fwd_speed) > 0.4:
 			var ang: float = _steer * max_steer_angle * (1.0 - k * 0.4)
