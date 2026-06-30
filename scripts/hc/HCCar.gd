@@ -11,8 +11,8 @@ const GlbUtil := preload("res://scripts/GlbUtil.gd")
 const CAR_GLB := "res://assets/car/kenney_sedan_cc0.glb"
 
 # --- tunables ---
-@export var engine_force: float = 16500.0
-@export var max_speed: float = 112.0
+@export var engine_force: float = 19000.0
+@export var max_speed: float = 125.0
 @export var brake_force: float = 5500.0
 @export var grip: float = 8.5
 @export var slide_factor: float = 0.7      # how much grip you lose turning hard at speed (slides)
@@ -54,7 +54,7 @@ func _ready() -> void:
 	continuous_cd = true
 	gravity_scale = 0.0          # we apply gravity manually; avoid double gravity
 	angular_damp = 0.2
-	linear_damp = 0.05
+	linear_damp = 0.01           # very low so momentum carries (fast arcade feel)
 	center_of_mass_mode = RigidBody3D.CENTER_OF_MASS_MODE_CUSTOM
 	center_of_mass = Vector3(0, -0.4, 0)
 	fuel = max_fuel
@@ -115,7 +115,7 @@ func _physics_process(delta: float) -> void:
 			else:
 				apply_central_force(fwd * -braking * engine_force * 0.4)
 		else:
-			apply_central_force(-fwd * fwd_speed * 0.5 * mass * 0.02)
+			apply_central_force(-fwd * fwd_speed * 0.04 * mass * 0.02)   # tiny coast drag, keeps momentum
 		fuel -= delta * 0.2   # idle burn
 		# smoothed steering (slower response than raw input)
 		_steer = lerpf(_steer, steer_in, 1.0 - exp(-steer_rate * delta))
@@ -143,6 +143,11 @@ func _physics_process(delta: float) -> void:
 		var rot_input: float = absf(pitch) + absf(steer_in) + absf(yaw)
 		if rot_input < 0.15:
 			angular_velocity = angular_velocity.lerp(Vector3.ZERO, 1.0 - exp(-10.0 * delta))
+
+	# soft top-speed cap so downhills don't run away to absurd speeds
+	var soft_cap := 53.0   # m/s (~190 km/h)
+	if speed > soft_cap:
+		apply_central_force(-vel.normalized() * (speed - soft_cap) * mass * 2.5)
 
 	# --- recover (R): ease upright + small lift ----------------------------
 	if Input.is_key_pressed(KEY_R):

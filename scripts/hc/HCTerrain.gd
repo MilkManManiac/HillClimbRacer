@@ -6,7 +6,7 @@ extends Node3D
 ## and you crash. Chunks stream in ahead and free behind; solid HeightMapShape3D collision.
 
 const CHUNK := 64.0
-const RES := 30           # grid cells per chunk side (higher = smoother)
+const RES := 48           # grid cells per chunk side (higher = smoother, no facet snags)
 const LAT := 3
 const AHEAD := 11
 const BEHIND := 3
@@ -29,7 +29,7 @@ func _ready() -> void:
 	_noise.seed = 1234
 	_noise.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
 	_noise.fractal_type = FastNoiseLite.FRACTAL_FBM
-	_noise.frequency = 0.011
+	_noise.frequency = 0.008
 	_noise.fractal_octaves = 2
 
 func set_target(t: Node3D) -> void:
