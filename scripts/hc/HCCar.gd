@@ -23,7 +23,8 @@ const CAR_GLB := "res://assets/car/kenney_sedan_cc0.glb"
 @export var suspension_rest: float = 0.55   # ride height (raised by Bigger Wheels)
 @export var wheel_radius: float = 0.5        # visual wheel size + bump reach
 @export var suspension_stiff: float = 105.0
-@export var suspension_damp: float = 2.2    # low damping = springy bounce on landing
+@export var suspension_damp: float = 3.2    # some bounce, but damped enough not to fling
+@export var suspension_max_force: float = 8500.0   # per-wheel cap so hard landings don't launch
 @export var dive_force: float = 30.0       # downward push when diving (upgradable)
 @export var center_assist: float = 0.0     # air-guidance upgrade: pulls toward road center
 @export var air_pitch_torque: float = 11.0
@@ -60,9 +61,13 @@ func _ready() -> void:
 	gravity_scale = 0.0          # we apply gravity manually; avoid double gravity
 	angular_damp = 0.2
 	linear_damp = 0.01           # very low so momentum carries (fast arcade feel)
-	# the body only collides with guardrails (layer 2); the TERRAIN (layer 1) is handled
-	# by the suspension raycasts, so a landing never scrubs speed on the chassis box
-	collision_mask = 2
+	# collide with terrain (layer 1) AND guardrails (layer 2), but FRICTIONLESS so a
+	# landing doesn't scrub momentum and the body can't sink/glitch through the ground
+	collision_mask = 3
+	var pm := PhysicsMaterial.new()
+	pm.friction = 0.0
+	pm.bounce = 0.0
+	physics_material_override = pm
 	center_of_mass_mode = RigidBody3D.CENTER_OF_MASS_MODE_CUSTOM
 	center_of_mass = Vector3(0, -0.4, 0)
 	fuel = max_fuel
@@ -93,6 +98,7 @@ func _physics_process(delta: float) -> void:
 			var compression: float = clamp((suspension_rest - dist) / suspension_rest, -0.3, 1.0)
 			var vdot := up.dot(vel)
 			var force: float = (compression * suspension_stiff - vdot * suspension_damp) * mass * 0.25
+			force = clampf(force, -2000.0, suspension_max_force)
 			apply_force(up * force, origin - global_position)
 	airborne = not _grounded
 
@@ -167,6 +173,10 @@ func _physics_process(delta: float) -> void:
 			var corr: float = clampf(-global_position.x * 0.3, -1.0, 1.0) * center_assist
 			apply_central_force(Vector3((corr - linear_velocity.x * center_assist * 0.4) * mass, 0.0, 0.0))
 
+	# keep a hard landing from flinging the car into a glitchy spin (only on the ground)
+	if _grounded and angular_velocity.length() > 5.0:
+		angular_velocity = angular_velocity.normalized() * 5.0
+
 	# soft top-speed cap so downhills don't run away to absurd speeds
 	var soft_cap := 53.0   # m/s (~190 km/h)
 	if speed > soft_cap:
@@ -197,7 +207,7 @@ func _physics_process(delta: float) -> void:
 	# anti-tunnel safety: if a hard landing punched us through the ground, pop back up
 	if terrain and not dead:
 		var th: float = terrain.call("height_at", global_position.x, global_position.z)
-		if global_position.y < th - 1.0:
+		if global_position.y < th - 2.5:   # deep last-resort only; box collision handles normal landings
 			var p := global_position
 			p.y = th + 0.6
 			global_position = p
