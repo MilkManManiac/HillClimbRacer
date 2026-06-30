@@ -11,8 +11,8 @@ const GlbUtil := preload("res://scripts/GlbUtil.gd")
 const CAR_GLB := "res://assets/car/kenney_sedan_cc0.glb"
 
 # --- tunables ---
-@export var engine_force: float = 10000.0
-@export var max_speed: float = 75.0
+@export var engine_force: float = 12500.0
+@export var max_speed: float = 92.0
 @export var brake_force: float = 5500.0
 @export var grip: float = 8.5
 @export var wheelbase: float = 2.8

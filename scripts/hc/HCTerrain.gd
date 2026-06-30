@@ -26,8 +26,8 @@ func _ready() -> void:
 	_noise.seed = 1234
 	_noise.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
 	_noise.fractal_type = FastNoiseLite.FRACTAL_FBM
-	_noise.frequency = 0.006
-	_noise.fractal_octaves = 3
+	_noise.frequency = 0.011
+	_noise.fractal_octaves = 2
 	_rough.seed = 99
 	_rough.noise_type = FastNoiseLite.TYPE_SIMPLEX
 	_rough.frequency = 0.05
@@ -37,14 +37,14 @@ func set_target(t: Node3D) -> void:
 	_target = t
 	_update_chunks(true)
 
-## World height at (x,z). Amplitude grows the further forward (-Z) you are.
-func height_at(x: float, z: float) -> float:
+## STRAIGHT ROAD with hills: height depends only on forward distance (z), so the surface
+## is flat across the width and rolls up/down along the road — clean ramps to build speed
+## on downhills and launch off crests. Amplitude grows the further (-Z) you go.
+func height_at(_x: float, z: float) -> float:
 	var d: float = maxf(0.0, -z)
 	var amp: float = lerpf(base_amp, max_amp, clamp(d / ramp_dist, 0.0, 1.0))
-	var n: float = _noise.get_noise_2d(x, z)            # -1..1, broad rolling hills
-	var r: float = _rough.get_noise_2d(x, z) * 0.12     # gentle chop so ramps stay smooth
-	var rough_mix: float = clamp(d / ramp_dist, 0.0, 1.0)
-	return (n + r * rough_mix) * amp
+	var n: float = _noise.get_noise_1d(z)               # 1D rolling hills along the road
+	return n * amp
 
 func _physics_process(_delta: float) -> void:
 	if _target:
@@ -148,6 +148,7 @@ func _terrain_mat() -> StandardMaterial3D:
 	_mat.vertex_color_use_as_albedo = true
 	_mat.roughness = 1.0
 	_mat.specular_mode = BaseMaterial3D.SPECULAR_DISABLED
+	_mat.cull_mode = BaseMaterial3D.CULL_DISABLED   # double-sided: fixes see-through faces
 	return _mat
 
 # --- lateral containment walls ----------------------------------------------
