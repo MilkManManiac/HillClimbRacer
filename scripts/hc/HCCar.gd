@@ -60,6 +60,9 @@ func _ready() -> void:
 	gravity_scale = 0.0          # we apply gravity manually; avoid double gravity
 	angular_damp = 0.2
 	linear_damp = 0.01           # very low so momentum carries (fast arcade feel)
+	# the body only collides with guardrails (layer 2); the TERRAIN (layer 1) is handled
+	# by the suspension raycasts, so a landing never scrubs speed on the chassis box
+	collision_mask = 2
 	center_of_mass_mode = RigidBody3D.CENTER_OF_MASS_MODE_CUSTOM
 	center_of_mass = Vector3(0, -0.4, 0)
 	fuel = max_fuel
@@ -149,14 +152,14 @@ func _physics_process(delta: float) -> void:
 		var pitch := pitch_in                      # W nose up / S nose down
 		if diving:
 			pitch -= 1.0                           # dive also pitches the nose down
-		var yaw := 0.0
-		if Input.is_key_pressed(KEY_Q): yaw += 1.0
-		if Input.is_key_pressed(KEY_E): yaw -= 1.0
-		apply_torque(right * pitch * air_pitch_torque * mass)
-		apply_torque(fwd * -steer_in * air_roll_torque * mass)
-		apply_torque(up * yaw * air_yaw_torque * mass)
+		var qe := 0.0
+		if Input.is_key_pressed(KEY_Q): qe += 1.0
+		if Input.is_key_pressed(KEY_E): qe -= 1.0
+		apply_torque(right * pitch * air_pitch_torque * mass)   # W/S = pitch
+		apply_torque(up * steer_in * air_yaw_torque * mass)     # A/D = yaw (rotate)
+		apply_torque(fwd * qe * air_roll_torque * mass)         # Q/E = roll
 		# arrest rotation quickly once the controls are released
-		var rot_input: float = absf(pitch) + absf(steer_in) + absf(yaw)
+		var rot_input: float = absf(pitch) + absf(steer_in) + absf(qe)
 		if rot_input < 0.15:
 			angular_velocity = angular_velocity.lerp(Vector3.ZERO, 1.0 - exp(-10.0 * delta))
 		# air-guidance upgrade: a slow correction back toward the road center (x=0)

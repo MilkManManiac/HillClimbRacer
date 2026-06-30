@@ -180,6 +180,13 @@ func _build_rail(xpos: float, z0: float, z1: float) -> Node3D:
 	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 	mi.material_override = mat
 	container.add_child(mi)
-	mi.create_trimesh_collision()
+	# guardrail collision on layer 2 (the car body collides with this, not the terrain)
+	var body := StaticBody3D.new()
+	body.collision_layer = 2
+	body.collision_mask = 0
+	var cs := CollisionShape3D.new()
+	cs.shape = mi.mesh.create_trimesh_shape()
+	body.add_child(cs)
+	container.add_child(body)
 	add_child(container)
 	return container
