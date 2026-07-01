@@ -64,7 +64,10 @@ var _dust: GPUParticles3D
 var _rockets: Array[Node3D] = []
 var _rocket_flames: Array[GPUParticles3D] = []
 var boosting: bool = false
+var drifting: bool = false          # rear traction broken (hard turn / handbrake) -> tire smoke
 var wing_lift: float = 0.0          # lift from Wings upgrade (air time)
+var _tire_smoke: Array[GPUParticles3D] = []
+var _exhaust_smoke: Array[GPUParticles3D] = []
 var _grounded: bool = false
 var _steer: float = 0.0
 var _air_time: float = 0.0
@@ -144,6 +147,7 @@ func _ready() -> void:
 	_build_cans()
 	_build_dust()
 	_build_rockets()
+	_build_smoke()
 	_fit_parts()   # raise/scale the bolt-on upgrade parts to fit this vehicle
 	# sidecar removed for now (functions kept dormant; not built/applied)
 
@@ -217,12 +221,19 @@ func _physics_process(delta: float) -> void:
 		var k: float = clamp(speed / max_speed, 0.0, 1.0)
 		# grip = re-aim horizontal velocity toward the car's heading WITHOUT losing speed
 		# (so a slightly-sideways landing keeps its momentum instead of scrubbing it).
-		# Turning hard at speed grips less -> it slides/drifts.
-		var slide: float = clamp(absf(_steer) * k, 0.0, 1.0)
-		var align_rate: float = grip * (1.0 - slide_factor * slide)
 		var hv := Vector3(vel.x, 0.0, vel.z)
 		var hspeed := hv.length()
 		var fwd_h := Vector3(fwd.x, 0.0, fwd.z)
+		# DRIFT: turning hard at speed (or braking while turning = handbrake) snaps the
+		# rear loose. While drifting, grip collapses so the car slides instead of
+		# re-aiming — you keep your momentum and skate sideways.
+		var hard: float = absf(_steer) * k
+		var handbrake: bool = braking > 0.3 and absf(_steer) > 0.2
+		drifting = hspeed > 7.0 and (hard > 0.55 or handbrake)
+		var slide: float = clamp(hard, 0.0, 1.0)
+		var align_rate: float = grip * (1.0 - slide_factor * slide)
+		if drifting:
+			align_rate = minf(align_rate, grip * 0.16)   # traction broken — really slide
 		if hspeed > 1.0 and fwd_h.length() > 0.1:
 			var dir := fwd_h.normalized()
 			if fwd_speed < 0.0:
@@ -230,11 +241,17 @@ func _physics_process(delta: float) -> void:
 			var t: float = clamp(align_rate * delta * 0.5, 0.0, 1.0)
 			var nhv := hv.normalized().slerp(dir, t) * hspeed
 			linear_velocity = Vector3(nhv.x, vel.y, nhv.z)
-		# steering (bicycle model)
+			# reward holding a slide: a little style score for a proper drift
+			if drifting:
+				score += hspeed * delta * 1.5
+		# steering (bicycle model) — nose swings harder mid-drift so you can hold it
 		if absf(fwd_speed) > 0.4:
 			var ang: float = _steer * max_steer_angle * (1.0 - k * 0.4)
+			if drifting:
+				ang *= 1.6
 			angular_velocity.y = (fwd_speed / wheelbase) * tan(ang)
 	else:
+		drifting = false   # no tire smoke in the air
 		# --- airborne: full manual 3-axis (no assist) ----------------------
 		var pitch := pitch_in                      # W/left-stick nose down, S nose up
 		var qe := Input.get_action_strength("roll_right") - Input.get_action_strength("roll_left")  # Q/E / right stick
@@ -272,6 +289,13 @@ func _physics_process(delta: float) -> void:
 		health -= delta * 4.0   # recovering costs a little
 
 	_animate_surfaces(delta)
+
+	# --- smoke: tire smoke while drifting, exhaust while on the gas / boosting ---
+	for ts in _tire_smoke:
+		ts.emitting = drifting and _grounded
+	var puffing: bool = (drive > 0.05 and fuel > 0.0) or boosting
+	for es in _exhaust_smoke:
+		es.emitting = puffing
 
 	# --- air-time + flip tracking (for later trick scoring) ----------------
 	if airborne:
@@ -1271,6 +1295,66 @@ func _build_dust() -> void:
 	qm.material = dm
 	_dust.draw_pass_1 = qm
 	add_child(_dust)
+
+# --- tire + exhaust smoke ----------------------------------------------------
+## A reusable billowing-smoke emitter (starts off; toggled each frame).
+func _make_smoke(col: Color, smin: float, smax: float, vmin: float, vmax: float, dir: Vector3, amount: int, life: float, grav: float) -> GPUParticles3D:
+	var g := GPUParticles3D.new()
+	g.amount = amount
+	g.lifetime = life
+	g.emitting = false
+	g.local_coords = false
+	var pm := ParticleProcessMaterial.new()
+	pm.direction = dir
+	pm.spread = 35.0
+	pm.initial_velocity_min = vmin
+	pm.initial_velocity_max = vmax
+	pm.gravity = Vector3(0, grav, 0)
+	pm.scale_min = smin
+	pm.scale_max = smax
+	var grad := Gradient.new()
+	grad.set_color(0, Color(col.r, col.g, col.b, col.a))
+	grad.set_color(1, Color(col.r, col.g, col.b, 0.0))   # fade to clear
+	var gt := GradientTexture1D.new(); gt.gradient = grad
+	pm.color_ramp = gt
+	var curve := Curve.new(); curve.add_point(Vector2(0, 0.35)); curve.add_point(Vector2(1, 1.0))
+	var ct := CurveTexture.new(); ct.curve = curve
+	pm.scale_curve = ct
+	g.process_material = pm
+	var qm := QuadMesh.new(); qm.size = Vector2(1, 1)
+	var m := StandardMaterial3D.new()
+	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	m.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.vertex_color_use_as_albedo = true
+	m.albedo_color = Color(1, 1, 1)
+	qm.material = m
+	g.draw_pass_1 = qm
+	return g
+
+func _build_smoke() -> void:
+	# tire smoke off the two rear wheels (shown while drifting)
+	for i in [2, 3]:
+		if i >= _wheel_positions.size():
+			continue
+		var p: Vector3 = _wheel_positions[i]
+		var sm := _make_smoke(Color(0.86, 0.86, 0.9, 0.55), 0.5, 1.5, 0.8, 2.4, Vector3(0, 1, 0), 30, 0.75, 0.8)
+		sm.position = Vector3(p.x, 0.12, p.z)
+		add_child(sm)
+		_tire_smoke.append(sm)
+	# exhaust smoke — dark diesel stacks for the monster, light puffs for the hot-rod
+	if vehicle_type == "monster":
+		for sx in [-1.16, 1.16]:
+			var e := _make_smoke(Color(0.13, 0.13, 0.14, 0.75), 0.5, 1.4, 1.6, 3.8, Vector3(0, 1, 0), 26, 1.0, 2.2)
+			e.position = Vector3(sx, 3.9, 0.3)
+			add_child(e)
+			_exhaust_smoke.append(e)
+	else:
+		for sx in [-0.45, 0.45]:
+			var e := _make_smoke(Color(0.42, 0.42, 0.45, 0.5), 0.22, 0.7, 1.2, 2.8, Vector3(0, 0.4, 1), 18, 0.7, 0.4)
+			e.position = Vector3(sx, 0.42, 2.15)
+			add_child(e)
+			_exhaust_smoke.append(e)
 
 # --- rocket boosters (Rockets upgrade) --------------------------------------
 ## Twin nozzles on the tail (+Z, the rear) with a glowing throat and a flame jet.
