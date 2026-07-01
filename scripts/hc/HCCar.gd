@@ -377,11 +377,15 @@ func _check_gap() -> void:
 		var over_void: bool = z < g.lip_z and z > g.far_z
 		if over_void and not _grounded:
 			_gap_armed = true   # airborne over the void
-		elif _gap_armed and z <= g.far_z and _grounded and absf(global_position.x) <= road_half:
-			_on_gap_cleared(int(g.idx))   # landed on the far platform = cleared
-		# fell in: dropped below the gap table anywhere over the void — even if you
-		# slid in with a wheel still touching (so it can't bounce in the pit).
-		if (over_void or _gap_armed) and global_position.y < lvl - 3.5:
+		elif _gap_armed and z <= g.far_z and global_position.y > lvl - 3.5 and absf(global_position.x) <= road_half:
+			# crossed the far edge ABOVE the fail line = you made it — clear it now, even
+			# mid-air. (A big jump can overshoot the whole landing platform; requiring a
+			# grounded touch there left the gap "armed" and falsely wrecked you on the
+			# lower terrain past it.)
+			_on_gap_cleared(int(g.idx))
+		# fell in: dropped below the gap table WHILE still over the void (also catches a
+		# grounded slide-in, since over_void is true whether or not a wheel is touching).
+		if over_void and global_position.y < lvl - 3.5:
 			_on_gap_failed()
 	elif _gap_armed and global_position.y < -12.0:
 		_on_gap_failed()
