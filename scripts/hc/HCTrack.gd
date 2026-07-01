@@ -9,7 +9,9 @@ extends Node3D
 ##   set_target(node), height_at(x,z), progress(pos), lateral_off(pos), road_half_here(pos)
 ## (No gaps yet — has_gaps() is false so the car skips its jump logic. Phase 2 adds them.)
 
-signal pickup_collected(kind: String, value: float)   # interface parity (unused for now)
+signal pickup_collected(kind: String, value: float)
+
+const HCPickup := preload("res://scripts/hc/HCPickup.gd")
 
 const STEP := 4.0            # path sample spacing (m)
 const N_MAX := 7000          # samples -> 28 km of road
@@ -28,6 +30,40 @@ const CELL := 24.0           # spatial-hash cell size for projection + overlap t
 @export var turn_radius_min := 30.0    # tightest turn radius (m) — small = drift-friendly
 @export var turn_radius_max := 85.0    # loosest turn radius (m)
 
+# --- jumps (gaps) on the winding road ---------------------------------------
+@export var gap_start := 320.0         # no jumps before this distance-along-road
+@export var gap_spacing := 300.0       # base distance between jumps
+@export var gap_spacing_grow := 90.0   # +distance to each next jump (rarer further out)
+@export var gap_base_width := 34.0     # void width (along the road) at the first jump
+@export var gap_grow := 10.0           # +void width per jump
+@export var gap_max_width := 130.0
+@export var gap_ramp_len := 24.0       # launch ramp run-up
+@export var gap_ramp_rise := 7.0       # how high the lip kicks
+@export var gap_land_len := 55.0       # landing DOWNSLOPE past the void (long = smooth)
+@export var gap_land_rise := 8.0       # landing lip height — you touch down and ride it down
+@export var gap_pit := -45.0           # void floor
+var _gaps: Array = []                  # {cs, vw, lvl, idx}
+var _gsamp := PackedInt32Array()       # per sample: index into _gaps, or -1
+
+# --- collectible pickups (coins + fuel), streamed by arc-length ahead of the car -
+# Deterministic slots along the road, streamed in a window and freed behind. They are
+# RESPAWNABLE: collecting one only removes it for the current run; reset_pickups()
+# (called on restart) frees them all and rewinds the frontier so every run starts
+# fully stocked. Fuel cans give a modest top-up — enough to matter, not a free tank.
+const PK_STEP := 16.0            # slot spacing along the road centre-line (m)
+const PK_LOOKAHEAD := 240.0      # spawn slots up to this far ahead (arc-length)
+const PK_BEHIND := 60.0          # free pickups once this far behind the car
+const PK_COIN_VALUE := 20.0      # cash per coin
+const PK_FUEL_VALUE := 14.0      # fuel units per can (deliberately small — a sip, not a fill)
+const PK_FUEL_SLOT := 8          # a fuel can every Nth slot (~128 m); the rest are coins
+const PK_ARC_COINS := 6          # coins arced over each gap jump
+const PK_ARC_PEAK := 7.0         # arc apex above the launch level
+var _pk_root: Node3D
+var _pk_frontier: float = 0.0    # arc-length spawned up to
+var _pk_init := false
+var _pk_nodes: Array = []        # [{node, s}] live pickups, for behind-culling
+var _pk_arcs := {}               # gap idx -> true once its coin arc is seeded (this run)
+
 var _px := PackedFloat32Array()   # world X per sample
 var _pz := PackedFloat32Array()   # world Z per sample
 var _ph := PackedFloat32Array()   # heading (rad): forward = (sin h, -cos h)
@@ -43,6 +79,7 @@ var _rail_mat: StandardMaterial3D
 
 func _ready() -> void:
 	_build_path()
+	_build_gaps()
 
 # --- deterministic 2-D path generation with hard no-overlap -------------------
 func _build_path() -> void:
@@ -166,7 +203,9 @@ func _smooth_widen() -> void:
 	_pw = out
 
 # --- projection (world pos -> path sample) -----------------------------------
-## Nearest sample to (x,z) searching outward from `hint`.
+## Nearest sample to (x,z) searching outward from `hint`. If the car isn't near the
+## hint (e.g. it just RESPAWNED far away), fall back to a global grid search so the
+## projection snaps to wherever the car actually is instead of the stale stretch.
 func _nearest_from(x: float, z: float, hint: int) -> int:
 	var best := clampi(hint, 0, _n - 1)
 	var bestd := INF
@@ -176,23 +215,28 @@ func _nearest_from(x: float, z: float, hint: int) -> int:
 		var d := dx * dx + dz * dz
 		if d < bestd:
 			bestd = d; best = j
+	if bestd > 3600.0:   # >60 m from the local window -> teleport; search globally
+		return _nearest_grid(x, z, best)
 	return best
-## Nearest sample anywhere (grid-based) — for arbitrary queries (anti-tunnel).
-func _nearest_grid(x: float, z: float) -> int:
+## Nearest sample anywhere (grid-based). `fallback` returned if nothing is nearby.
+func _nearest_grid(x: float, z: float, fallback: int = 0) -> int:
 	var c := _cell(x, z)
-	var best := 0; var bestd := INF
-	for dx in range(-1, 2):
-		for dz in range(-1, 2):
-			var key := Vector2i(c.x + dx, c.y + dz)
-			if not _grid.has(key):
-				continue
-			for j in _grid[key]:
-				var ddx: float = _px[j] - x; var ddz: float = _pz[j] - z
-				var d := ddx * ddx + ddz * ddz
-				if d < bestd:
-					bestd = d; best = j
-	if bestd == INF:
-		return _nearest_from(x, z, _proj_i)   # fallback if no nearby cell
+	var best := fallback; var bestd := INF
+	for r in range(0, 4):   # widen the ring until we find road samples
+		for dx in range(-r, r + 1):
+			for dz in range(-r, r + 1):
+				if r > 0 and absi(dx) != r and absi(dz) != r:
+					continue   # only the new ring
+				var key := Vector2i(c.x + dx, c.y + dz)
+				if not _grid.has(key):
+					continue
+				for j in _grid[key]:
+					var ddx: float = _px[j] - x; var ddz: float = _pz[j] - z
+					var d := ddx * ddx + ddz * ddz
+					if d < bestd:
+						bestd = d; best = j
+		if bestd != INF:
+			break
 	return best
 
 ## Signed lateral offset of (x,z) from sample i (along the road's right vector).
@@ -207,7 +251,7 @@ func set_target(t: Node3D) -> void:
 	_update_tiles()
 
 func has_gaps() -> bool:
-	return false   # phase 1: no jumps on the winding road yet
+	return true
 
 ## Where to drop the car in: a bit forward along the opening straight (so there's road
 ## BEHIND it and it can't roll off the start edge). Heading here is 0 -> faces forward.
@@ -233,23 +277,211 @@ func road_half_here(pos: Vector3) -> float:
 	var i := _nearest_from(pos.x, pos.z, _proj_i)
 	return lerpf(road_half, road_half_turn, _pw[i])
 
-## Ground height at an arbitrary world (x,z) — rolling hills along the road, flat past it.
+## Ground height at an arbitrary world (x,z) — rolling hills + carved jumps.
 func height_at(x: float, z: float) -> float:
 	if _n == 0:
 		return 0.0
 	var i := _nearest_grid(x, z)
 	var lat := _lateral(i, x, z)
-	var d := float(i) * STEP
-	var amp := lerpf(3.0, hill_amp, clampf(d / 450.0, 0.0, 1.0))
-	var prof := _noise.get_noise_1d(d)
 	var rh := lerpf(road_half, road_half_turn, _pw[i])
+	return _carved_height(float(i) * STEP, lat, rh)
+
+## Base rolling-hill height (no jumps) at distance s, lateral lat.
+func _base_hill(s: float, lat: float, rh: float) -> float:
+	var amp := lerpf(3.0, hill_amp, clampf(s / 450.0, 0.0, 1.0))
+	var prof := _noise.get_noise_1d(s)
 	var edge := smoothstep(rh, rh + edge_falloff, absf(lat))
 	return prof * lerpf(amp, amp * 0.1, edge)
+
+## Hill height with any jump (ramp -> void -> landing) carved into the road at s.
+func _carved_height(s: float, lat: float, rh: float) -> float:
+	var base := _base_hill(s, lat, rh)
+	var gi := _gap_index_at_s(s)
+	if gi < 0:
+		return base
+	var on_road := 1.0 - smoothstep(rh, rh + edge_falloff, absf(lat))
+	if on_road < 0.01:
+		return base
+	return lerpf(base, _gap_profile(_gaps[gi], s), on_road)
+
+## Which gap (index into _gaps) covers distance s, or -1.
+func _gap_index_at_s(s: float) -> int:
+	if _gsamp.is_empty():
+		return -1
+	var i := clampi(int(s / STEP), 0, _gsamp.size() - 1)
+	return _gsamp[i]
+
+## Height profile of a jump at distance s: ramp kicks up, void drops, landing flat.
+func _gap_profile(g: Dictionary, s: float) -> float:
+	var lvl: float = g.lvl
+	var lip: float = g.cs - g.vw * 0.5
+	var far: float = g.cs + g.vw * 0.5
+	var ramp0: float = lip - gap_ramp_len
+	var land1: float = far + gap_land_len
+	if s < lip:
+		# ramp: rise from the surrounding ground up to the launch lip
+		var t: float = clampf((s - ramp0) / gap_ramp_len, 0.0, 1.0)
+		return lerpf(_base_hill(ramp0, 0.0, road_half), lvl + gap_ramp_rise, smoothstep(0.0, 1.0, t))
+	elif s < far:
+		return gap_pit    # the void
+	else:
+		# landing DOWNSLOPE: an elevated lip at the far edge sloping gently down to the
+		# ground, so a descending jump touches down moving ALONG the slope (smooth) instead
+		# of slamming onto a flat pad.
+		var t2: float = clampf((s - far) / gap_land_len, 0.0, 1.0)
+		var land_top: float = lvl + gap_land_rise
+		return lerpf(land_top, _base_hill(land1, 0.0, road_half), smoothstep(0.0, 1.0, t2))
+
+# --- jump scheduling ---------------------------------------------------------
+## Place jumps on STRAIGHT stretches (progressive spacing), marking the samples they
+## cover so height/collision/gap-state can find them fast.
+func _build_gaps() -> void:
+	_gsamp.resize(_n)
+	for i in range(_n):
+		_gsamp[i] = -1
+	var idx := 0
+	var s := gap_start
+	var limit := float(N_MAX) * STEP - gap_land_len - 60.0
+	while s < limit and idx < 400:
+		var vw := minf(gap_base_width + float(idx) * gap_grow, gap_max_width)
+		var span := gap_ramp_len + vw + gap_land_len + 24.0
+		if _is_straight(s - span * 0.5, s + span * 0.5):
+			_gaps.append({"cs": s, "vw": vw, "lvl": _base_hill(s, 0.0, road_half), "idx": idx})
+			var i0 := clampi(int((s - vw * 0.5 - gap_ramp_len) / STEP), 0, _n - 1)
+			var i1 := clampi(int((s + vw * 0.5 + gap_land_len) / STEP), 0, _n - 1)
+			for i in range(i0, i1 + 1):
+				_gsamp[i] = idx
+			idx += 1
+			s += gap_spacing + float(idx) * gap_spacing_grow
+		else:
+			s += 60.0   # turn here; nudge forward and look again
+
+## Is the road dead-straight across [s0,s1] (no turn), so a jump is fair?
+func _is_straight(s0: float, s1: float) -> bool:
+	var i0 := clampi(int(s0 / STEP), 0, _n - 1)
+	var i1 := clampi(int(s1 / STEP), 0, _n - 1)
+	if absf(_ph[i1] - _ph[i0]) > deg_to_rad(7.0):
+		return false
+	for i in range(i0, i1 + 1):
+		if _pw[i] > 0.12:
+			return false   # inside a turn's widened zone
+	return true
+
+## Jump state at a world position, for the car's _check_gap (mirrors the z-terrain).
+func gap_state(pos: Vector3) -> Dictionary:
+	var i := _nearest_from(pos.x, pos.z, _proj_i)
+	var gi := _gsamp[i] if i < _gsamp.size() else -1
+	if gi < 0:
+		return {"active": false}
+	var g: Dictionary = _gaps[gi]
+	var s := float(i) * STEP
+	var lat := absf(_lateral(i, pos.x, pos.z))
+	var rh := lerpf(road_half, road_half_turn, _pw[i])
+	var lip: float = g.cs - g.vw * 0.5
+	var far: float = g.cs + g.vw * 0.5
+	return {
+		"active": true, "idx": int(g.idx), "level": float(g.lvl),
+		"over_void": s > lip and s < far,
+		"past_far": s >= far,
+		"on_road": lat <= rh,
+	}
 
 # --- streaming: ribbon tiles along the path ----------------------------------
 func _process(_delta: float) -> void:
 	if _target:
 		_update_tiles()
+		_update_pickups()
+
+# --- pickups (coins + fuel), main-thread streamed by arc-length ----------------
+
+## Advance a spawn frontier ahead of the car's road progress, dropping a coin (or a
+## fuel can every PK_FUEL_SLOT-th slot) at each slot, plus a coin arc over any gap.
+## Frees pickups that fall well behind. Deterministic + respawnable (see reset_pickups).
+func _update_pickups() -> void:
+	if _target == null:
+		return
+	if _pk_root == null:
+		_pk_root = Node3D.new()
+		add_child(_pk_root)
+	var cs: float = progress(_target.global_position)
+	if not _pk_init:
+		_pk_frontier = snappedf(maxf(cs, 0.0), PK_STEP)
+		_pk_init = true
+	# fill the lookahead window
+	var limit: float = cs + PK_LOOKAHEAD
+	while _pk_frontier < limit:
+		_spawn_pickup_at_s(_pk_frontier)
+		_pk_frontier += PK_STEP
+	# cull pickups that have dropped behind the car
+	var behind: float = cs - PK_BEHIND
+	var kept: Array = []
+	for e in _pk_nodes:
+		if is_instance_valid(e.node):
+			if e.s < behind:
+				e.node.queue_free()
+			else:
+				kept.append(e)
+	_pk_nodes = kept
+
+## Decide + place whatever pickup sits at arc-length s (skips gap voids; seeds arcs).
+func _spawn_pickup_at_s(s: float) -> void:
+	var i: int = clampi(int(round(s / STEP)), 0, _n - 1)
+	var gi: int = _gap_index_at_s(s)
+	if gi >= 0:
+		# seed this gap's coin arc once, and don't drop a ground pickup inside the void
+		if not _pk_arcs.has(gi):
+			_pk_arcs[gi] = true
+			_spawn_gap_arc(_gaps[gi])
+		var g: Dictionary = _gaps[gi]
+		if s > g.cs - g.vw * 0.5 and s < g.cs + g.vw * 0.5:
+			return
+	var slot: int = int(round(s / PK_STEP))
+	var kind := "coin"
+	var value := PK_COIN_VALUE
+	if slot % PK_FUEL_SLOT == 0:
+		kind = "fuel"
+		value = PK_FUEL_VALUE
+	# lateral weave for coins so the line isn't a dead-straight rail (perp = road right)
+	var off := 0.0
+	if kind == "coin":
+		off = float((slot % 3) - 1) * (road_half * 0.4)
+	var right := Vector3(cos(_ph[i]), 0.0, sin(_ph[i]))
+	var base := Vector3(_px[i], 0.0, _pz[i]) + right * off
+	base.y = height_at(base.x, base.z) + 1.4
+	_add_pickup(kind, value, base, s)
+
+## A short parabola of coins arced over a gap's void, peaking so a clean jump scoops them.
+func _spawn_gap_arc(g: Dictionary) -> void:
+	var lvl: float = g.lvl
+	var lip: float = g.cs - g.vw * 0.5
+	var far: float = g.cs + g.vw * 0.5
+	for k in range(PK_ARC_COINS):
+		var t: float = float(k) / float(PK_ARC_COINS - 1)
+		var s: float = lerpf(lip, far, t)
+		var i: int = clampi(int(round(s / STEP)), 0, _n - 1)
+		var pos := Vector3(_px[i], lvl + PK_ARC_PEAK * 4.0 * t * (1.0 - t) + 1.4, _pz[i])
+		_add_pickup("coin", PK_COIN_VALUE, pos, s)
+
+## Instantiate one pickup, track it (with its arc-length s), and bridge its signal up.
+func _add_pickup(kind: String, value: float, pos: Vector3, s: float) -> void:
+	var pu := HCPickup.make(kind, value)
+	_pk_root.add_child(pu)
+	pu.global_position = pos
+	pu.collected.connect(_on_pickup_collected)
+	_pk_nodes.append({"node": pu, "s": s})
+
+func _on_pickup_collected(kind: String, value: float) -> void:
+	pickup_collected.emit(kind, value)
+
+## Wipe every live pickup and rewind the frontier so the next run re-stocks the whole
+## track — collecting a pickup never removes it permanently, only for the current run.
+func reset_pickups() -> void:
+	for e in _pk_nodes:
+		if is_instance_valid(e.node):
+			e.node.queue_free()
+	_pk_nodes.clear()
+	_pk_arcs.clear()
+	_pk_init = false
 
 func _update_tiles() -> void:
 	if _n == 0:
@@ -315,16 +547,17 @@ func _build_tile(t: int) -> void:
 			var wy := _height_lat(d, lat, rh)
 			pts.append(Vector3(wx, wy, wz))
 			cols.append(_surface_color(d, lat, rh))
-		rows.append({"p": pts, "c": cols, "rh": rh, "cx": cx, "cz": cz, "rx": rx, "rz": rz, "d": d})
+		rows.append({"p": pts, "c": cols, "rh": rh, "cx": cx, "cz": cz, "rx": rx, "rz": rz, "d": d, "void": _in_void_s(d)})
 	# stitch rows into the ribbon + collision band
 	for r in range(rows.size() - 1):
 		var a: Dictionary = rows[r]
 		var b: Dictionary = rows[r + 1]
+		var over_void: bool = a.void or b.void   # no floor over a jump — the car falls in
 		for k in range(LAT_FR.size() - 1):
 			_quad(st, a.p[k], a.p[k + 1], b.p[k], b.p[k + 1], a.c[k], a.c[k + 1], b.c[k], b.c[k + 1])
 			# collision across the drivable band (a bit past the rails so a slide still lands)
 			var midlat: float = (float(LAT_FR[k]) + float(LAT_FR[k + 1])) * 0.5 * half_mesh
-			if absf(midlat) <= road_half_turn + 2.0:
+			if not over_void and absf(midlat) <= road_half_turn + 2.0:
 				_quad(col, a.p[k], a.p[k + 1], b.p[k], b.p[k + 1], Color.WHITE, Color.WHITE, Color.WHITE, Color.WHITE)
 	st.generate_normals()
 	var container := Node3D.new()
@@ -347,10 +580,15 @@ func _build_tile(t: int) -> void:
 	_tiles[t] = container
 
 func _height_lat(d: float, lat: float, rh: float) -> float:
-	var amp := lerpf(3.0, hill_amp, clampf(d / 450.0, 0.0, 1.0))
-	var prof := _noise.get_noise_1d(d)
-	var edge := smoothstep(rh, rh + edge_falloff, absf(lat))
-	return prof * lerpf(amp, amp * 0.1, edge)
+	return _carved_height(d, lat, rh)
+
+## Is distance s inside a jump's void (the hole itself)?
+func _in_void_s(s: float) -> bool:
+	var gi := _gap_index_at_s(s)
+	if gi < 0:
+		return false
+	var g: Dictionary = _gaps[gi]
+	return s > g.cs - g.vw * 0.5 and s < g.cs + g.vw * 0.5
 
 func _surface_color(d: float, lat: float, rh: float) -> Color:
 	var grass := Color(0.28, 0.44, 0.20)
@@ -358,6 +596,16 @@ func _surface_color(d: float, lat: float, rh: float) -> Color:
 	var al := absf(lat)
 	if al > rh + 1.0:
 		return grass
+	# jump dressing: hazard stripes up the ramp, bright pad on the landing
+	var gi := _gap_index_at_s(d)
+	if gi >= 0 and al < rh:
+		var g: Dictionary = _gaps[gi]
+		var lip: float = g.cs - g.vw * 0.5
+		var far: float = g.cs + g.vw * 0.5
+		if d > lip - gap_ramp_len and d < lip:
+			return Color(0.92, 0.78, 0.12) if fmod(d, 4.0) < 2.0 else Color(0.1, 0.1, 0.11)
+		elif d >= far and d < far + gap_land_len:
+			return Color(0.16, 0.5, 0.3).lerp(grass, smoothstep(rh - 1.5, rh + 1.0, al))
 	var road := asphalt
 	if al < 1.3 and fmod(d, 7.0) < 4.0:
 		road = Color(0.86, 0.74, 0.22)   # soft dashed centre line

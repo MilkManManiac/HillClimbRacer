@@ -18,6 +18,14 @@ const CAR_GLB := "res://assets/car/kenney_sedan_cc0.glb"
 @export var slide_factor: float = 0.7      # how much grip you lose turning hard at speed (slides)
 @export var wheelbase: float = 2.8
 @export var max_steer_angle: float = 0.4   # smaller = gentler turns
+@export var corner_grip: float = 22.0      # max lateral accel (m/s^2) — low = wide turns at speed
+# --- per-vehicle drift personality (set from HCMain.VEHICLES) ---
+@export var drift_yaw_max: float = 3.1     # nose swing at full lock while drifting (tight vs shallow)
+@export var drift_snap: float = 7.0        # how fast drift-yaw chases the stick (HIGH = twitchy/loose)
+@export var drift_scrub: float = 0.9       # speed bled off mid-drift (HIGH = tight-but-slow corners)
+@export var slide_thresh: float = 0.85     # steer×speed a hard flick needs to break into a drift (HIGH = grips through corners)
+# --- per-vehicle roll instability / tipping ---
+@export var com_height: float = -0.4       # center-of-mass Y offset (higher = more top-heavy)
 @export var steer_rate: float = 3.0        # lower = slower steering response
 @export var gravity_force: float = 17.0    # lower = floatier, more hang time
 @export var suspension_rest: float = 0.55   # ride height (raised by Bigger Wheels)
@@ -27,6 +35,7 @@ const CAR_GLB := "res://assets/car/kenney_sedan_cc0.glb"
 @export var suspension_max_force: float = 8500.0   # per-wheel cap so hard landings don't launch
 @export var dive_force: float = 30.0       # downward push when diving (upgradable)
 @export var boost_force: float = 0.0       # rocket thrust along the nose (Rockets upgrade; 0 = none)
+@export var downforce: float = 0.0         # Downforce upgrade: speed-scaled push into the road (grounded only)
 @export var center_assist: float = 0.0     # air-guidance upgrade: pulls toward road center
 @export var air_pitch_torque: float = 11.0
 @export var air_roll_torque: float = 9.0
@@ -66,7 +75,7 @@ var _rocket_flames: Array[GPUParticles3D] = []
 var boosting: bool = false
 var drifting: bool = false          # rear traction broken (hard turn / handbrake) -> tire smoke
 var _grip_break: float = 0.0        # 0 = full grip, 1 = fully sliding; ramps in fast, out slow
-const DRIFT_YAW_MAX := 3.1          # rad/s the nose swings at FULL lock while fully drifting
+var _drift_yaw_cur: float = 0.0     # smoothed drift yaw (drift_snap controls how fast it chases target)
 const DRIFT_YAW_EXP := 1.9          # >1 = gentle at small steer, ramps up the harder you turn
 var wing_lift: float = 0.0          # lift from Wings upgrade (air time)
 var _tire_smoke: Array[GPUParticles3D] = []
@@ -83,6 +92,9 @@ var _skid_life: Array[float] = []
 var _skid_idx: int = 0
 var _skid_last: Array[Vector3] = [Vector3.ZERO, Vector3.ZERO]
 var _skid_root: Node3D
+var _underglow: Node3D
+var _ug_strips: Array[MeshInstance3D] = []
+var _ug_light: OmniLight3D
 var _grounded: bool = false
 var _steer: float = 0.0
 var _air_time: float = 0.0
@@ -119,8 +131,11 @@ var _falling_out: bool = false  # fell in; awaiting respawn (suspends anti-tunne
 # suspension switches off, and the car deadlocks sunk-and-undriveable. Box LENGTH
 # (col.z) is free to trim for facet-snag relief — only the height/col_y matter here.
 const VSPEC := {
-	"hotrod":  {"mass": 850.0,  "col": Vector3(1.9, 0.9, 3.6), "col_y": 0.7, "fx": 0.9, "fz": 1.4,  "wheelbase": 2.8},
-	"monster": {"mass": 2400.0, "col": Vector3(3.0, 1.8, 4.8), "col_y": 1.3, "fx": 1.7, "fz": 2.05, "wheelbase": 4.1},
+	"minivan": {"mass": 1200.0, "col": Vector3(2.0, 1.4, 4.0), "col_y": 0.95, "fx": 0.95, "fz": 1.5,  "wheelbase": 3.0},
+	"hotrod":  {"mass": 850.0,  "col": Vector3(1.9, 0.9, 3.6), "col_y": 0.7,  "fx": 0.9,  "fz": 1.4,  "wheelbase": 2.8},
+	"monster": {"mass": 2400.0, "col": Vector3(3.0, 1.8, 4.8), "col_y": 1.3,  "fx": 1.7,  "fz": 2.05, "wheelbase": 4.1},
+	"sports":  {"mass": 950.0,  "col": Vector3(2.1, 0.7, 4.0), "col_y": 0.5,  "fx": 1.05, "fz": 1.55, "wheelbase": 3.0},
+	"f1":      {"mass": 780.0,  "col": Vector3(1.5, 0.6, 4.4), "col_y": 0.45, "fx": 1.15, "fz": 1.9,  "wheelbase": 3.7},
 }
 var _vs: Dictionary = VSPEC["hotrod"]
 var _part_scale: float = 1.0   # bolt-on upgrade parts are scaled up to fit a bigger ride
@@ -129,6 +144,7 @@ func _ready() -> void:
 	add_to_group("car")   # so world pickups (HCPickup Area3D) can identify the player body
 	_vs = VSPEC.get(vehicle_type, VSPEC["hotrod"])
 	mass = float(_vs.mass)
+	wheelbase = float(_vs.wheelbase)   # per-vehicle turn feel (was set via apply_chassis, now removed)
 	# per-wheel suspension cap MUST scale with weight, else a heavy ride (monster
 	# truck) can't generate enough force to hold itself up — it bottoms out, the
 	# chassis drags, suspension feels dead, and landings never compress. ~13x mass
@@ -140,15 +156,19 @@ func _ready() -> void:
 	gravity_scale = 0.0          # we apply gravity manually; avoid double gravity
 	angular_damp = 0.2
 	linear_damp = 0.01           # very low so momentum carries (fast arcade feel)
-	# collide with terrain (layer 1) AND guardrails (layer 2), but FRICTIONLESS so a
-	# landing doesn't scrub momentum and the body can't sink/glitch through the ground
-	collision_mask = 3
+	# The body box does NOT collide with the terrain (layer 1). This is a raycast-suspension
+	# vehicle: the wheel rays hold it up and the anti-tunnel safety net catches deep punches.
+	# Letting the long box ride the per-tile trimesh caused "ghost collisions" — at speed the
+	# box catches internal facet/seam edges and (being frictionless) redirects forward momentum
+	# straight up, i.e. the random collide-lose-speed-launch bug. Mask 2 keeps it free to hit
+	# future solid obstacles (walls/props) without ever touching the drivable ground.
+	collision_mask = 2
 	var pm := PhysicsMaterial.new()
 	pm.friction = 0.0
 	pm.bounce = 0.0
 	physics_material_override = pm
 	center_of_mass_mode = RigidBody3D.CENTER_OF_MASS_MODE_CUSTOM
-	center_of_mass = Vector3(0, -0.4, 0)
+	apply_com()   # per-vehicle CoM height (tippy rides ride higher/heavier up top)
 	fuel = max_fuel
 	health = max_health
 	_build_collision()
@@ -164,8 +184,14 @@ func _ready() -> void:
 	_build_rockets()
 	_build_smoke()
 	_build_skids()
+	_build_underglow()
 	_fit_parts()   # raise/scale the bolt-on upgrade parts to fit this vehicle
 	# sidecar removed for now (functions kept dormant; not built/applied)
+
+## Push the current com_height into the rigid body. Called on spawn and whenever
+## HCMain re-applies vehicle tuning, so a top-heavy ride actually sits top-heavy.
+func apply_com() -> void:
+	center_of_mass = Vector3(0, com_height, 0)
 
 func _physics_process(delta: float) -> void:
 	if dead:
@@ -185,17 +211,41 @@ func _physics_process(delta: float) -> void:
 	# --- suspension + ground detection -------------------------------------
 	var was_grounded := _grounded
 	_grounded = false
+	var gnormal := Vector3.ZERO   # averaged ground normal under the wheels (for pitch stability)
 	for i in range(_rays.size()):
 		var ray := _rays[i]
 		if _suspend(ray, up, vel):
 			_grounded = true
+			gnormal += ray.get_collision_normal()
 		_update_wheel_visual(i, ray)   # keep the visible wheel on the ground (no sinking)
 	if _sidecar_on and _sidecar_ray and _suspend(_sidecar_ray, up, vel):
 		_grounded = true
 	airborne = not _grounded
 
+	# --- grounded attitude: glue pitch & roll to the ground slope -----------
+	# The 4 springs alone let the chassis wind up a pitch OSCILLATION at speed (worst on the long
+	# F1) that a landing kicks into a full nose-dive/flip. Instead, while grounded we strongly and
+	# critically-damp the chassis ATTITUDE toward the averaged ground normal — pitch AND roll,
+	# never yaw (steering owns that) — then hard-cap the grounded pitch/roll rate. The car stays
+	# planted and glued to the slope, so it can't knife its nose in or flip on a hard landing.
+	if _grounded and gnormal.length() > 0.01:
+		var gn := gnormal.normalized()
+		var lvl_axis := up.cross(gn)                        # rotate body-up toward ground normal (pitch+roll, no yaw)
+		var yaw_rate: float = angular_velocity.dot(up)
+		var tilt_rate := angular_velocity - up * yaw_rate   # pitch+roll part of the spin
+		apply_torque((lvl_axis * 32.0 - tilt_rate * 9.0) * mass)
+		# hard cap the grounded pitch/roll rate so a hard landing can't spike a tumble
+		var pr: float = clampf(angular_velocity.dot(right), -3.5, 3.5)
+		var rr: float = clampf(angular_velocity.dot(fwd), -3.5, 3.5)
+		angular_velocity = up * yaw_rate + right * pr + fwd * rr
+
 	# --- gravity ------------------------------------------------------------
 	apply_central_force(Vector3.DOWN * gravity_force * mass)
+
+	# --- downforce upgrade: press the car into the road at speed so it plants and
+	# corners flatter. Grounded-only so it never kills your jumps.
+	if downforce > 0.0 and _grounded:
+		apply_central_force(Vector3.DOWN * downforce * speed * mass * 0.12)
 
 	# --- dive (hold Space / LB): drop faster, burns fuel --------------------
 	var diving := Input.is_action_pressed("dive") and fuel > 0.0
@@ -247,7 +297,7 @@ func _physics_process(delta: float) -> void:
 		var handbrake: bool = braking > 0.3 and absf(_steer) > 0.1
 		# drift is INTENTIONAL: the handbrake breaks traction (at any steer, low speed OK);
 		# a bare hard flick only breaks it near full lock so fast cornering stays gripped.
-		var breaking_now: bool = hspeed > 4.0 and (handbrake or hard > 0.85)
+		var breaking_now: bool = hspeed > 4.0 and (handbrake or hard > slide_thresh)
 		# traction break ramps IN fast but recovers SLOWLY, so a drift keeps sliding and
 		# washes out naturally after you let off instead of snapping back to full grip.
 		if breaking_now:
@@ -268,15 +318,32 @@ func _physics_process(delta: float) -> void:
 			# reward holding a slide: a little style score for a proper drift
 			if drifting:
 				score += hspeed * delta * 1.5
-		# steering. Grippy = bicycle model. Mid-drift the nose rotates PROGRESSIVELY with
-		# steer: slow/holdable at small angles, ramping up hard the more you turn — so you
-		# ease into a slide and can crank it tighter. Blended in by how broken traction is.
+				# per-vehicle scrub: a drift bleeds forward speed (tight-but-slow rides
+				# scrub hard; low-scrub rides skate through corners keeping momentum)
+				var scrub: float = drift_scrub * _grip_break * absf(_steer) * delta
+				linear_velocity *= (1.0 - clampf(scrub * 0.9, 0.0, 0.25))
+		# steering. Grippy = bicycle model, but GRIP-LIMITED: a car can only pull so much
+		# lateral G, so the faster you go the WIDER you must turn (slow down or drift for a
+		# tight corner). corner_grip (per-vehicle) = max lateral accel; longer wheelbase also
+		# widens turns. Mid-drift the nose instead rotates PROGRESSIVELY with steer (uncapped).
 		if absf(fwd_speed) > 0.4:
-			var grip_ang: float = _steer * max_steer_angle * (1.0 - k * 0.4)
+			var grip_ang: float = _steer * max_steer_angle * (1.0 - k * 0.22)
 			var grip_yaw: float = (fwd_speed / wheelbase) * tan(grip_ang)
+			var max_yaw: float = corner_grip / maxf(absf(fwd_speed), 4.0)   # lat-accel cap
+			grip_yaw = clampf(grip_yaw, -max_yaw, max_yaw)
 			var prog: float = signf(_steer) * pow(absf(_steer), DRIFT_YAW_EXP)   # progressive curve
-			var drift_yaw: float = prog * DRIFT_YAW_MAX * signf(fwd_speed)
-			angular_velocity.y = lerpf(grip_yaw, drift_yaw, _grip_break)
+			# per-vehicle drift feel: drift_yaw_max = how far the nose swings at full lock;
+			# drift_snap = how fast it chases the stick (HIGH = twitchy/loose, LOW = lazy tail).
+			var drift_target: float = prog * drift_yaw_max * signf(fwd_speed)
+			_drift_yaw_cur = lerpf(_drift_yaw_cur, drift_target, 1.0 - exp(-drift_snap * delta))
+			var yaw_target: float = lerpf(grip_yaw, _drift_yaw_cur, _grip_break)
+			# Apply the turn about the BODY up axis, NOT world Y. When the car is pitched/leaned at
+			# speed, spinning about world-up bleeds onto the body PITCH axis and knifes the nose
+			# into the ground. Rebuild angular velocity from body axes: set yaw, keep current pitch
+			# & roll rates (suspension + pitch-stability own those).
+			var pitch_c: float = angular_velocity.dot(right)
+			var roll_c: float = angular_velocity.dot(fwd)
+			angular_velocity = up * yaw_target + right * pitch_c + fwd * roll_c
 	else:
 		_grip_break = move_toward(_grip_break, 0.0, delta * 4.0)
 		drifting = false   # no tire smoke in the air
@@ -298,13 +365,19 @@ func _physics_process(delta: float) -> void:
 			var corr: float = clampf(-global_position.x * 0.18, -0.6, 0.6) * center_assist
 			apply_central_force(Vector3((corr - linear_velocity.x * center_assist * 0.22) * mass, 0.0, 0.0))
 
-	# keep a hard landing from flinging the car into a glitchy spin (only on the ground)
-	if _grounded and angular_velocity.length() > 5.0:
-		angular_velocity = angular_velocity.normalized() * 5.0
+	# The car self-levels on its four suspension springs, so it stays upright on its own —
+	# there is NO tip/lean/roll-over mechanic. Cars differ in the corners purely by turn
+	# radius (corner_grip / max_steer_angle / wheelbase) and drift feel, not by leaning over.
+	# This clamp just stops a hard landing from flinging the chassis into a glitchy spin.
+	if _grounded and angular_velocity.length() > 5.5:
+		angular_velocity = angular_velocity.normalized() * 5.5
 
-	# soft top-speed cap so downhills don't run away to absurd speeds
-	# (boost gives only a tiny extra headroom now — it's an air nudge, not a sled)
-	var soft_cap := 58.0 if boosting else 53.0   # m/s
+	# soft top-speed cap so downhills don't run away to absurd speeds. PER-VEHICLE now:
+	# it tracks this ride's own max_speed (+ headroom for downhills/boost), so a fast car
+	# (F1) genuinely runs away from a slow one instead of everything sharing one ceiling.
+	var soft_cap := max_speed * 1.3
+	if boosting:
+		soft_cap += 8.0
 	if speed > soft_cap:
 		apply_central_force(-vel.normalized() * (speed - soft_cap) * mass * 2.5)
 
@@ -354,14 +427,57 @@ func _physics_process(delta: float) -> void:
 	# gap / checkpoint resolution (jump cleared, or fell in)
 	_check_gap()
 
-	# anti-tunnel safety: if a hard landing punched us through the ground, pop back up
-	# (suspended while falling into a gap — we WANT that fall to play out)
-	if terrain and not dead and not _falling_out:
-		var th: float = terrain.call("height_at", global_position.x, global_position.z)
-		if global_position.y < th - 2.5:   # deep last-resort only; box collision handles normal landings
-			var p := global_position
-			p.y = th + 0.6
-			global_position = p
+	# --- off-map / fall wreck ----------------------------------------------
+	# The road is a finite ribbon; past the meshed verge there's no ground at all, so
+	# flying off the side (or plunging into any un-scored void) would fall forever. The
+	# grounded off-road check below only catches slow roll-offs — this catches AIRBORNE
+	# departures too. Scored gaps run their own fail path, so skip while armed/falling.
+	if not dead and not _falling_out and not _gap_armed:
+		var off_mesh: bool = _road_off() > _road_half_here() + 11.0
+		if off_mesh or global_position.y < -70.0:
+			health = 0.0
+			dead = true
+			return
+
+	# --- JUMP-RAMP launch (only at real ramps, never on rolling hills) ------
+	# A soft, force-capped raycast spring can't build real launch velocity in the split second
+	# the car spends on a ramp at speed, so on its own it just skims FLAT over the pit. The
+	# terrain knows exactly where the engineered jump ramps are (gap_state), so ONLY there do we
+	# convert forward speed into UPWARD velocity via the ramp's own slope (rate = slope x
+	# horizontal speed): you arc off the lip and the faster you hit it, the bigger the air.
+	# Gated to gap ramps so rolling hills never fling the car (that was the old follow_vy bug).
+	if _grounded and terrain and terrain.has_method("gap_state"):
+		var gs: Dictionary = terrain.call("gap_state", global_position)
+		if gs.get("active", false) and gs.get("on_road", true) and not gs.get("over_void", false) and not gs.get("past_far", false):
+			var e := 1.5
+			var gx: float = (float(terrain.call("height_at", global_position.x + e, global_position.z)) - float(terrain.call("height_at", global_position.x - e, global_position.z))) / (2.0 * e)
+			var gz: float = (float(terrain.call("height_at", global_position.x, global_position.z + e)) - float(terrain.call("height_at", global_position.x, global_position.z - e))) / (2.0 * e)
+			var ramp_vy: float = linear_velocity.x * gx + linear_velocity.z * gz
+			if ramp_vy > 0.5:
+				linear_velocity.y = maxf(linear_velocity.y, minf(ramp_vy, 24.0))
+
+	# --- anti-tunnel safety floor (analytic ground, NO fling) ---------------
+	# The wheel springs give the smooth ride and the ramp launches; this is a SAFETY NET only.
+	# A big spawn/respawn drop (or a stray high-speed punch) can pierce the road before the
+	# springs catch it — and the collision tiles may not have streamed in yet. So if the
+	# body's lowest corner is below the ANALYTIC ground height (always available, even before
+	# tiles build), lift it back onto the surface and kill only DOWNWARD speed. It adds NO
+	# ground-follow velocity, so it never flings the car off rises the way the old clamp did,
+	# and it leaves upward (launch) velocity from the springs intact. Suspended while falling
+	# into a gap — that fall should play out.
+	if terrain and not dead and not _falling_out and _col_box and _col_shape:
+		var gh: float = terrain.call("height_at", global_position.x, global_position.z)
+		var hx: float = _col_box.size.x * 0.5
+		var hy: float = _col_box.size.y * 0.5
+		var hz: float = _col_box.size.z * 0.5
+		var cy: float = _col_shape.position.y
+		var lowest: float = INF
+		for cxs in [-1.0, 1.0]:
+			for cys in [-1.0, 1.0]:
+				for czs in [-1.0, 1.0]:
+					lowest = minf(lowest, to_global(Vector3(hx * cxs, cy + hy * cys, hz * czs)).y)
+		if lowest < gh:
+			global_position.y += (gh - lowest)
 			if linear_velocity.y < 0.0:
 				linear_velocity.y = 0.0
 			reset_physics_interpolation()
@@ -457,8 +573,11 @@ func get_speed_kmh() -> float: return linear_velocity.length() * 3.6
 func _check_gap() -> void:
 	if terrain == null or dead or _falling_out:
 		return
+	if terrain.has_method("gap_state"):
+		_check_gap_track()
+		return
 	if not terrain.has_method("_gap_for_z"):
-		return   # winding-road track has no jumps yet (phase 1)
+		return
 	var z := global_position.z
 	var g: Dictionary = terrain.call("_gap_for_z", z)
 	if not g.is_empty():
@@ -477,6 +596,22 @@ func _check_gap() -> void:
 		if over_void and global_position.y < lvl - 3.5:
 			_on_gap_failed()
 	elif _gap_armed and global_position.y < -12.0:
+		_on_gap_failed()
+
+## Jump resolution on the 2-D winding track (same rules as the z-corridor, but the
+## track reports gap state by our world position instead of by z).
+func _check_gap_track() -> void:
+	var g: Dictionary = terrain.call("gap_state", global_position)
+	if not g.get("active", false):
+		if _gap_armed and global_position.y < -14.0:
+			_on_gap_failed()
+		return
+	var lvl: float = g.level
+	if g.over_void and not _grounded:
+		_gap_armed = true
+	elif _gap_armed and g.past_far and global_position.y > lvl - 3.5 and g.on_road:
+		_on_gap_cleared(int(g.idx))
+	if g.over_void and global_position.y < lvl - 3.5:
 		_on_gap_failed()
 
 func _on_gap_cleared(idx: int) -> void:
@@ -708,9 +843,15 @@ func _panel(parent: Node3D, size: Vector3, pos: Vector3, col: Color, rough := 0.
 func _build_body() -> void:
 	_body = Node3D.new()
 	add_child(_body)
-	if vehicle_type == "monster":
-		_build_monster_body()
-		return
+	match vehicle_type:
+		"monster":
+			_build_monster_body(); return
+		"minivan":
+			_build_minivan_body(); return
+		"sports":
+			_build_sports_body(); return
+		"f1":
+			_build_f1_body(); return
 	var red := Color(0.86, 0.11, 0.09)        # saturated hot-rod paint
 	var red_dk := Color(0.5, 0.07, 0.06)       # shadowed paint for steps
 	var dark := Color(0.09, 0.09, 0.11)
@@ -829,7 +970,158 @@ func _build_monster_body() -> void:
 	_chrome_cyl(hull, 0.11, 2.1, Vector3(0, 0.95, 2.25), Vector3(0, 0, 90))          # rear bar
 	# exhaust stacks up the back of the cab
 	for sx in [-1.0, 1.0]:
-		_chrome_cyl(hull, 0.1, 1.3, Vector3(0.8 * sx, 2.0, 0.2), Vector3(0, 0, 0))
+		_chrome_cyl(hull, 0.1, 0.9, Vector3(0.8 * sx, 1.4, 0.25), Vector3(0, 0, 0))   # shorter + lower so they sit below the chase camera
+
+# --- underglow (cosmetic) ----------------------------------------------------
+## Emissive strips under the body + a tinted light that spills onto the road.
+func _build_underglow() -> void:
+	_underglow = Node3D.new()
+	add_child(_underglow)
+	var hx: float = float(_vs.fx) + 0.05
+	var hz: float = float(_vs.fz) + 0.3
+	var y := 0.12
+	var strips := [
+		[Vector3(0, y, -hz), Vector3(hx * 2.0, 0.05, 0.14)],   # front
+		[Vector3(0, y, hz), Vector3(hx * 2.0, 0.05, 0.14)],    # rear
+		[Vector3(-hx, y, 0), Vector3(0.14, 0.05, hz * 2.0)],   # left
+		[Vector3(hx, y, 0), Vector3(0.14, 0.05, hz * 2.0)],    # right
+	]
+	for st in strips:
+		var mi := MeshInstance3D.new()
+		var bm := BoxMesh.new()
+		bm.size = st[1]
+		mi.mesh = bm
+		mi.position = st[0]
+		var m := StandardMaterial3D.new()
+		m.emission_enabled = true
+		m.emission_energy_multiplier = 3.0
+		mi.material_override = m
+		_underglow.add_child(mi)
+		_ug_strips.append(mi)
+	_ug_light = OmniLight3D.new()
+	_ug_light.position = Vector3(0, 0.05, 0)
+	_ug_light.omni_range = 4.5
+	_ug_light.light_energy = 2.2
+	_underglow.add_child(_ug_light)
+	_underglow.visible = false
+
+## Toggle underglow on/off and set its colour (bought + picked in the garage).
+func apply_underglow(on: bool, color: Color) -> void:
+	if _underglow == null:
+		return
+	_underglow.visible = on
+	if not on:
+		return
+	for mi in _ug_strips:
+		var m := mi.material_override as StandardMaterial3D
+		m.albedo_color = color
+		m.emission = color
+	if _ug_light:
+		_ug_light.light_color = color
+
+# --- cosmetic tints (bought + picked in the garage) --------------------------
+## Rebuild a particle system's colour ramp: opaque `core` fading to clear `edge`.
+func _retint(p: GPUParticles3D, core: Color, edge: Color) -> void:
+	if p == null:
+		return
+	var pm := p.process_material as ParticleProcessMaterial
+	if pm == null:
+		return
+	var grad := Gradient.new()
+	grad.set_color(0, core)
+	grad.set_color(1, edge)
+	var gt := GradientTexture1D.new(); gt.gradient = grad
+	pm.color_ramp = gt
+
+## Tire-smoke colour (the puffs kicked up while drifting).
+func apply_smoke_color(color: Color) -> void:
+	var core := Color(color.r, color.g, color.b, 0.55)
+	var edge := Color(color.r, color.g, color.b, 0.0)
+	for ts in _tire_smoke:
+		_retint(ts, core, edge)
+
+## Drift skid-streak colour (the marks laid under the rear wheels). Alpha is still
+## animated per-mark in _update_skids; we only set the RGB here.
+func apply_streak_color(color: Color) -> void:
+	for mi in _skid_marks:
+		var m := mi.material_override as StandardMaterial3D
+		if m:
+			m.albedo_color = Color(color.r, color.g, color.b, m.albedo_color.a)
+
+## Boost flame colour (the rocket jets). Core is pushed toward white so it still
+## reads as hot; the tint shows through the body and trailing edge of the jet.
+func apply_flame_color(color: Color) -> void:
+	var core := color.lerp(Color(1, 1, 1, 1), 0.55); core.a = 1.0
+	var edge := Color(color.r, color.g, color.b, 0.0)
+	for f in _rocket_flames:
+		_retint(f, core, edge)
+
+# --- extra vehicle bodies ----------------------------------------------------
+
+## Boxy faded minivan — the deliberately-uncool $0 starter. Faces -Z.
+func _build_minivan_body() -> void:
+	var body := Color(0.62, 0.6, 0.5)      # faded beige
+	var body_dk := Color(0.42, 0.4, 0.34)
+	var dark := Color(0.1, 0.1, 0.12)
+	var glass := _glass(0.3)
+	_panel(_body, Vector3(1.9, 0.28, 4.0), Vector3(0, 0.42, 0), dark, 0.85)                 # rocker/floor
+	_panel(_body, Vector3(1.9, 1.05, 3.5), Vector3(0, 1.05, 0.15), body, 0.7, 0.05)         # boxy cabin
+	_panel(_body, Vector3(1.86, 0.62, 0.7), Vector3(0, 0.72, -1.95), body, 0.7)             # stubby flat front
+	_panel(_body, Vector3(1.82, 0.14, 3.3), Vector3(0, 1.64, 0.15), body_dk, 0.6)           # roof cap
+	var wt := _panel(_body, Vector3(1.7, 0.5, 0.06), Vector3(0, 1.3, -1.62), Color(1, 1, 1), 0.05); wt.material_override = glass
+	var rw := _panel(_body, Vector3(1.6, 0.45, 0.06), Vector3(0, 1.3, 1.86), Color(1, 1, 1), 0.05); rw.material_override = glass
+	for sx in [-1.0, 1.0]:
+		var sw := _panel(_body, Vector3(0.06, 0.48, 2.6), Vector3(0.95 * sx, 1.32, 0.2), Color(1, 1, 1), 0.05); sw.material_override = glass
+		_emit_panel(_body, Vector3(0.3, 0.22, 0.1), Vector3(0.7 * sx, 0.8, -2.3), Color(1, 0.95, 0.8), 1.6)
+	_panel(_body, Vector3(1.4, 0.28, 0.1), Vector3(0, 0.6, -2.3), dark, 0.5)                # grille
+	_chrome_cyl(_body, 0.08, 1.9, Vector3(0, 0.42, -2.3), Vector3(0, 0, 90))                # front bumper
+	_chrome_cyl(_body, 0.08, 1.9, Vector3(0, 0.42, 2.2), Vector3(0, 0, 90))                 # rear bumper
+	_panel(_body, Vector3(0.5, 0.3, 0.03), Vector3(0.96, 0.9, -0.5), Color(0.4, 0.28, 0.16), 0.95)  # rust patch
+
+## Low, wide, grippy sports car — the corner carver. Faces -Z.
+func _build_sports_body() -> void:
+	var body := Color(0.93, 0.72, 0.06)    # racing yellow
+	var body_dk := Color(0.6, 0.47, 0.05)
+	var dark := Color(0.08, 0.08, 0.1)
+	var glass := _glass(0.26)
+	_panel(_body, Vector3(2.0, 0.22, 4.0), Vector3(0, 0.32, 0), dark, 0.8)                  # low floor
+	_panel(_body, Vector3(1.94, 0.42, 3.9), Vector3(0, 0.58, 0), body, 0.28, 0.7)           # sleek body
+	var nose := _panel(_body, Vector3(1.72, 0.3, 1.5), Vector3(0, 0.55, -1.75), body, 0.28, 0.7); nose.rotation_degrees = Vector3(-7, 0, 0)
+	_panel(_body, Vector3(1.5, 0.34, 1.6), Vector3(0, 0.92, 0.2), body, 0.3, 0.6)           # low cabin
+	var ws := _panel(_body, Vector3(1.4, 0.3, 0.05), Vector3(0, 1.0, -0.62), Color(1, 1, 1), 0.05); ws.material_override = glass
+	var roof := _panel(_body, Vector3(1.42, 0.26, 1.1), Vector3(0, 1.12, 0.32), Color(1, 1, 1), 0.05); roof.material_override = glass
+	for sx in [-1.0, 1.0]:
+		_panel(_body, Vector3(0.14, 0.24, 3.4), Vector3(0.98 * sx, 0.48, 0), body_dk, 0.4)  # side skirt
+		_emit_panel(_body, Vector3(0.32, 0.14, 0.1), Vector3(0.6 * sx, 0.66, -2.32), Color(1, 0.97, 0.85), 2.0)
+		_emit_panel(_body, Vector3(0.32, 0.12, 0.08), Vector3(0.6 * sx, 0.74, 1.98), Color(1, 0.2, 0.1), 2.2)
+	_panel(_body, Vector3(1.9, 0.2, 0.9), Vector3(0, 0.8, 1.6), body, 0.3, 0.6)             # rear deck
+	for sx in [-0.75, 0.75]:
+		_panel(_body, Vector3(0.08, 0.3, 0.1), Vector3(sx, 0.98, 1.9), dark, 0.5)           # spoiler struts
+	_panel(_body, Vector3(1.94, 0.08, 0.42), Vector3(0, 1.15, 1.92), dark, 0.4)             # spoiler wing
+	_panel(_body, Vector3(0.9, 0.16, 0.08), Vector3(0, 0.52, -2.32), dark, 0.5)             # grille
+
+## Open-wheel F1 — narrow tub, long nose, front & rear wings, airbox. Faces -Z.
+func _build_f1_body() -> void:
+	var body := Color(0.1, 0.3, 0.86)      # team blue
+	var body_dk := Color(0.06, 0.16, 0.5)
+	var dark := Color(0.06, 0.06, 0.08)
+	_panel(_body, Vector3(0.72, 0.34, 3.2), Vector3(0, 0.5, 0.35), body, 0.3, 0.5)          # monocoque tub
+	_panel(_body, Vector3(0.4, 0.22, 1.0), Vector3(0, 0.5, -1.6), body, 0.3, 0.5)           # nose base
+	_panel(_body, Vector3(0.28, 0.16, 1.0), Vector3(0, 0.48, -2.4), body, 0.3, 0.5)         # thin nose tip
+	for sx in [-1.0, 1.0]:
+		_panel(_body, Vector3(0.5, 0.3, 1.7), Vector3(0.62 * sx, 0.48, 0.5), body_dk, 0.4)  # side pod
+	_panel(_body, Vector3(0.42, 0.5, 0.7), Vector3(0, 0.98, 1.1), body_dk, 0.35)            # airbox
+	_panel(_body, Vector3(0.5, 0.16, 0.9), Vector3(0, 0.7, 0.15), dark, 0.7)                # open cockpit
+	# rear wing
+	for sx in [-0.5, 0.5]:
+		_panel(_body, Vector3(0.05, 0.44, 0.5), Vector3(sx, 0.98, 2.05), dark, 0.4)
+	_panel(_body, Vector3(1.25, 0.09, 0.5), Vector3(0, 1.22, 2.05), body_dk, 0.4)
+	# front wing
+	_panel(_body, Vector3(1.5, 0.08, 0.42), Vector3(0, 0.32, -2.5), body_dk, 0.4)
+	for sx in [-0.72, 0.72]:
+		_panel(_body, Vector3(0.05, 0.28, 0.42), Vector3(sx, 0.4, -2.5), dark, 0.4)
+	for sx in [-1.0, 1.0]:
+		_emit_panel(_body, Vector3(0.18, 0.1, 0.06), Vector3(0.55 * sx, 0.62, 1.9), Color(1, 0.2, 0.1), 2.2)
 
 # --- body-detail helpers -----------------------------------------------------
 
@@ -1410,8 +1702,8 @@ func _build_smoke() -> void:
 	# exhaust smoke — dark diesel stacks for the monster, light puffs for the hot-rod
 	if vehicle_type == "monster":
 		for sx in [-1.16, 1.16]:
-			var e := _make_smoke(Color(0.13, 0.13, 0.14, 0.75), 0.5, 1.4, 1.6, 3.8, Vector3(0, 1, 0), 26, 1.0, 2.2)
-			e.position = Vector3(sx, 3.9, 0.3)
+			var e := _make_smoke(Color(0.13, 0.13, 0.14, 0.75), 0.45, 1.1, 0.8, 1.8, Vector3(0, 1, 0), 26, 0.7, 2.2)
+			e.position = Vector3(sx, 2.8, 0.3)
 			add_child(e)
 			_exhaust_smoke.append(e)
 	else:
@@ -1431,7 +1723,7 @@ func _build_smoke() -> void:
 		var bf := _make_backfire()
 		if mono:
 			(bf.process_material as ParticleProcessMaterial).direction = Vector3(0, 1, 0.2)
-		bf.position = Vector3(sx, (3.9 if mono else 0.42), (0.3 if mono else 2.2))
+		bf.position = Vector3(sx, (2.8 if mono else 0.42), (0.3 if mono else 2.2))
 		add_child(bf)
 		_backfire.append(bf)
 
