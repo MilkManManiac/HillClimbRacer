@@ -5,8 +5,10 @@ extends Node3D
 
 const SkyScript := preload("res://scripts/Sky.gd")
 const HCTerrainScript := preload("res://scripts/hc/HCTerrain.gd")
+const HCTrackScript := preload("res://scripts/hc/HCTrack.gd")
 const HCCarScript := preload("res://scripts/hc/HCCar.gd")
 const HCAudioScript := preload("res://scripts/hc/HCAudio.gd")
+const USE_TRACK := true   # true = new 2-D winding road (HCTrack); false = classic corridor
 
 var _car: RigidBody3D
 var _audio: Node
@@ -93,6 +95,7 @@ var _shop_rows := {}
 var _veh_rows := {}
 var _reset_btn: Button
 var _restart_btn: Button
+var _money_btn: Button
 var _reset_armed := false   # fresh-start needs a confirm click so it's not a mis-tap
 var _first_veh_btn: Button   # focus target when the garage opens (gamepad nav)
 
@@ -102,6 +105,12 @@ const SPEED_REF := 53.0                # reference top speed (m/s)
 const SPEED_FX_ON := 0.55              # speed-lines begin at this fraction of ref
 const SPEED_FX_MAX := 0.98             # speed-lines reach full at this fraction of ref
 const SPEED_LINE_COUNT := 32           # number of radial streaks
+# corner look-ahead: sample the road centre-line a bit ahead and lean the aim into
+# the upcoming bend so curves read early. Subtle + heavily damped (see _update_camera).
+const CAM_LOOKAHEAD_DIST := 45.0       # metres ahead of the car to sample the road
+const CAM_LOOKAHEAD_GAIN := 0.6        # how strongly lateral road bend maps to aim bias
+const CAM_LOOKAHEAD_MAX := 7.0         # max world-X aim bias (metres)
+var _cam_lookahead := 0.0              # smoothed look-ahead aim bias (world X, metres)
 var _cam_roll := 0.0                   # smoothed camera bank angle (degrees)
 var _cam_look_basis := Basis.IDENTITY  # roll-free smoothing accumulator (see _update_camera)
 var _cam_look_ready := false           # false until _cam_look_basis is seeded
@@ -184,16 +193,20 @@ func _setup_sky() -> void:
 
 func _setup_terrain_and_car() -> void:
 	_terrain = Node3D.new()
-	_terrain.set_script(HCTerrainScript)
+	# TOGGLE: the new 2-D winding-ribbon road (HCTrack) vs the classic z-corridor.
+	_terrain.set_script(HCTrackScript if USE_TRACK else HCTerrainScript)
 	add_child(_terrain)
 	_car = RigidBody3D.new()
 	_car.set_script(HCCarScript)
 	_car.set("vehicle_type", _vehicle)   # set BEFORE add_child so _ready builds the right ride
 	add_child(_car)
-	_car.set("road_half", _terrain.get("road_half_width"))
+	_car.set("road_half", _terrain.get("road_half") if USE_TRACK else _terrain.get("road_half_width"))
 	_car.set("terrain", _terrain)
-	# place start above the terrain so it drops onto it
-	_start.y = _terrain.call("height_at", 0.0, 0.0) + 4.0
+	# place start above the road so it drops onto it
+	if _terrain.has_method("spawn_pos"):
+		_start = _terrain.call("spawn_pos")   # track: a bit forward so we don't roll off the start
+	else:
+		_start.y = _terrain.call("height_at", 0.0, 0.0) + 4.0
 	_car.global_position = _start
 	_terrain.call("set_target", _car)
 	_car.connect("gap_failed", _on_car_gap_failed)
@@ -252,8 +265,23 @@ func _update_camera(delta: float) -> void:
 			if is_finite(lat):
 				roll_target = clampf(lat / 12.0, -1.0, 1.0) * CAM_ROLL_MAX_DEG
 	_cam_roll = lerpf(_cam_roll, roll_target, 1.0 - exp(-6.0 * delta))
+	# corner look-ahead: sample the road centre-line ~LOOKAHEAD metres ahead (forward
+	# is -Z, so subtract) and bias the aim toward where the road is heading. Eased to 0
+	# when there's nothing to drive (dead / no car / shop open) so it never lingers.
+	var lead_target := 0.0
+	var la_active: bool = not (_car == null or bool(_car.get("dead")) or (_shop != null and _shop.visible))
+	if la_active and _terrain != null and _terrain.has_method("road_center_x"):
+		var cz: float = _car.global_position.z
+		var here_cx: float = _terrain.call("road_center_x", cz)
+		var ahead_cx: float = _terrain.call("road_center_x", cz - CAM_LOOKAHEAD_DIST)
+		var lateral_lead := ahead_cx - here_cx
+		if is_finite(lateral_lead):
+			lead_target = clampf(lateral_lead * CAM_LOOKAHEAD_GAIN, -CAM_LOOKAHEAD_MAX, CAM_LOOKAHEAD_MAX)
+	_cam_lookahead = lerpf(_cam_lookahead, lead_target, 1.0 - exp(-4.0 * delta))
 	var target := _car.global_position
 	var want := target - _cam_heading * 12.0 + Vector3(0, 6.0, 0)
+	# gentle "cut the corner": nudge the chase position a small fraction of the aim bias
+	want.x += _cam_lookahead * 0.3
 	# don't let terrain block the view of the car: raycast from the car toward the camera
 	# and pull the camera in front of any hill in the way
 	var ss := _car.get_world_3d().direct_space_state
@@ -271,6 +299,9 @@ func _update_camera(delta: float) -> void:
 	var snap: float = 16.0 if blocked else 6.0
 	_cam.global_position = _cam.global_position.lerp(want, 1.0 - exp(-snap * delta))
 	var look := target + Vector3(0, 1.0, 0)
+	# lean the AIM toward the upcoming bend (composes with the roll-free basis below;
+	# it only shifts the look target, so it never feeds the drift-roll accumulator)
+	look.x += _cam_lookahead
 	var dir := look - _cam.global_position
 	# looking_at() errors if the look direction is parallel to the up vector
 	# (camera ends up directly above/below the car). Skip the degenerate frame,
@@ -313,6 +344,7 @@ func _restart() -> void:
 	_shake_off = Vector3.ZERO
 	_fov_punch = 0.0
 	_cam_roll = 0.0
+	_cam_lookahead = 0.0
 	_cam_look_ready = false   # reseed the look basis at the new spawn orientation
 	_speed_fx = 0.0
 	_was_dead = false
@@ -607,7 +639,21 @@ func _build_shop() -> void:
 	_reset_btn.pressed.connect(_on_reset_pressed)
 	box.add_child(_reset_btn)
 
+	# TEST-ONLY: instant cash so you can buy anything while iterating
+	_money_btn = Button.new()
+	_money_btn.text = "🧪 +$1,000,000  (test money)"
+	_money_btn.custom_minimum_size = Vector2(0, 34)
+	_money_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_money_btn.add_theme_color_override("font_color", Color(0.6, 1.0, 0.7))
+	_money_btn.pressed.connect(_on_test_money)
+	box.add_child(_money_btn)
+
 	_wire_focus_chain()
+
+## TEST-ONLY: dump a million dollars in the bank and refresh the shop.
+func _on_test_money() -> void:
+	money += 1000000
+	_refresh_shop()
 
 ## Chain every shop button top-to-bottom (vehicles -> upgrades -> retry -> new game,
 ## wrapping) so a gamepad d-pad walks the WHOLE list. Without this, the default
@@ -622,6 +668,7 @@ func _wire_focus_chain() -> void:
 		chain.append(_shop_rows[key].buy)
 	chain.append(_restart_btn)
 	chain.append(_reset_btn)
+	chain.append(_money_btn)
 	var n := chain.size()
 	for i in range(n):
 		var cur: Control = chain[i]
@@ -701,9 +748,12 @@ func _swap_vehicle(vk: String) -> void:
 	_car.set_script(HCCarScript)
 	_car.set("vehicle_type", _vehicle)
 	add_child(_car)
-	_car.set("road_half", _terrain.get("road_half_width"))
+	_car.set("road_half", _terrain.get("road_half") if USE_TRACK else _terrain.get("road_half_width"))
 	_car.set("terrain", _terrain)
-	_start.y = _terrain.call("height_at", 0.0, 0.0) + 4.0
+	if _terrain.has_method("spawn_pos"):
+		_start = _terrain.call("spawn_pos")
+	else:
+		_start.y = _terrain.call("height_at", 0.0, 0.0) + 4.0
 	_car.global_position = _start
 	_terrain.call("set_target", _car)
 	_car.connect("gap_failed", _on_car_gap_failed)
@@ -875,6 +925,9 @@ func _update_hud() -> void:
 func _update_gap_telegraph() -> void:
 	if _respawning or bool(_car.get("dead")):
 		return   # _big is owned by the wipeout / death screen
+	if not _terrain.has_method("_gap_for_z"):
+		_big.text = ""   # no gaps on the winding-road track yet
+		return
 	var gz: float = _car.global_position.z
 	var g: Dictionary = _terrain.call("_gap_for_z", gz)
 	if g.is_empty() or gz <= g.lip_z or (gz - g.lip_z) > 75.0:

@@ -48,6 +48,28 @@ const ARC_PEAK := 7.0             # arc apex height above the table level
 @export var land_len: float = 36.0           # flat landing platform past the void
 @export var pit_floor: float = -45.0         # void floor (deep = unrecoverable)
 
+# --- curve sections (long SUSTAINED sweepers you hold a drift through) --------
+# The road is defined by its HEADING: dead-straight (heading held) most of the time,
+# with occasional long sweepers where the heading ramps to a new direction (a real
+# constant-radius-ish turn you hold the whole way). The road WANDERS — it never snaps
+# back to centre; each sweeper just leaves it pointed a new way. Heading is capped so
+# the forward corridor can never turn sideways. Sweepers only sit in the gap-free
+# straights between jumps. The whole centre-line is integrated once into a read-only
+# table at load, so road_center_x/road_half_at are cheap, pure, thread-safe lookups.
+@export var curve_start: float = 200.0       # no sweepers before this distance
+@export var curve_every: int = 1             # a sweeper every Nth gap-free straight
+@export var curve_len: float = 640.0         # sweeper length = how long you hold the drift
+@export var curve_angle_deg: float = 40.0    # heading change per sweeper (how hard the turn)
+@export var curve_cap_deg: float = 52.0      # max |heading| — road never turns past this (x(z) breaks near 90)
+@export var curve_road_half: float = 40.0    # widened drivable half-width through a sweeper
+@export var curve_min_straight: float = 150.0  # a straight must be at least this long to hold a sweeper
+const CURVE_GAP_BUFFER := 30.0               # keep sweepers this far clear of any gap
+const CX_STEP := 8.0                         # centre-line table sample spacing (m)
+const CX_MAXD := 30000.0                     # precompute the wander out to here
+var _cx_x: PackedFloat32Array = PackedFloat32Array()   # road-centre X per sample
+var _cx_w: PackedFloat32Array = PackedFloat32Array()   # widen factor 0..1 per sample
+var _cx_n: int = 0
+
 var _noise := FastNoiseLite.new()
 var _chunks := {}
 var _target: Node3D
@@ -69,6 +91,7 @@ var _gap_arcs := {}
 
 func _ready() -> void:
 	_noise = _new_noise()   # single source of truth (workers use the same config)
+	_build_curve_table()    # integrate the wandering centre-line before streaming starts
 
 func set_target(t: Node3D) -> void:
 	_target = t
@@ -86,6 +109,101 @@ func _new_noise() -> FastNoiseLite:
 	n.fractal_gain = 0.4   # less high-frequency detail = smoother crests
 	return n
 
+# --- road curves (heading-integrated wandering centre-line) ------------------
+# gap schedule geometry (distance-space), so sweepers can sit in the gaps' straights.
+func _gap_cd(i: int) -> float:
+	return gap_start_dist + gap_spacing * float(i) + gap_spacing_grow * float(i) * float(i - 1) * 0.5
+func _gap_vw(i: int) -> float:
+	return minf(gap_base_width + float(i) * gap_grow, gap_max_width)
+func _gap_lo(i: int) -> float:   # ramp start (nearest edge of the carved span)
+	return _gap_cd(i) - _gap_vw(i) * 0.5 - ramp_len
+func _gap_hi(i: int) -> float:   # landing end (farthest edge)
+	return _gap_cd(i) + _gap_vw(i) * 0.5 + land_len
+
+## Integrate the whole wandering centre-line ONCE into read-only tables. The road
+## holds a heading on straights and ramps it through each sweeper; x = integral of
+## tan(heading). Sweepers sit centred in the gap-free straight after each gap.
+func _build_curve_table() -> void:
+	# 1) schedule the sweepers (one per qualifying gap-free straight)
+	var arcs: Array = []   # {d0, d1, t0, t1}
+	var theta: float = 0.0
+	var cap: float = deg_to_rad(curve_cap_deg)
+	var ang: float = deg_to_rad(curve_angle_deg)
+	var wsign: float = 1.0   # flips each time the road is near-straight, so it snakes BOTH ways
+	var s: int = 0
+	while s < 4000:
+		var i: int = s - 1
+		var lo: float = (curve_start if i < 0 else _gap_hi(i)) + CURVE_GAP_BUFFER
+		var hi: float = _gap_lo(s) - CURVE_GAP_BUFFER
+		if lo > CX_MAXD:
+			break
+		var qualifies: bool = (curve_every <= 1 or s % curve_every == 0) and (hi - lo) >= curve_min_straight
+		if qualifies:
+			var arclen: float = minf(curve_len, hi - lo)
+			var center: float = (lo + hi) * 0.5
+			# turn back toward straight when already angled; when near straight, pick a
+			# fresh direction (flipping each time) so the road snakes both ways, not one.
+			var dir: float
+			if absf(theta) > ang * 0.5:
+				dir = -signf(theta)
+			else:
+				wsign = -wsign
+				dir = wsign
+			var t1: float = clampf(theta + dir * ang, -cap, cap)
+			arcs.append({"d0": center - arclen * 0.5, "d1": center + arclen * 0.5, "t0": theta, "t1": t1})
+			theta = t1
+		s += 1
+	# 2) integrate x (and a widen factor) over uniform samples
+	_cx_n = int(CX_MAXD / CX_STEP) + 2
+	_cx_x.resize(_cx_n)
+	_cx_w.resize(_cx_n)
+	var x: float = 0.0
+	var hold: float = 0.0   # heading held on the current straight
+	var ai: int = 0
+	for k in range(_cx_n):
+		var d: float = float(k) * CX_STEP
+		while ai < arcs.size() and d > arcs[ai].d1:
+			hold = arcs[ai].t1
+			ai += 1
+		var th: float = hold
+		var wide: float = 0.0
+		if ai < arcs.size():
+			var a: Dictionary = arcs[ai]
+			if d >= a.d0 and d <= a.d1:
+				var u: float = (d - a.d0) / maxf(a.d1 - a.d0, 1.0)
+				th = lerpf(a.t0, a.t1, smoothstep(0.0, 1.0, u))
+				wide = smoothstep(0.0, 0.14, u) * (1.0 - smoothstep(0.86, 1.0, u))
+		x += tan(th) * CX_STEP
+		_cx_x[k] = x
+		_cx_w[k] = wide
+
+## Lateral offset (metres) of the road centre-line at distance z (read-only table).
+func road_center_x(z: float) -> float:
+	if _cx_n == 0:
+		return 0.0
+	var d: float = -z
+	if d <= 0.0:
+		return 0.0
+	var fk: float = d / CX_STEP
+	var k: int = int(fk)
+	if k >= _cx_n - 1:
+		return _cx_x[_cx_n - 1]
+	return lerpf(_cx_x[k], _cx_x[k + 1], fk - float(k))
+
+## Drivable half-width (metres) at distance z — wider through a sweeper for drift room.
+func road_half_at(z: float) -> float:
+	if _cx_n == 0:
+		return road_half_width
+	var d: float = -z
+	if d < 0.0:
+		return road_half_width
+	var fk: float = d / CX_STEP
+	var k: int = int(fk)
+	if k >= _cx_n - 1:
+		return road_half_width
+	var w: float = lerpf(_cx_w[k], _cx_w[k + 1], fk - float(k))
+	return lerpf(road_half_width, curve_road_half, w)
+
 ## Rolling-hills base height (road center high, sides flat). No gaps.
 ## `noise` lets worker threads pass their own instance; main-thread callers omit it.
 func _terrain_height(x: float, z: float, noise: FastNoiseLite = null) -> float:
@@ -94,7 +212,8 @@ func _terrain_height(x: float, z: float, noise: FastNoiseLite = null) -> float:
 	var d: float = maxf(0.0, -z)
 	var amp: float = lerpf(base_amp, max_amp, clamp(d / ramp_dist, 0.0, 1.0))
 	var prof: float = noise.get_noise_1d(z)
-	var edge: float = smoothstep(road_half_width, road_half_width + edge_falloff, absf(x))
+	var rhw: float = road_half_at(z)
+	var edge: float = smoothstep(rhw, rhw + edge_falloff, absf(x - road_center_x(z)))
 	var amp_here: float = lerpf(amp, amp * side_amp, edge)
 	return prof * amp_here
 
@@ -131,7 +250,7 @@ func _gap_for_z(z: float, noise: FastNoiseLite = null) -> Dictionary:
 	# one shared "table" height for the whole gap so takeoff and landing match
 	# (no impossible taller-on-one-side peak). Sampled from the natural hills at
 	# the approach so it blends in smoothly.
-	var level: float = _terrain_height(0.0, ramp0, noise)
+	var level: float = _terrain_height(road_center_x(ramp0), ramp0, noise)
 	return {
 		"idx": idx,
 		"void_w": void_w,
@@ -150,7 +269,7 @@ func height_at(x: float, z: float, noise: FastNoiseLite = null) -> float:
 	var g := _gap_for_z(z, noise)
 	if g.is_empty():
 		return base
-	var on_road: float = 1.0 - smoothstep(road_half_width, road_half_width + edge_falloff, absf(x))
+	var on_road: float = 1.0 - smoothstep(road_half_at(z), road_half_at(z) + edge_falloff, absf(x - road_center_x(z)))
 	if on_road < 0.01:
 		return base
 	var gy: float = base
@@ -349,6 +468,7 @@ func _gen_chunk_data(key: Vector2i) -> Dictionary:
 const PROP_TREE := 0
 const PROP_ROCK := 1
 const PROP_SIGN := 2
+const PROP_CHEVRON := 3      # curve-warning chevron on the outside of a bend
 const PROP_MARGIN := 8.0     # clearance off the asphalt before anything spawns
 const PROP_SPREAD := 24.0    # how far out from the margin props may sit
 const PROP_ZSTEP := 7.0      # candidate slot spacing down the corridor
@@ -382,7 +502,7 @@ func _gen_props(ox: float, oz: float, noise: FastNoiseLite) -> Array:
 				continue
 			# lateral distance out from the verge, jittered by a second sample
 			var jx: float = noise.get_noise_2d(z * 7.0, side * 91.0) * 0.5 + 0.5
-			var x: float = side * (road_half_width + PROP_MARGIN + jx * PROP_SPREAD)
+			var x: float = road_center_x(z) + side * (road_half_at(z) + PROP_MARGIN + jx * PROP_SPREAD)
 			# only emit props whose x lands in THIS chunk's lateral span, so the
 			# several lateral chunks streamed each frame don't all spawn duplicates.
 			if x < ox or x >= ox + CHUNK:
@@ -404,6 +524,25 @@ func _gen_props(ox: float, oz: float, noise: FastNoiseLite) -> Array:
 			var sc: float = 0.7 + (noise.get_noise_2d(x * 2.3, z * 2.3) * 0.5 + 0.5) * 0.8
 			var rot: float = (noise.get_noise_2d(x * 1.7 + 5.0, z * 1.7) * 0.5 + 0.5) * TAU
 			out.append({"pos": Vector3(x, y, z), "type": typ, "scale": sc, "rot": rot})
+	# chevron warning signs on the OUTER verge through the sweepers (~14 m apart)
+	for s in range(slots):
+		if s % 2 != 0:
+			continue
+		var cz: float = oz + (float(s) + 0.5) * PROP_ZSTEP
+		var half: float = road_half_at(cz)
+		if half < road_half_width + 0.5:
+			continue   # not in a sweeper (road hasn't widened)
+		var cx: float = road_center_x(cz)
+		# outer side = convex side of the bend, from the local curvature of the centre-line
+		var curv: float = road_center_x(cz + 4.0) - 2.0 * cx + road_center_x(cz - 4.0)
+		var outer: float = signf(curv) if absf(curv) > 0.0002 else 1.0
+		var chx: float = cx + outer * (half + 2.5)
+		if chx < ox or chx >= ox + CHUNK:
+			continue
+		var chy: float = height_at(chx, cz, noise)
+		if chy < pit_floor + 5.0:
+			continue
+		out.append({"pos": Vector3(chx, chy, cz), "type": PROP_CHEVRON, "scale": 1.0, "rot": 0.0})
 	return out
 
 ## Main-thread: turn built data into nodes and add to the tree.
@@ -446,6 +585,8 @@ func _prop_mesh(typ: int) -> Mesh:
 			m = _make_rock_mesh()
 		PROP_SIGN:
 			m = _make_sign_mesh()
+		PROP_CHEVRON:
+			m = _make_chevron_mesh()
 		_:
 			m = _make_tree_mesh()
 	_prop_meshes[typ] = m
@@ -518,6 +659,23 @@ func _make_sign_mesh() -> Mesh:
 	_add_part(mesh, panel, Transform3D(Basis(), Vector3(0, 2.1, 0)), Color(0.90, 0.78, 0.16))
 	return mesh
 
+## A curve-warning chevron sign (yellow panel + black '>' arrow), faces +Z (the driver).
+func _make_chevron_mesh() -> Mesh:
+	var mesh := ArrayMesh.new()
+	var post := CylinderMesh.new()
+	post.top_radius = 0.06; post.bottom_radius = 0.06; post.height = 1.6
+	post.radial_segments = 5; post.rings = 1
+	_add_part(mesh, post, Transform3D(Basis(), Vector3(0, 0.8, 0)), Color(0.22, 0.22, 0.24))
+	var panel := BoxMesh.new()
+	panel.size = Vector3(0.95, 0.95, 0.06)
+	_add_part(mesh, panel, Transform3D(Basis(), Vector3(0, 1.75, 0)), Color(0.96, 0.82, 0.10))   # yellow
+	# two black bars meeting into a '>' chevron
+	var bar := BoxMesh.new()
+	bar.size = Vector3(0.6, 0.15, 0.05)
+	_add_part(mesh, bar, Transform3D(Basis(Vector3(0, 0, 1), deg_to_rad(38.0)), Vector3(-0.05, 1.9, 0.04)), Color(0.1, 0.1, 0.11))
+	_add_part(mesh, bar, Transform3D(Basis(Vector3(0, 0, 1), deg_to_rad(-38.0)), Vector3(-0.05, 1.6, 0.04)), Color(0.1, 0.1, 0.11))
+	return mesh
+
 ## Build one MultiMeshInstance3D per prop type present in this chunk.
 func _insert_props(container: Node3D, props: Array) -> void:
 	if props.is_empty():
@@ -563,21 +721,22 @@ func _biome(z: float) -> Array:
 	return [(a[0] as Color).lerp(b[0], f), (a[1] as Color).lerp(b[1], f)]
 
 func _color_for(x: float, _y: float, z: float, noise: FastNoiseLite = null) -> Color:
-	var ax := absf(x)
+	var rhw := road_half_at(z)                 # widens through curves
+	var ax := absf(x - road_center_x(z))       # distance from the (curving) road centre
 	var pal := _biome(z)
 	var grass: Color = pal[0]
 	var asphalt: Color = pal[1]
-	var edge := smoothstep(road_half_width - 2.0, road_half_width + 2.0, ax)
+	var edge := smoothstep(rhw - 2.0, rhw + 2.0, ax)
 	# gap dressing: hazard stripes up the launch ramp, bright pad on the landing
 	var g := _gap_for_z(z, noise)
-	if not g.is_empty() and ax < road_half_width:
+	if not g.is_empty() and ax < rhw:
 		if z <= g.ramp_z0 and z > g.lip_z:
 			var stripe: bool = fmod(absf(z), 4.0) < 2.0   # yellow/black chevron feel
 			return Color(0.92, 0.78, 0.12) if stripe else Color(0.1, 0.1, 0.11)
 		elif z < g.far_z and z >= g.land_z1:
 			return Color(0.16, 0.5, 0.3).lerp(grass, edge)   # green "safe" landing pad
 	# --- off the asphalt: ground with a little grain so the verges aren't a flat fill
-	if ax > road_half_width + 2.0:
+	if ax > rhw + 2.0:
 		var gv: float = 0.0
 		if noise != null:
 			gv = noise.get_noise_2d(x * 1.3, z * 1.3) * 0.06
@@ -597,13 +756,13 @@ func _color_for(x: float, _y: float, z: float, noise: FastNoiseLite = null) -> C
 		return road   # gap in the dash
 
 	# solid edge / shoulder lines just inside the verge
-	var line_in := road_half_width - 1.6
-	var line_out := road_half_width - 0.6
+	var line_in := rhw - 1.6
+	var line_out := rhw - 0.6
 	if ax > line_in and ax < line_out:
 		return Color(0.88, 0.88, 0.90)   # solid white edge line
 
 	# rumble strips: short alternating light/dark blocks on the shoulder strip
-	if ax >= line_out and ax < road_half_width:
+	if ax >= line_out and ax < rhw:
 		var rumble: bool = fmod(absf(z), 2.4) < 1.2
 		var rc := Color(0.82, 0.20, 0.18) if rumble else Color(0.90, 0.90, 0.92)
 		return rc.lerp(grass, edge)
@@ -639,8 +798,8 @@ func _rebuild_barriers(pz: int) -> void:
 	_barriers.clear()
 	var z0 := float(pz - AHEAD) * CHUNK
 	var z1 := float(pz + BEHIND + 1) * CHUNK
-	_barriers.append(_build_rail(-road_half_width, z0, z1))
-	_barriers.append(_build_rail(road_half_width, z0, z1))
+	_barriers.append(_build_rail(-1.0, z0, z1))
+	_barriers.append(_build_rail(1.0, z0, z1))
 
 ## Skip rail over a void so it doesn't magically bridge the gap.
 func _in_void(z: float) -> bool:
@@ -649,7 +808,8 @@ func _in_void(z: float) -> bool:
 		return false
 	return z <= g.lip_z and z >= g.far_z
 
-func _build_rail(xpos: float, z0: float, z1: float) -> Node3D:
+func _build_rail(side: float, z0: float, z1: float) -> Node3D:
+	# `side` is -1 (left) or +1 (right); the rail rides the curving, widening verge.
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var step := 4.0
@@ -664,6 +824,7 @@ func _build_rail(xpos: float, z0: float, z1: float) -> Node3D:
 			rings = 0
 			z += step
 			continue
+		var xpos := road_center_x(z) + side * road_half_at(z)   # follow the road edge
 		var ey := height_at(xpos, z)
 		st.set_color(Color(0.75, 0.75, 0.8))
 		st.add_vertex(Vector3(xpos, ey - 0.3, z))

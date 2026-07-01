@@ -23,24 +23,27 @@ func _ready() -> void:
 		print("[gap] FAIL: no gap at first center"); fails += 1
 	else:
 		var lvl: float = g.level
+		# the road can wander, so sample the carve at the road CENTRE, not x=0
+		var cx: float = t.call("road_center_x", float(g.center_z))
+		var cxl: float = t.call("road_center_x", float(g.far_z) - 6.0)
 		# void floor sits well below the gap table level
-		var hy_void: float = t.call("height_at", 0.0, float(g.center_z))
+		var hy_void: float = t.call("height_at", cx, float(g.center_z))
 		if hy_void > lvl - 20.0:
 			print("[gap] FAIL: void not carved (h=%.1f, level=%.1f)" % [hy_void, lvl]); fails += 1
 		# ramp rises above the table level toward the lip
-		var hy_ramp: float = t.call("height_at", 0.0, float(g.lip_z) + 2.0)
+		var hy_ramp: float = t.call("height_at", t.call("road_center_x", float(g.lip_z) + 2.0), float(g.lip_z) + 2.0)
 		if hy_ramp <= lvl + 1.0:
 			print("[gap] FAIL: ramp does not kick up (ramp=%.1f level=%.1f)" % [hy_ramp, lvl]); fails += 1
 		# landing platform is flat at the table level just past the far edge
-		var hy_land: float = t.call("height_at", 0.0, float(g.far_z) - 6.0)
+		var hy_land: float = t.call("height_at", cxl, float(g.far_z) - 6.0)
 		if absf(hy_land - lvl) > 1.5:
 			print("[gap] FAIL: landing not at table level (land=%.2f level=%.2f)" % [hy_land, lvl]); fails += 1
 		# THE KEY ONE: takeoff and landing must be at (nearly) the same height
-		var hy_takeoff: float = t.call("height_at", 0.0, float(g.ramp_z0) + 9.0)   # approach plateau
+		var hy_takeoff: float = t.call("height_at", t.call("road_center_x", float(g.ramp_z0) + 9.0), float(g.ramp_z0) + 9.0)
 		if absf(hy_takeoff - hy_land) > 2.5:
 			print("[gap] FAIL: takeoff/landing height mismatch (takeoff=%.2f land=%.2f)" % [hy_takeoff, hy_land]); fails += 1
 		# the SIDES (off road) must NOT be carved into the void
-		var side_x: float = t.get("road_half_width") + t.get("edge_falloff") + 8.0
+		var side_x: float = cx + t.get("road_half_width") + t.get("edge_falloff") + 8.0
 		var hy_side: float = t.call("height_at", side_x, float(g.center_z))
 		if hy_side < lvl - 20.0:
 			print("[gap] FAIL: void carved off-road (side h=%.1f)" % hy_side); fails += 1

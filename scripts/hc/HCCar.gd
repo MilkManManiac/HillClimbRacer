@@ -66,6 +66,8 @@ var _rocket_flames: Array[GPUParticles3D] = []
 var boosting: bool = false
 var drifting: bool = false          # rear traction broken (hard turn / handbrake) -> tire smoke
 var _grip_break: float = 0.0        # 0 = full grip, 1 = fully sliding; ramps in fast, out slow
+const DRIFT_YAW_MAX := 3.1          # rad/s the nose swings at FULL lock while fully drifting
+const DRIFT_YAW_EXP := 1.9          # >1 = gentle at small steer, ramps up the harder you turn
 var wing_lift: float = 0.0          # lift from Wings upgrade (air time)
 var _tire_smoke: Array[GPUParticles3D] = []
 var _exhaust_smoke: Array[GPUParticles3D] = []
@@ -242,18 +244,20 @@ func _physics_process(delta: float) -> void:
 		# rear loose. While drifting, grip collapses so the car slides instead of
 		# re-aiming — you keep your momentum and skate sideways.
 		var hard: float = absf(_steer) * k
-		var handbrake: bool = braking > 0.3 and absf(_steer) > 0.2
-		var breaking_now: bool = hspeed > 7.0 and (hard > 0.55 or handbrake)
+		var handbrake: bool = braking > 0.3 and absf(_steer) > 0.1
+		# drift is INTENTIONAL: the handbrake breaks traction (at any steer, low speed OK);
+		# a bare hard flick only breaks it near full lock so fast cornering stays gripped.
+		var breaking_now: bool = hspeed > 4.0 and (handbrake or hard > 0.85)
 		# traction break ramps IN fast but recovers SLOWLY, so a drift keeps sliding and
 		# washes out naturally after you let off instead of snapping back to full grip.
 		if breaking_now:
-			_grip_break = move_toward(_grip_break, 1.0, delta * 9.0)   # ~0.11s to fully break
+			_grip_break = move_toward(_grip_break, 1.0, delta * 16.0)   # snaps loose quickly
 		else:
-			_grip_break = move_toward(_grip_break, 0.0, delta * 1.3)   # ~0.75s to regrip
+			_grip_break = move_toward(_grip_break, 0.0, delta * 1.3)    # ~0.75s to regrip
 		drifting = _grip_break > 0.3
 		var slide: float = clamp(hard, 0.0, 1.0)
 		var grip_normal: float = grip * (1.0 - slide_factor * slide)
-		var align_rate: float = lerpf(grip_normal, grip * 0.16, _grip_break)   # blend grip -> slidey
+		var align_rate: float = lerpf(grip_normal, grip * 0.24, _grip_break)   # blend grip -> slidey (grippy enough to hold)
 		if hspeed > 1.0 and fwd_h.length() > 0.1:
 			var dir := fwd_h.normalized()
 			if fwd_speed < 0.0:
@@ -264,11 +268,15 @@ func _physics_process(delta: float) -> void:
 			# reward holding a slide: a little style score for a proper drift
 			if drifting:
 				score += hspeed * delta * 1.5
-		# steering (bicycle model) — nose swings harder mid-drift so you can hold it
+		# steering. Grippy = bicycle model. Mid-drift the nose rotates PROGRESSIVELY with
+		# steer: slow/holdable at small angles, ramping up hard the more you turn — so you
+		# ease into a slide and can crank it tighter. Blended in by how broken traction is.
 		if absf(fwd_speed) > 0.4:
-			var ang: float = _steer * max_steer_angle * (1.0 - k * 0.4)
-			ang *= lerpf(1.0, 1.6, _grip_break)   # nose swings harder the deeper the slide
-			angular_velocity.y = (fwd_speed / wheelbase) * tan(ang)
+			var grip_ang: float = _steer * max_steer_angle * (1.0 - k * 0.4)
+			var grip_yaw: float = (fwd_speed / wheelbase) * tan(grip_ang)
+			var prog: float = signf(_steer) * pow(absf(_steer), DRIFT_YAW_EXP)   # progressive curve
+			var drift_yaw: float = prog * DRIFT_YAW_MAX * signf(fwd_speed)
+			angular_velocity.y = lerpf(grip_yaw, drift_yaw, _grip_break)
 	else:
 		_grip_break = move_toward(_grip_break, 0.0, delta * 4.0)
 		drifting = false   # no tire smoke in the air
@@ -359,11 +367,14 @@ func _physics_process(delta: float) -> void:
 			reset_physics_interpolation()
 
 	# --- fuel/health bookkeeping -------------------------------------------
-	# crash if you land/roll off the road (past the rails)
-	if _grounded and absf(global_position.x) > road_half + 1.5:
+	# crash if you land/roll off the road (past the rails) — road may curve & widen
+	if _grounded and _road_off() > _road_half_here() + 1.5:
 		health = 0.0
 	fuel = maxf(fuel, 0.0)
-	distance = maxf(distance, -global_position.z)
+	if terrain and terrain.has_method("progress"):
+		distance = maxf(distance, terrain.call("progress", global_position))   # arc-length on the track
+	else:
+		distance = maxf(distance, -global_position.z)
 	if health <= 0.0 or (fuel <= 0.0 and speed < 0.5 and _grounded):
 		dead = true
 
@@ -376,7 +387,7 @@ func _on_land(vel: Vector3) -> void:
 	if dmg > 1.0:
 		health -= dmg
 	# trick scoring: a clean landing confirms the combo (airtime + flips)
-	var off_road := absf(global_position.x) > road_half
+	var off_road := _road_off() > _road_half_here()
 	if _air_time > 0.45 and not off_road:
 		if uprightness > 0.45:
 			var flips := int(_flip_accum / 320.0)
@@ -397,6 +408,26 @@ func _on_land(vel: Vector3) -> void:
 	landed.emit(maxf(0.0, -vel.y), _air_time)   # drives camera shake / FOV punch
 	_air_time = 0.0
 	_flip_accum = 0.0
+
+## Road centre-line X at our forward position (0 if the terrain has no curves).
+func _road_cx() -> float:
+	if terrain and terrain.has_method("road_center_x"):
+		return terrain.call("road_center_x", global_position.z)
+	return 0.0
+
+## Lateral distance from the road centre (path-projected on the winding track).
+func _road_off() -> float:
+	if terrain and terrain.has_method("lateral_off"):
+		return terrain.call("lateral_off", global_position)
+	return absf(global_position.x - _road_cx())
+
+## Drivable half-width here (wider through curves); falls back to road_half.
+func _road_half_here() -> float:
+	if terrain and terrain.has_method("road_half_here"):
+		return terrain.call("road_half_here", global_position)
+	if terrain and terrain.has_method("road_half_at"):
+		return terrain.call("road_half_at", global_position.z)
+	return road_half
 
 func reset_run(start: Vector3) -> void:
 	dead = false
@@ -426,6 +457,8 @@ func get_speed_kmh() -> float: return linear_velocity.length() * 3.6
 func _check_gap() -> void:
 	if terrain == null or dead or _falling_out:
 		return
+	if not terrain.has_method("_gap_for_z"):
+		return   # winding-road track has no jumps yet (phase 1)
 	var z := global_position.z
 	var g: Dictionary = terrain.call("_gap_for_z", z)
 	if not g.is_empty():
@@ -433,7 +466,7 @@ func _check_gap() -> void:
 		var over_void: bool = z < g.lip_z and z > g.far_z
 		if over_void and not _grounded:
 			_gap_armed = true   # airborne over the void
-		elif _gap_armed and z <= g.far_z and global_position.y > lvl - 3.5 and absf(global_position.x) <= road_half:
+		elif _gap_armed and z <= g.far_z and global_position.y > lvl - 3.5 and _road_off() <= _road_half_here():
 			# crossed the far edge ABOVE the fail line = you made it — clear it now, even
 			# mid-air. (A big jump can overshoot the whole landing platform; requiring a
 			# grounded touch there left the gap "armed" and falsely wrecked you on the
