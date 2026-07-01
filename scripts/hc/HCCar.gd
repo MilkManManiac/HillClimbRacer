@@ -50,6 +50,8 @@ var terrain: Node3D   # set by HCMain; used to catch ground tunneling
 var _rays: Array[RayCast3D] = []
 var _wheel_meshes: Array[MeshInstance3D] = []
 var _wheel_positions: Array[Vector3] = []
+var _springs: Array[MeshInstance3D] = []   # visible coil-over per wheel (Suspension upgrade)
+var _spring_beef: float = 0.7              # coil thickness, grows with Suspension level
 var _wings: Array[Node3D] = []
 var _ailerons: Array[Node3D] = []
 var _rudder: Node3D
@@ -133,6 +135,7 @@ func _ready() -> void:
 	health = max_health
 	_build_collision()
 	_build_rays()
+	_build_springs()
 	_build_body()
 	_build_wings()
 	_build_engine()
@@ -441,8 +444,63 @@ func _update_wheel_visual(i: int, ray: RayCast3D) -> void:
 		d = clampf(d, 0.0, reach)
 		wy = base.y - d + wheel_radius        # wheel centre = contact + radius (bottom on ground)
 	else:
-		wy = base.y - suspension_rest         # hang at rest droop in the air
+		wy = base.y - reach + wheel_radius    # full droop in the air (springs stretch out)
 	wm.position = Vector3(base.x, wy, base.z)
+	# coil spring: spans a fixed chassis mount down to the wheel hub, so it visibly
+	# COMPRESSES on landings and STRETCHES when the wheel droops in the air.
+	if i < _springs.size():
+		var sp := _springs[i]
+		var mount_y: float = base.y + 0.35
+		var length: float = maxf(mount_y - wy, 0.05)
+		var rfac: float = clampf(wheel_radius / 0.5, 1.0, 2.2)
+		sp.position = Vector3(base.x, mount_y, base.z)
+		sp.scale = Vector3(_spring_beef * rfac, length, _spring_beef * rfac)
+
+## A helix tube (coil spring), unit height running from y=0 (top) down to y=-1, so
+## scaling its Y stretches/compresses the coils like a real spring.
+func _coil_mesh(coils: float, coil_r: float, wire_r: float, sides: int, seg: int) -> ArrayMesh:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var rings: Array = []
+	for i in range(seg + 1):
+		var t: float = float(i) / float(seg)
+		var ang: float = coils * TAU * t
+		var c := Vector3(coil_r * cos(ang), -t, coil_r * sin(ang))
+		var dang: float = coils * TAU
+		var tang := Vector3(-coil_r * sin(ang) * dang, -1.0, coil_r * cos(ang) * dang).normalized()
+		var nrm := tang.cross(Vector3.UP)
+		if nrm.length() < 0.001:
+			nrm = tang.cross(Vector3.RIGHT)
+		nrm = nrm.normalized()
+		var bin := tang.cross(nrm).normalized()
+		var ring: Array = []
+		for s in range(sides):
+			var sa: float = TAU * float(s) / float(sides)
+			ring.append(c + nrm * (cos(sa) * wire_r) + bin * (sin(sa) * wire_r))
+		rings.append(ring)
+	for i in range(seg):
+		for s in range(sides):
+			var s2: int = (s + 1) % sides
+			st.add_vertex(rings[i][s]); st.add_vertex(rings[i + 1][s]); st.add_vertex(rings[i][s2])
+			st.add_vertex(rings[i][s2]); st.add_vertex(rings[i + 1][s]); st.add_vertex(rings[i + 1][s2])
+	st.generate_normals()
+	return st.commit()
+
+func _build_springs() -> void:
+	var coil := _coil_mesh(4.5, 0.13, 0.03, 6, 96)
+	var mat := _metal(Color(0.95, 0.78, 0.2), 0.3)   # gold coil-over spring
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	for i in range(_wheel_positions.size()):
+		var mi := MeshInstance3D.new()
+		mi.mesh = coil
+		mi.material_override = mat
+		add_child(mi)
+		_springs.append(mi)
+
+## Suspension upgrade: coils get chunkier as you invest (always visible so you can
+## watch them work — thin at level 0, beefy at max).
+func apply_suspension(level: int) -> void:
+	_spring_beef = 0.55 + float(level) * 0.11
 
 ## Raise/spread the bolt-on upgrade parts (wings, rudder, rockets, engine, cage,
 ## cans, air-brake) so they sit on a bigger ride instead of clustering at hot-rod
@@ -1035,7 +1093,26 @@ func apply_engine(level: int) -> void:
 	var s: float = (0.55 + float(level) * 0.16) * _part_scale
 	_engine.scale = Vector3(s, s, s)
 
-# --- roll cage (Suspension upgrade) -----------------------------------------
+# --- roll cage (Durability upgrade) -----------------------------------------
+## A chrome ball weld-node to hide/strengthen a tube joint.
+func _weld_node(parent: Node3D, pos: Vector3, r: float) -> void:
+	var mi := MeshInstance3D.new()
+	var sm := SphereMesh.new()
+	sm.radius = r
+	sm.height = r * 2.0
+	mi.mesh = sm
+	mi.material_override = _chrome(0.18)
+	mi.position = pos
+	parent.add_child(mi)
+
+## Matte foam material (roll-cage padding).
+func _foam(col: Color) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = col
+	m.roughness = 0.98
+	m.metallic = 0.0
+	return m
+
 func _tube(parent: Node3D, a: Vector3, b: Vector3, r: float, mat: Material) -> void:
 	var mi := MeshInstance3D.new()
 	var cm := CylinderMesh.new()
@@ -1059,7 +1136,7 @@ func _build_cage() -> void:
 		var t := Node3D.new()
 		_cage.add_child(t)
 		_cage_tiers.append(t)
-	var mat := _metal(Color(0.13, 0.13, 0.15))
+	var mat := _metal(Color(0.56, 0.58, 0.64), 0.32)   # bare chromoly steel tube (bright, not black)
 	var hx := 1.32
 	var zf := -1.75
 	var zr := 1.75
@@ -1076,6 +1153,13 @@ func _build_cage() -> void:
 	_tube(_cage_tiers[0], top[1], top[3], 0.06, mat)
 	_tube(_cage_tiers[0], bot[0], bot[2], 0.06, mat)
 	_tube(_cage_tiers[0], bot[1], bot[3], 0.06, mat)
+	# chrome weld nodes at every corner so the joints read welded, not floating
+	for p in (bot + top):
+		_weld_node(_cage_tiers[0], p, 0.085)
+	# bright foam padding on the front uprights (the bars beside the driver's head)
+	var pad := _foam(Color(0.92, 0.16, 0.1))
+	_tube(_cage_tiers[0], Vector3(-hx, 1.15, zf), Vector3(-hx, 1.95, zf), 0.1, pad)
+	_tube(_cage_tiers[0], Vector3(hx, 1.15, zf), Vector3(hx, 1.95, zf), 0.1, pad)
 	# tier 1 (Lv2): side diagonal braces
 	_tube(_cage_tiers[1], bot[0], top[2], 0.05, mat)
 	_tube(_cage_tiers[1], bot[1], top[3], 0.05, mat)

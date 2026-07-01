@@ -24,15 +24,16 @@ var _score_lbl: Label
 var _trick_lbl: Label
 
 # --- economy / upgrades ------------------------------------------------------
-const UP_KEYS := ["engine", "fuel", "fueleff", "cashmult", "suspension", "wheels", "wings", "ailerons", "dive", "rockets", "stretch", "wide"]
-const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "fueleff": "Fuel Economy", "cashmult": "Sponsor Decals", "suspension": "Suspension", "wheels": "Bigger Wheels", "wings": "Wings", "ailerons": "Ailerons", "dive": "Dive Power", "rockets": "Rockets", "stretch": "Stretch (Limo)", "wide": "Wide Stance"}
+const UP_KEYS := ["engine", "fuel", "fueleff", "cashmult", "suspension", "durability", "wheels", "wings", "ailerons", "dive", "rockets", "stretch", "wide"]
+const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "fueleff": "Fuel Economy", "cashmult": "Sponsor Decals", "suspension": "Suspension", "durability": "Durability", "wheels": "Bigger Wheels", "wings": "Wings", "ailerons": "Ailerons", "dive": "Dive Power", "rockets": "Rockets", "stretch": "Stretch (Limo)", "wide": "Wide Stance"}
 const UP_DESC := {
 	"engine": "More power & higher top speed",
 	"fuel": "Bigger tank — more total fuel",
 	"fueleff": "Burns fuel slower (better mileage)",
 	"cashmult": "Earn more cash per metre (+25%/lvl)",
-	"suspension": "Roll cage, armor (+HP), softer landings",
-	"wheels": "Taller wheels, more ground clearance",
+	"suspension": "Coil springs — softer, safer landings (visible!)",
+	"durability": "Roll cage + armor — more health (HP)",
+	"wheels": "Taller & wider wheels, more clearance",
 	"wings": "Lift = more air time off jumps",
 	"ailerons": "Air control + auto-centering (needs Wings)",
 	"dive": "Hold Space to dive + an air-brake flap",
@@ -40,7 +41,7 @@ const UP_DESC := {
 	"stretch": "Limo: longer wheelbase, lazier turns",
 	"wide": "Wider stance, harder to roll over",
 }
-const UP_BASECOST := {"engine": 320, "fuel": 260, "fueleff": 240, "cashmult": 400, "suspension": 340, "wheels": 280, "wings": 380, "ailerons": 340, "dive": 300, "rockets": 420, "stretch": 360, "wide": 320}
+const UP_BASECOST := {"engine": 320, "fuel": 260, "fueleff": 240, "cashmult": 400, "suspension": 300, "durability": 300, "wheels": 280, "wings": 380, "ailerons": 340, "dive": 300, "rockets": 420, "stretch": 360, "wide": 320}
 const UP_COSTMULT := 1.9   # each level costs 1.9x the last — costs ramp hard
 const UP_MAX := 6
 const MONEY_PER_M := 1.0    # money earned = metres travelled down the track
@@ -346,8 +347,10 @@ func _apply_upgrades() -> void:
 	_car.set("grip", float(v.grip))
 	_car.set("gravity_force", float(v.gravity))
 	_car.set("max_steer_angle", float(v.steer))
-	# hard landings hurt sooner unless you buy Suspension/Wheels
+	# Suspension softens landings (higher free-impact threshold) + shows the springs
 	_car.set("land_damage_speed", float(v.land_base) + _levels.suspension * 5.0 + _levels.wheels * 2.0)
+	if _car.has_method("apply_suspension"):
+		_car.call("apply_suspension", _levels.suspension)
 	# Bigger Wheels: more ride height + larger wheels (clearance over bumps).
 	# Per-ride growth — the monster's wheels balloon dramatically.
 	_car.set("suspension_rest", float(v.susp_rest) + _levels.wheels * float(v.susp_per))
@@ -360,10 +363,10 @@ func _apply_upgrades() -> void:
 	if _car.has_method("apply_ailerons"):
 		_car.call("apply_ailerons", _levels.ailerons)
 	_car.set("dive_force", 30.0 + _levels.dive * 16.0)     # heavier dive to time ramps
-	# Suspension also = roll cage + more health (frame/armor)
-	_car.set("max_health", float(v.health_base) + _levels.suspension * 18.0)
+	# Durability = roll cage + armor (more health / frame)
+	_car.set("max_health", float(v.health_base) + _levels.durability * 18.0)
 	if _car.has_method("apply_cage"):
-		_car.call("apply_cage", _levels.suspension)
+		_car.call("apply_cage", _levels.durability)
 	if _car.has_method("apply_cans"):
 		_car.call("apply_cans", _levels.fuel)
 	if _car.has_method("apply_airbrake"):
@@ -414,6 +417,7 @@ func _build_shop() -> void:
 	scroll.custom_minimum_size = Vector2(504, 360)
 	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	scroll.follow_focus = true   # gamepad: scroll to keep the focused row on screen
 	box.add_child(scroll)
 	var list := VBoxContainer.new()
 	list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -493,6 +497,32 @@ func _build_shop() -> void:
 	_reset_btn.add_theme_color_override("font_color", Color(1.0, 0.62, 0.55))
 	_reset_btn.pressed.connect(_on_reset_pressed)
 	box.add_child(_reset_btn)
+
+	_wire_focus_chain()
+
+## Chain every shop button top-to-bottom (vehicles -> upgrades -> retry -> new game,
+## wrapping) so a gamepad d-pad walks the WHOLE list. Without this, the default
+## focus solver jumps straight from an upgrade row to the Retry button because the
+## next rows are clipped by the scroll. (Disabled buttons stay focusable so you can
+## still read every upgrade; they just can't be pressed.)
+func _wire_focus_chain() -> void:
+	var chain: Array[Control] = []
+	for vk in VEH_KEYS:
+		chain.append(_veh_rows[vk].buy)
+	for key in UP_KEYS:
+		chain.append(_shop_rows[key].buy)
+	chain.append(_restart_btn)
+	chain.append(_reset_btn)
+	var n := chain.size()
+	for i in range(n):
+		var cur: Control = chain[i]
+		var nxt: Control = chain[(i + 1) % n]
+		var prv: Control = chain[(i - 1 + n) % n]
+		cur.focus_mode = Control.FOCUS_ALL
+		cur.focus_neighbor_bottom = cur.get_path_to(nxt)
+		cur.focus_neighbor_top = cur.get_path_to(prv)
+		cur.focus_next = cur.get_path_to(nxt)
+		cur.focus_previous = cur.get_path_to(prv)
 
 func _shop_label(parent: Node, text: String, size: int, col: Color) -> Label:
 	var l := Label.new()
