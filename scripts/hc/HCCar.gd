@@ -360,7 +360,7 @@ func _physics_process(delta: float) -> void:
 
 	# --- fuel/health bookkeeping -------------------------------------------
 	# crash if you land/roll off the road (past the rails)
-	if _grounded and _road_off() > road_half + 1.5:
+	if _grounded and absf(global_position.x) > road_half + 1.5:
 		health = 0.0
 	fuel = maxf(fuel, 0.0)
 	distance = maxf(distance, -global_position.z)
@@ -376,7 +376,7 @@ func _on_land(vel: Vector3) -> void:
 	if dmg > 1.0:
 		health -= dmg
 	# trick scoring: a clean landing confirms the combo (airtime + flips)
-	var off_road := _road_off() > road_half
+	var off_road := absf(global_position.x) > road_half
 	if _air_time > 0.45 and not off_road:
 		if uprightness > 0.45:
 			var flips := int(_flip_accum / 320.0)
@@ -397,13 +397,6 @@ func _on_land(vel: Vector3) -> void:
 	landed.emit(maxf(0.0, -vel.y), _air_time)   # drives camera shake / FOV punch
 	_air_time = 0.0
 	_flip_accum = 0.0
-
-## Lateral distance from the (possibly curving) road centre-line at our z.
-func _road_off() -> float:
-	var cx := 0.0
-	if terrain and terrain.has_method("road_center_x"):
-		cx = terrain.call("road_center_x", global_position.z)
-	return absf(global_position.x - cx)
 
 func reset_run(start: Vector3) -> void:
 	dead = false
@@ -440,7 +433,7 @@ func _check_gap() -> void:
 		var over_void: bool = z < g.lip_z and z > g.far_z
 		if over_void and not _grounded:
 			_gap_armed = true   # airborne over the void
-		elif _gap_armed and z <= g.far_z and global_position.y > lvl - 3.5 and _road_off() <= road_half:
+		elif _gap_armed and z <= g.far_z and global_position.y > lvl - 3.5 and absf(global_position.x) <= road_half:
 			# crossed the far edge ABOVE the fail line = you made it — clear it now, even
 			# mid-air. (A big jump can overshoot the whole landing platform; requiring a
 			# grounded touch there left the gap "armed" and falsely wrecked you on the

@@ -36,19 +36,6 @@ const ARC_PEAK := 7.0             # arc apex height above the table level
 @export var side_amp: float = 0.10           # leftover hilliness on the flat sides
 @export var rail_height: float = 1.6
 
-# --- road curves (meandering centre-line so you can drift the bends) ----------
-@export var curve_start: float = 150.0       # straight for this far, then curves ramp in
-@export var curve_amp: float = 26.0          # lateral swing of the road centre (metres)
-@export var curve_freq: float = 0.010        # base curve frequency (lower = longer sweepers)
-
-## Lateral offset of the road centre-line at distance z (deterministic). 0 = straight.
-## Everything that measures "distance from the road" uses absf(x - road_center_x(z)).
-func road_center_x(z: float) -> float:
-	var d: float = maxf(0.0, -z)
-	var ramp: float = smoothstep(curve_start, curve_start + 140.0, d)   # ease bends in
-	var c: float = sin(d * curve_freq) + 0.5 * sin(d * curve_freq * 2.3 + 1.7)
-	return c * curve_amp * ramp
-
 # --- gap / checkpoint schedule (jump the hole or fall in) --------------------
 @export var gap_start_dist: float = 360.0    # pure hills before this; first gap here
 @export var gap_spacing: float = 340.0       # distance to the SECOND gap (base spacing)
@@ -107,7 +94,7 @@ func _terrain_height(x: float, z: float, noise: FastNoiseLite = null) -> float:
 	var d: float = maxf(0.0, -z)
 	var amp: float = lerpf(base_amp, max_amp, clamp(d / ramp_dist, 0.0, 1.0))
 	var prof: float = noise.get_noise_1d(z)
-	var edge: float = smoothstep(road_half_width, road_half_width + edge_falloff, absf(x - road_center_x(z)))
+	var edge: float = smoothstep(road_half_width, road_half_width + edge_falloff, absf(x))
 	var amp_here: float = lerpf(amp, amp * side_amp, edge)
 	return prof * amp_here
 
@@ -144,7 +131,7 @@ func _gap_for_z(z: float, noise: FastNoiseLite = null) -> Dictionary:
 	# one shared "table" height for the whole gap so takeoff and landing match
 	# (no impossible taller-on-one-side peak). Sampled from the natural hills at
 	# the approach so it blends in smoothly.
-	var level: float = _terrain_height(road_center_x(ramp0), ramp0, noise)
+	var level: float = _terrain_height(0.0, ramp0, noise)
 	return {
 		"idx": idx,
 		"void_w": void_w,
@@ -163,7 +150,7 @@ func height_at(x: float, z: float, noise: FastNoiseLite = null) -> float:
 	var g := _gap_for_z(z, noise)
 	if g.is_empty():
 		return base
-	var on_road: float = 1.0 - smoothstep(road_half_width, road_half_width + edge_falloff, absf(x - road_center_x(z)))
+	var on_road: float = 1.0 - smoothstep(road_half_width, road_half_width + edge_falloff, absf(x))
 	if on_road < 0.01:
 		return base
 	var gy: float = base
@@ -395,7 +382,7 @@ func _gen_props(ox: float, oz: float, noise: FastNoiseLite) -> Array:
 				continue
 			# lateral distance out from the verge, jittered by a second sample
 			var jx: float = noise.get_noise_2d(z * 7.0, side * 91.0) * 0.5 + 0.5
-			var x: float = road_center_x(z) + side * (road_half_width + PROP_MARGIN + jx * PROP_SPREAD)
+			var x: float = side * (road_half_width + PROP_MARGIN + jx * PROP_SPREAD)
 			# only emit props whose x lands in THIS chunk's lateral span, so the
 			# several lateral chunks streamed each frame don't all spawn duplicates.
 			if x < ox or x >= ox + CHUNK:
@@ -576,7 +563,7 @@ func _biome(z: float) -> Array:
 	return [(a[0] as Color).lerp(b[0], f), (a[1] as Color).lerp(b[1], f)]
 
 func _color_for(x: float, _y: float, z: float, noise: FastNoiseLite = null) -> Color:
-	var ax := absf(x - road_center_x(z))   # distance from the (possibly curving) road centre
+	var ax := absf(x)
 	var pal := _biome(z)
 	var grass: Color = pal[0]
 	var asphalt: Color = pal[1]
@@ -677,12 +664,11 @@ func _build_rail(xpos: float, z0: float, z1: float) -> Node3D:
 			rings = 0
 			z += step
 			continue
-		var rx := road_center_x(z) + xpos   # rail follows the curving road edge
-		var ey := height_at(rx, z)
+		var ey := height_at(xpos, z)
 		st.set_color(Color(0.75, 0.75, 0.8))
-		st.add_vertex(Vector3(rx, ey - 0.3, z))
+		st.add_vertex(Vector3(xpos, ey - 0.3, z))
 		st.set_color(Color(0.9, 0.3, 0.25))
-		st.add_vertex(Vector3(rx, ey + rail_height, z))
+		st.add_vertex(Vector3(xpos, ey + rail_height, z))
 		vbase += 2
 		if rings >= 1:
 			var a := seg_start + (rings - 1) * 2
