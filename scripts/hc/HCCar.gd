@@ -65,9 +65,22 @@ var _rockets: Array[Node3D] = []
 var _rocket_flames: Array[GPUParticles3D] = []
 var boosting: bool = false
 var drifting: bool = false          # rear traction broken (hard turn / handbrake) -> tire smoke
+var _grip_break: float = 0.0        # 0 = full grip, 1 = fully sliding; ramps in fast, out slow
 var wing_lift: float = 0.0          # lift from Wings upgrade (air time)
 var _tire_smoke: Array[GPUParticles3D] = []
 var _exhaust_smoke: Array[GPUParticles3D] = []
+var _damage_smoke: GPUParticles3D          # engine smoke when HP is low
+var _backfire: Array[GPUParticles3D] = []  # flame pops on throttle lift
+var _prev_drive: float = 0.0
+var _backfire_cd: float = 0.0
+# skid marks: a world-space pool of dark quads laid under the rear wheels while drifting
+const SKID_POOL := 120
+const SKID_LIFE := 2.8
+var _skid_marks: Array[MeshInstance3D] = []
+var _skid_life: Array[float] = []
+var _skid_idx: int = 0
+var _skid_last: Array[Vector3] = [Vector3.ZERO, Vector3.ZERO]
+var _skid_root: Node3D
 var _grounded: bool = false
 var _steer: float = 0.0
 var _air_time: float = 0.0
@@ -148,6 +161,7 @@ func _ready() -> void:
 	_build_dust()
 	_build_rockets()
 	_build_smoke()
+	_build_skids()
 	_fit_parts()   # raise/scale the bolt-on upgrade parts to fit this vehicle
 	# sidecar removed for now (functions kept dormant; not built/applied)
 
@@ -229,11 +243,17 @@ func _physics_process(delta: float) -> void:
 		# re-aiming — you keep your momentum and skate sideways.
 		var hard: float = absf(_steer) * k
 		var handbrake: bool = braking > 0.3 and absf(_steer) > 0.2
-		drifting = hspeed > 7.0 and (hard > 0.55 or handbrake)
+		var breaking_now: bool = hspeed > 7.0 and (hard > 0.55 or handbrake)
+		# traction break ramps IN fast but recovers SLOWLY, so a drift keeps sliding and
+		# washes out naturally after you let off instead of snapping back to full grip.
+		if breaking_now:
+			_grip_break = move_toward(_grip_break, 1.0, delta * 9.0)   # ~0.11s to fully break
+		else:
+			_grip_break = move_toward(_grip_break, 0.0, delta * 1.3)   # ~0.75s to regrip
+		drifting = _grip_break > 0.3
 		var slide: float = clamp(hard, 0.0, 1.0)
-		var align_rate: float = grip * (1.0 - slide_factor * slide)
-		if drifting:
-			align_rate = minf(align_rate, grip * 0.16)   # traction broken — really slide
+		var grip_normal: float = grip * (1.0 - slide_factor * slide)
+		var align_rate: float = lerpf(grip_normal, grip * 0.16, _grip_break)   # blend grip -> slidey
 		if hspeed > 1.0 and fwd_h.length() > 0.1:
 			var dir := fwd_h.normalized()
 			if fwd_speed < 0.0:
@@ -247,10 +267,10 @@ func _physics_process(delta: float) -> void:
 		# steering (bicycle model) — nose swings harder mid-drift so you can hold it
 		if absf(fwd_speed) > 0.4:
 			var ang: float = _steer * max_steer_angle * (1.0 - k * 0.4)
-			if drifting:
-				ang *= 1.6
+			ang *= lerpf(1.0, 1.6, _grip_break)   # nose swings harder the deeper the slide
 			angular_velocity.y = (fwd_speed / wheelbase) * tan(ang)
 	else:
+		_grip_break = move_toward(_grip_break, 0.0, delta * 4.0)
 		drifting = false   # no tire smoke in the air
 		# --- airborne: full manual 3-axis (no assist) ----------------------
 		var pitch := pitch_in                      # W/left-stick nose down, S nose up
@@ -296,6 +316,18 @@ func _physics_process(delta: float) -> void:
 	var puffing: bool = (drive > 0.05 and fuel > 0.0) or boosting
 	for es in _exhaust_smoke:
 		es.emitting = puffing
+	# damage smoke once the frame's beat up
+	if _damage_smoke:
+		_damage_smoke.emitting = health < max_health * 0.5
+	# backfire pop when you snap OFF the throttle at speed
+	_backfire_cd = maxf(_backfire_cd - delta, 0.0)
+	if _prev_drive > 0.55 and drive < 0.15 and speed > 8.0 and _grounded and _backfire_cd <= 0.0:
+		for bf in _backfire:
+			bf.restart()
+		_backfire_cd = 0.5
+	_prev_drive = drive
+	# skid marks under the rear wheels while drifting
+	_update_skids(delta)
 
 	# --- air-time + flip tracking (for later trick scoring) ----------------
 	if airborne:
@@ -1355,6 +1387,119 @@ func _build_smoke() -> void:
 			e.position = Vector3(sx, 0.42, 2.15)
 			add_child(e)
 			_exhaust_smoke.append(e)
+	# engine damage smoke (dark, from the hood) — shown while health is low
+	var mono := vehicle_type == "monster"
+	_damage_smoke = _make_smoke(Color(0.09, 0.09, 0.1, 0.85), 0.35, 1.1, 1.0, 2.6, Vector3(0, 1, 0.2), 22, 0.95, 1.4)
+	_damage_smoke.position = Vector3(0, (1.6 if mono else 1.0), (-1.6 if mono else -1.0))
+	add_child(_damage_smoke)
+	# backfire flame pops at the exhaust
+	var bx: Array = [-1.16, 1.16] if mono else [-0.45, 0.45]
+	for sx in bx:
+		var bf := _make_backfire()
+		if mono:
+			(bf.process_material as ParticleProcessMaterial).direction = Vector3(0, 1, 0.2)
+		bf.position = Vector3(sx, (3.9 if mono else 0.42), (0.3 if mono else 2.2))
+		add_child(bf)
+		_backfire.append(bf)
+
+## A one-shot orange flame burst (exhaust backfire).
+func _make_backfire() -> GPUParticles3D:
+	var g := GPUParticles3D.new()
+	g.amount = 12
+	g.lifetime = 0.22
+	g.one_shot = true
+	g.explosiveness = 0.95
+	g.emitting = false
+	g.local_coords = false
+	var pm := ParticleProcessMaterial.new()
+	pm.direction = Vector3(0, 0.35, 1)   # out the back
+	pm.spread = 28.0
+	pm.initial_velocity_min = 4.0
+	pm.initial_velocity_max = 9.0
+	pm.gravity = Vector3.ZERO
+	pm.scale_min = 0.3
+	pm.scale_max = 0.75
+	var grad := Gradient.new()
+	grad.set_color(0, Color(1.0, 0.92, 0.55, 1.0))
+	grad.set_color(1, Color(1.0, 0.3, 0.05, 0.0))
+	var gt := GradientTexture1D.new(); gt.gradient = grad
+	pm.color_ramp = gt
+	g.process_material = pm
+	var qm := QuadMesh.new(); qm.size = Vector2(0.5, 0.5)
+	var m := StandardMaterial3D.new()
+	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	m.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	m.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.vertex_color_use_as_albedo = true
+	m.albedo_color = Color(1, 1, 1)
+	qm.material = m
+	g.draw_pass_1 = qm
+	return g
+
+# --- skid marks --------------------------------------------------------------
+func _build_skids() -> void:
+	_skid_root = Node3D.new()
+	_skid_root.name = "HCSkidRoot"
+	for _i in range(SKID_POOL):
+		var mi := MeshInstance3D.new()
+		var qm := QuadMesh.new()
+		qm.size = Vector2(0.55, 0.95)
+		mi.mesh = qm
+		var m := StandardMaterial3D.new()
+		m.albedo_color = Color(0.05, 0.05, 0.06, 0.0)
+		m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		mi.material_override = m
+		mi.visible = false
+		_skid_root.add_child(mi)
+		_skid_marks.append(mi)
+		_skid_life.append(0.0)
+	# park the pool in WORLD space (under the scene, not the car) so the marks stay
+	# on the ground as we drive on. Clear any leftover root from a previous car.
+	var host: Node = get_parent()
+	if host:
+		var ex: Node = host.get_node_or_null("HCSkidRoot")
+		if ex:
+			ex.queue_free()
+		host.add_child.call_deferred(_skid_root)
+
+## Lay one flat skid quad at a ground point, long axis along the travel heading.
+func _stamp_skid(pos: Vector3, heading: Vector3) -> void:
+	var mi := _skid_marks[_skid_idx]
+	_skid_life[_skid_idx] = SKID_LIFE
+	_skid_idx = (_skid_idx + 1) % SKID_POOL
+	var fwd := Vector3(heading.x, 0.0, heading.z)
+	if fwd.length() < 0.1:
+		fwd = Vector3.FORWARD
+	fwd = fwd.normalized()
+	var right := fwd.cross(Vector3.UP).normalized()
+	mi.visible = true
+	mi.global_transform = Transform3D(Basis(right, fwd, Vector3.UP), pos + Vector3(0, 0.04, 0))
+
+func _update_skids(delta: float) -> void:
+	for i in range(_skid_marks.size()):
+		if _skid_life[i] > 0.0:
+			_skid_life[i] -= delta
+			var mi := _skid_marks[i]
+			if _skid_life[i] <= 0.0:
+				mi.visible = false
+			else:
+				(mi.material_override as StandardMaterial3D).albedo_color.a = clampf(_skid_life[i] / SKID_LIFE, 0.0, 1.0) * 0.72
+	if not (drifting and _grounded):
+		return
+	for jj in range(2):
+		var wj: int = jj + 2   # rear wheels are indices 2, 3
+		if wj >= _rays.size():
+			continue
+		var ray := _rays[wj]
+		if not ray.is_colliding():
+			continue
+		var cp := ray.get_collision_point()
+		if _skid_last[jj] != Vector3.ZERO and cp.distance_to(_skid_last[jj]) < 0.4:
+			continue
+		_skid_last[jj] = cp
+		_stamp_skid(cp, linear_velocity)
 
 # --- rocket boosters (Rockets upgrade) --------------------------------------
 ## Twin nozzles on the tail (+Z, the rear) with a glowing throat and a flame jet.

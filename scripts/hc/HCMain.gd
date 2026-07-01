@@ -96,6 +96,20 @@ var _restart_btn: Button
 var _reset_armed := false   # fresh-start needs a confirm click so it's not a mis-tap
 var _first_veh_btn: Button   # focus target when the garage opens (gamepad nav)
 
+# --- feel juice: camera bank into drifts + high-speed speed-lines -------------
+const CAM_ROLL_MAX_DEG := 5.0          # max camera bank while drifting (degrees)
+const SPEED_REF := 53.0                # reference top speed (m/s)
+const SPEED_FX_ON := 0.55              # speed-lines begin at this fraction of ref
+const SPEED_FX_MAX := 0.98             # speed-lines reach full at this fraction of ref
+const SPEED_LINE_COUNT := 32           # number of radial streaks
+var _cam_roll := 0.0                   # smoothed camera bank angle (degrees)
+var _cam_look_basis := Basis.IDENTITY  # roll-free smoothing accumulator (see _update_camera)
+var _cam_look_ready := false           # false until _cam_look_basis is seeded
+var _speed_fx := 0.0                   # smoothed speed-lines intensity 0..1
+var _speed_lines: Control              # full-screen streak overlay (mouse-ignored)
+var _speed_line_nodes: Array[Line2D] = []
+var _speed_lines_size := Vector2.ZERO  # viewport size the streaks were laid out for
+
 func _ready() -> void:
 	_setup_input()
 	_init_levels()
@@ -103,6 +117,7 @@ func _ready() -> void:
 	_setup_terrain_and_car()
 	_setup_camera()
 	_setup_hud()
+	_setup_speed_lines()
 	_build_shop()
 	_apply_upgrades()
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
@@ -206,6 +221,7 @@ func _process(delta: float) -> void:
 		return
 	_update_camera(delta)
 	_update_hud()
+	_update_feel(delta)
 	# on death, bank money earned from how far down the track you got, open the shop
 	var d: bool = _car.get("dead")
 	if d and not _was_dead:
@@ -224,6 +240,18 @@ func _update_camera(delta: float) -> void:
 	var vh := Vector3(vel.x, 0, vel.z)
 	if vh.length() > 2.0:
 		_cam_heading = _cam_heading.lerp(vh.normalized(), 1.0 - exp(-3.0 * delta))
+	# feature 1: bank the camera toward the slide while drifting. Sign comes from
+	# the car's lateral velocity (horizontal vel dotted onto the car's right axis);
+	# smoothed so it eases in/out and can't snap. Applied to the view basis below.
+	var roll_target := 0.0
+	if not bool(_car.get("dead")) and bool(_car.get("drifting")):
+		var cr := _car.global_transform.basis.x   # car's right vector (world)
+		cr.y = 0.0
+		if cr.length() > 0.001 and vh.length() > 1.0:
+			var lat: float = vh.dot(cr.normalized())   # + = sliding to car's right
+			if is_finite(lat):
+				roll_target = clampf(lat / 12.0, -1.0, 1.0) * CAM_ROLL_MAX_DEG
+	_cam_roll = lerpf(_cam_roll, roll_target, 1.0 - exp(-6.0 * delta))
 	var target := _car.global_position
 	var want := target - _cam_heading * 12.0 + Vector3(0, 6.0, 0)
 	# don't let terrain block the view of the car: raycast from the car toward the camera
@@ -252,7 +280,16 @@ func _update_camera(delta: float) -> void:
 		if absf(dir.normalized().dot(Vector3.UP)) > 0.985:
 			up_ref = _cam_heading if _cam_heading.length() > 0.1 else Vector3.FORWARD
 		var t := _cam.global_transform.looking_at(look, up_ref)
-		_cam.global_transform.basis = _cam.global_transform.basis.slerp(t.basis, 1.0 - exp(-8.0 * delta))
+		# smooth the roll-FREE look basis in its own accumulator so the drift bank
+		# (applied below) never feeds back into next frame's slerp and accumulates.
+		if not _cam_look_ready:
+			_cam_look_basis = t.basis
+			_cam_look_ready = true
+		_cam_look_basis = _cam_look_basis.slerp(t.basis, 1.0 - exp(-8.0 * delta))
+		# feature 1: roll the final view about its forward axis by the smoothed bank,
+		# rebuilt from the un-rolled basis each frame (no drift over time).
+		var fwd: Vector3 = (-_cam_look_basis.z).normalized()
+		_cam.global_transform.basis = _cam_look_basis.rotated(fwd, deg_to_rad(_cam_roll))
 	# FOV widens with speed (and harder while boosting) for a sense of pace
 	var spd: float = _car.linear_velocity.length()
 	var boosting: bool = bool(_car.get("boosting"))
@@ -275,6 +312,9 @@ func _restart() -> void:
 	_shake = 0.0
 	_shake_off = Vector3.ZERO
 	_fov_punch = 0.0
+	_cam_roll = 0.0
+	_cam_look_ready = false   # reseed the look basis at the new spawn orientation
+	_speed_fx = 0.0
 	_was_dead = false
 	if _shop:
 		_shop.visible = false
@@ -290,6 +330,75 @@ func _on_car_landed(impact: float, _air_time: float) -> void:
 ## shows the end screen. Just add a jolt here for feel.
 func _on_car_gap_failed(_can_respawn: bool) -> void:
 	_shake = maxf(_shake, 0.5)
+
+# --- feel: speed-lines overlay ----------------------------------------------
+
+## Build a full-screen overlay of thin radial streaks (anime-style speed lines),
+## drawn procedurally with Line2Ds (no texture assets). Alpha is driven per-frame
+## in _update_feel by a smoothed speed factor. Its own CanvasLayer sits UNDER the
+## HUD (layer 1) and shop (layer 10) so it never obscures readouts, and it ignores
+## the mouse so it can't eat clicks in the shop.
+func _setup_speed_lines() -> void:
+	var layer := CanvasLayer.new()
+	layer.layer = 0
+	add_child(layer)
+	_speed_lines = Control.new()
+	_speed_lines.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_speed_lines.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_speed_lines.modulate = Color(1, 1, 1, 0)   # start invisible; ramps with speed
+	layer.add_child(_speed_lines)
+	for i in range(SPEED_LINE_COUNT):
+		var ln := Line2D.new()
+		ln.width = randf_range(1.5, 3.5)
+		ln.default_color = Color(1, 1, 1, randf_range(0.3, 0.55))
+		ln.begin_cap_mode = Line2D.LINE_CAP_ROUND
+		ln.end_cap_mode = Line2D.LINE_CAP_ROUND
+		_speed_lines.add_child(ln)
+		_speed_line_nodes.append(ln)
+	_layout_speed_lines(get_viewport().get_visible_rect().size)
+
+## Position the streaks radially around screen center, from just outside a central
+## "safe" radius out toward the edges. Recomputed whenever the viewport resizes.
+## Safe on a zero-size viewport (frame 0): bails until a real size arrives.
+func _layout_speed_lines(vp: Vector2) -> void:
+	if vp.x < 1.0 or vp.y < 1.0:
+		return
+	_speed_lines_size = vp
+	var center := vp * 0.5
+	var span := vp.length()
+	var safe := span * 0.18          # inner radius kept clear of streaks
+	var reach := span * 0.72
+	var n := _speed_line_nodes.size()
+	if n <= 0:
+		return
+	for i in range(n):
+		var ln := _speed_line_nodes[i]
+		var ang := TAU * float(i) / float(n) + randf_range(-0.06, 0.06)
+		var dir := Vector2(cos(ang), sin(ang))
+		var r0 := safe + randf_range(0.0, safe * 0.4)
+		var r1 := r0 + reach * randf_range(0.5, 1.0)
+		ln.clear_points()
+		ln.add_point(center + dir * r0)
+		ln.add_point(center + dir * r1)
+
+## Per-frame feel update: ramp the speed-lines alpha with a smoothed speed factor,
+## hidden while dead or the shop is open. (Camera bank is handled in _update_camera.)
+func _update_feel(delta: float) -> void:
+	if _speed_lines == null:
+		return
+	# relayout on first valid frame or after a viewport resize
+	var vp := get_viewport().get_visible_rect().size
+	if vp.x >= 1.0 and vp.y >= 1.0 and vp.distance_to(_speed_lines_size) > 1.0:
+		_layout_speed_lines(vp)
+	var hidden: bool = _car == null or bool(_car.get("dead")) or (_shop != null and _shop.visible)
+	var target := 0.0
+	if not hidden:
+		var spd: float = _car.linear_velocity.length()
+		if is_finite(spd):
+			var f := (spd / SPEED_REF - SPEED_FX_ON) / maxf(SPEED_FX_MAX - SPEED_FX_ON, 0.01)
+			target = clampf(f, 0.0, 1.0)
+	_speed_fx = lerpf(_speed_fx, target, 1.0 - exp(-4.0 * delta))
+	_speed_lines.modulate.a = _speed_fx * 0.7   # peak ~0.35 alpha per streak
 
 ## Sponsor Decals upgrade: scales all cash earned (distance payout + coins).
 func _cash_mult() -> float:
