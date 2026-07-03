@@ -17,6 +17,62 @@ var _cam: Camera3D
 var _cam_heading := Vector3(0, 0, -1)
 var _start := Vector3(0, 6, 0)
 
+# --- maps ----------------------------------------------------------------
+# Each map is a HCTrack export override set applied via `_terrain.set(k, v)` BEFORE
+# add_child (generation happens in _ready on add_child, so this is the only window).
+# "mode" picks the run variant: "classic" = today's game, "sprint" = race-the-clock
+# (see SPRINT_* below). Selected map persists across restarts/deaths in the session.
+const MAPS := {
+	"hills": {
+		"name": "Rolling Hills", "desc": "The classic ride — gentle sweepers, occasional jumps.",
+		"mode": "classic", "sky_time": 0.37, "overrides": {},
+	},
+	"canyon": {
+		"name": "Sunset Canyon", "desc": "All-drifting speedrun through red sandstone — no jumps, beat the clock.",
+		"mode": "sprint", "sky_time": 0.31,
+		"overrides": {
+			"straight_bias": 0.22, "max_turn_deg": 150.0, "turn_radius_min": 26.0, "turn_radius_max": 60.0,
+			"road_half": 20.0, "road_half_turn": 32.0, "hill_amp": 2.5, "noise_frequency": 0.004,
+			"gap_start": 9.9e8, "path_seed": 424242, "noise_seed": 99,
+			"grass_color": Color(0.55, 0.33, 0.18), "asphalt_color": Color(0.12, 0.11, 0.12),
+			"edge_line_color": Color(0.95, 0.88, 0.72), "rail_band_color": Color(0.95, 0.5, 0.15),
+			"scatter_density": 0.85,
+			"scatter_kinds": ["res://assets/rocks/rock_quaternius_1_cc0.glb", "res://assets/rocks/rock_quaternius_2_cc0.glb"],
+		},
+	},
+	"alpine": {
+		"name": "Alpine Ridge", "desc": "Big snowy hills, big-air jumps — send it.",
+		"mode": "classic", "sky_time": 0.45,
+		"overrides": {
+			"hill_amp": 14.0, "straight_bias": 0.7, "turn_radius_min": 50.0, "turn_radius_max": 95.0,
+			"gap_start": 240.0, "gap_spacing": 230.0, "gap_ramp_rise": 8.5, "noise_frequency": 0.0034,
+			"path_seed": 1337, "noise_seed": 2026,
+			"grass_color": Color(0.88, 0.90, 0.94), "asphalt_color": Color(0.10, 0.10, 0.12),
+			"centre_line_color": Color(0.85, 0.4, 0.2), "edge_line_color": Color(0.25, 0.3, 0.4),
+			"rail_band_color": Color(0.2, 0.5, 0.95), "scatter_density": 0.85,
+			"scatter_kinds": [
+				"res://assets/trees/pine_quaternius_cc0.glb",
+				"res://assets/trees/pine_tall_quaternius_cc0.glb",
+				"res://assets/trees/pine_tree_quaternius_cc0.glb",
+				"res://assets/trees/pine_trees_quaternius_cc0.glb",
+			],
+		},
+	},
+}
+const MAP_KEYS := ["hills", "canyon", "alpine"]
+var _map := "hills"
+var _map_btns := {}       # key -> Button (title-screen row)
+var _map_row_lbl: Label   # shop/death-screen "MAP: <name>" readout
+
+# --- sprint mode (mode "sprint" — race the clock) -------------------------
+const SPRINT_TIME := 40.0        # starting countdown (s)
+const SPRINT_CHECKPOINT_M := 350.0
+const SPRINT_BONUS_S := 15.0
+var _sprint_active := false
+var _sprint_time := 0.0
+var _sprint_next_checkpoint := 0.0
+var _sprint_lbl: Label
+
 # HUD
 var _fuel_bar: ColorRect
 var _health_bar: ColorRect
@@ -170,8 +226,8 @@ const SPEED_LINE_COUNT := 32           # number of radial streaks
 # the upcoming bend so curves read early. Subtle + heavily damped (see _update_camera).
 const CAM_LOOKAHEAD_DIST := 45.0       # metres ahead of the car to sample the road
 const CAM_LOOKAHEAD_GAIN := 0.6        # how strongly lateral road bend maps to aim bias
-const CAM_LOOKAHEAD_MAX := 7.0         # max world-X aim bias (metres)
-var _cam_lookahead := 0.0              # smoothed look-ahead aim bias (world X, metres)
+const CAM_LOOKAHEAD_MAX := 7.0         # max aim bias (metres)
+var _cam_lead := Vector3.ZERO          # smoothed look-ahead aim bias (horizontal vector)
 var _cam_roll := 0.0                   # smoothed camera bank angle (degrees)
 var _cam_look_basis := Basis.IDENTITY  # roll-free smoothing accumulator (see _update_camera)
 var _cam_look_ready := false           # false until _cam_look_basis is seeded
@@ -258,16 +314,74 @@ func _new_action(nm: String, dz: float, events: Array) -> void:
 	for e in events:
 		InputMap.action_add_event(nm, e)
 
+var _sky: Node3D   # kept so maps can retune time-of-day on switch (_apply_map)
+
 func _setup_sky() -> void:
 	var sky := Node3D.new()
 	sky.set_script(SkyScript)
-	sky.set("time_of_day", 0.42)
+	# ARCADE MODE: freeze on a warm, bright afternoon rather than letting Sky.gd's
+	# day/night cycle run (that cycle is built for a different, darker mode elsewhere).
+	# t=0.37 -> ~43deg sun elevation: a pleasant, readable afternoon angle.
+	sky.set("time_of_day", MAPS[_map].sky_time)
+	sky.set("auto_advance", false)   # lock the time of day; this mode is never dark
 	add_child(sky)
+	_sky = sky
+	_tune_arcade_environment(sky)
+
+## Sky.gd builds a full WorldEnvironment + sun/moon rig tuned for its slow day/night
+## cycle (long shadow draw distance, volumetric fog, etc). We stay inside HCMain.gd's
+## scope by reaching into the nodes it already created and retuning them for a cheap,
+## bright, always-readable arcade look — Sky.gd itself belongs to another mode/owner.
+func _tune_arcade_environment(sky: Node3D) -> void:
+	var env: Environment = sky.get("_env")
+	var sun: DirectionalLight3D = sky.get("_sun")
+	if env:
+		# filmic tonemap with a light exposure lift so the bright, colorful palette pops
+		env.tonemap_mode = Environment.TONE_MAPPER_ACES
+		env.tonemap_exposure = 1.3
+		# ambient bounce from the sky itself, lifted a touch so shadows never read as dead
+		env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
+		env.ambient_light_energy = 1.2
+		# glow: only strong emissive (coin pickups, brake lights, nitro) should bloom —
+		# a high threshold keeps the sky/road from washing out into a soft haze
+		env.glow_enabled = true
+		env.glow_intensity = 0.35
+		env.glow_bloom = 0.06
+		env.glow_hdr_threshold = 1.3
+		env.glow_blend_mode = Environment.GLOW_BLEND_MODE_SOFTLIGHT
+		# perf: cut anything heavy — no volumetric fog / SSR / SDFGI in this mode
+		env.volumetric_fog_enabled = false
+		env.ssr_enabled = false
+		env.sdfgi_enabled = false
+		# cheap depth fog for an aerial-perspective feel: starts well past normal
+		# reaction range so it beautifies the horizon without hiding the road ahead
+		env.fog_enabled = true
+		env.fog_mode = Environment.FOG_MODE_DEPTH
+		env.fog_depth_begin = 130.0
+		env.fog_depth_end = 950.0
+		env.fog_density = 0.01
+		env.fog_aerial_perspective = 0.4
+		env.fog_sky_affect = 0.55
+		env.fog_light_color = Color(0.95, 0.85, 0.72)   # warm horizon haze
+		# a small saturation/contrast lift so the arcade colors read punchy, not flat
+		env.adjustment_enabled = true
+		env.adjustment_saturation = 1.15
+		env.adjustment_contrast = 1.06
+		env.adjustment_brightness = 1.02
+	if sun:
+		sun.light_color = Color(1.0, 0.92, 0.78)   # warm afternoon sun
+		sun.light_energy = 1.9
+		sun.shadow_enabled = true
+		sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
+		sun.directional_shadow_max_distance = 150.0   # cheaper than Sky.gd's default 320m
+		sun.shadow_bias = 0.05
+		sun.shadow_blur = 1.5   # soft-edged shadows, not razor-hard arcade shadows
 
 func _setup_terrain_and_car() -> void:
 	_terrain = Node3D.new()
 	# TOGGLE: the new 2-D winding-ribbon road (HCTrack) vs the classic z-corridor.
 	_terrain.set_script(HCTrackScript if USE_TRACK else HCTerrainScript)
+	_apply_map_overrides(_terrain)   # map knobs must land BEFORE add_child (gen runs in _ready)
 	add_child(_terrain)
 	_car = RigidBody3D.new()
 	_car.set_script(HCCarScript)
@@ -289,6 +403,94 @@ func _setup_terrain_and_car() -> void:
 	# HCAudio synth + all play_* calls stay guarded by `if _audio:` so leaving
 	# _audio null = fully silent; flip this back on by instancing HCAudioScript here.
 
+## Push the active map's HCTrack export overrides onto a not-yet-added terrain node.
+## Must run set_script -> this -> add_child, since HCTrack builds its road in _ready.
+func _apply_map_overrides(terrain: Node3D) -> void:
+	var overrides: Dictionary = MAPS[_map].overrides
+	for k in overrides:
+		terrain.set(k, overrides[k])
+
+## Called by the title-screen map row / shop "MAP" switcher (and MapProbe). Rebuilds
+## the terrain fresh with the new map's overrides, respawns the car on it, and resets
+## run + sprint state. Safe to call before or after _begin_game.
+func select_map(key: String) -> void:
+	if not MAPS.has(key) or key == _map:
+		return
+	_map = key
+	_apply_map()
+
+## Rebuild path for a map switch: free the old terrain, build a new one with this
+## map's overrides, respawn the car, reconnect signals, reset run + sprint state.
+func _apply_map() -> void:
+	if _terrain and _terrain.is_connected("pickup_collected", _on_pickup_collected):
+		_terrain.disconnect("pickup_collected", _on_pickup_collected)
+	if _terrain:
+		var old: Node = _terrain
+		remove_child(old)
+		old.queue_free()
+	_terrain = Node3D.new()
+	_terrain.set_script(HCTrackScript if USE_TRACK else HCTerrainScript)
+	_apply_map_overrides(_terrain)
+	add_child(_terrain)
+	if _car:
+		_car.set("road_half", _terrain.get("road_half") if USE_TRACK else _terrain.get("road_half_width"))
+		_car.set("terrain", _terrain)
+	if _terrain.has_method("spawn_pos"):
+		_start = _terrain.call("spawn_pos")
+	else:
+		_start.y = _terrain.call("height_at", 0.0, 0.0) + 4.0
+	_terrain.call("set_target", _car)
+	_terrain.connect("pickup_collected", _on_pickup_collected)
+	if _sky:
+		_sky.set("time_of_day", MAPS[_map].sky_time)
+	if _car:
+		_car.call("reset_run", _start)
+	_reset_sprint_state()
+	if _cam:
+		_cam.global_position = _start + Vector3(0, 6, 12)
+	_cam_heading = Vector3(0, 0, -1)
+	_cam_look_ready = false
+	_was_dead = false
+	_update_map_row()
+	if _shop and _shop.visible:
+		_refresh_shop()
+
+## Title-screen map button: select it and re-run the initial terrain/car build (the
+## title screen is still paused/showing, so this just swaps which map we'll play).
+func _on_title_map_button(key: String) -> void:
+	if _audio:
+		_audio.call("play_click")
+	if key != _map:
+		_map = key
+		_apply_map()
+		_refresh_map_buttons()
+	# hand focus back to START so Enter/Ⓐ always launches (a clicked map button
+	# would otherwise keep focus and swallow the confirm key)
+	if _start_btn:
+		_start_btn.grab_focus()
+
+## Highlight the currently-selected map button on the title screen.
+func _refresh_map_buttons() -> void:
+	for mk in MAP_KEYS:
+		if not _map_btns.has(mk):
+			continue
+		var b: Button = _map_btns[mk]
+		b.button_pressed = (mk == _map)
+
+## Cycle to the next map from the shop/death-screen "MAP" row.
+func _cycle_map() -> void:
+	if _audio:
+		_audio.call("play_click")
+	var i: int = MAP_KEYS.find(_map)
+	_map = MAP_KEYS[(i + 1) % MAP_KEYS.size()]
+	_apply_map()
+	_refresh_map_buttons()
+
+## Refresh the "MAP: <name>" readout in the shop/death screen, if built.
+func _update_map_row() -> void:
+	if _map_row_lbl:
+		_map_row_lbl.text = "MAP:  %s" % MAPS[_map].name
+
 func _setup_camera() -> void:
 	_cam = Camera3D.new()
 	_cam.fov = 70.0
@@ -309,6 +511,7 @@ func _process(delta: float) -> void:
 	_update_camera(delta)
 	_update_hud()
 	_update_feel(delta)
+	_update_sprint(delta)
 	# on death, bank money earned from how far down the track you got, open the shop
 	var d: bool = _car.get("dead")
 	if d and not _was_dead:
@@ -339,23 +542,28 @@ func _update_camera(delta: float) -> void:
 			if is_finite(lat):
 				roll_target = clampf(lat / 12.0, -1.0, 1.0) * CAM_ROLL_MAX_DEG
 	_cam_roll = lerpf(_cam_roll, roll_target, 1.0 - exp(-6.0 * delta))
-	# corner look-ahead: sample the road centre-line ~LOOKAHEAD metres ahead (forward
-	# is -Z, so subtract) and bias the aim toward where the road is heading. Eased to 0
+	# corner look-ahead: sample the road centre-line ~LOOKAHEAD metres further along the
+	# path and bias the aim toward where the road is heading. Only the SIDEWAYS part of
+	# the lead (perpendicular to travel) is kept, so straights add no bias. Eased to 0
 	# when there's nothing to drive (dead / no car / shop open) so it never lingers.
-	var lead_target := 0.0
+	var lead_target := Vector3.ZERO
 	var la_active: bool = not (_car == null or bool(_car.get("dead")) or (_shop != null and _shop.visible))
-	if la_active and _terrain != null and _terrain.has_method("road_center_x"):
-		var cz: float = _car.global_position.z
-		var here_cx: float = _terrain.call("road_center_x", cz)
-		var ahead_cx: float = _terrain.call("road_center_x", cz - CAM_LOOKAHEAD_DIST)
-		var lateral_lead := ahead_cx - here_cx
-		if is_finite(lateral_lead):
-			lead_target = clampf(lateral_lead * CAM_LOOKAHEAD_GAIN, -CAM_LOOKAHEAD_MAX, CAM_LOOKAHEAD_MAX)
-	_cam_lookahead = lerpf(_cam_lookahead, lead_target, 1.0 - exp(-4.0 * delta))
+	if la_active and _terrain != null and _terrain.has_method("path_ahead"):
+		var here: Vector3 = _terrain.call("path_ahead", _car.global_position, 0.0)
+		var ahead: Vector3 = _terrain.call("path_ahead", _car.global_position, CAM_LOOKAHEAD_DIST)
+		var lead := ahead - here
+		lead.y = 0.0
+		lead -= _cam_heading * lead.dot(_cam_heading)   # sideways component only
+		lead *= CAM_LOOKAHEAD_GAIN
+		if lead.length() > CAM_LOOKAHEAD_MAX:
+			lead = lead.normalized() * CAM_LOOKAHEAD_MAX
+		if lead.is_finite():
+			lead_target = lead
+	_cam_lead = _cam_lead.lerp(lead_target, 1.0 - exp(-4.0 * delta))
 	var target := _car.global_position
 	var want := target - _cam_heading * 12.0 + Vector3(0, 6.0, 0)
 	# gentle "cut the corner": nudge the chase position a small fraction of the aim bias
-	want.x += _cam_lookahead * 0.3
+	want += _cam_lead * 0.3
 	# don't let terrain block the view of the car: raycast from the car toward the camera
 	# and pull the camera in front of any hill in the way
 	var ss := _car.get_world_3d().direct_space_state
@@ -375,7 +583,7 @@ func _update_camera(delta: float) -> void:
 	var look := target + Vector3(0, 1.0, 0)
 	# lean the AIM toward the upcoming bend (composes with the roll-free basis below;
 	# it only shifts the look target, so it never feeds the drift-roll accumulator)
-	look.x += _cam_lookahead
+	look += _cam_lead
 	var dir := look - _cam.global_position
 	# looking_at() errors if the look direction is parallel to the up vector
 	# (camera ends up directly above/below the car). Skip the degenerate frame,
@@ -420,10 +628,11 @@ func _restart() -> void:
 	_shake_off = Vector3.ZERO
 	_fov_punch = 0.0
 	_cam_roll = 0.0
-	_cam_lookahead = 0.0
+	_cam_lead = Vector3.ZERO
 	_cam_look_ready = false   # reseed the look basis at the new spawn orientation
 	_speed_fx = 0.0
 	_was_dead = false
+	_reset_sprint_state()
 	if _shop:
 		_shop.visible = false
 
@@ -438,6 +647,33 @@ func _on_car_landed(impact: float, _air_time: float) -> void:
 ## shows the end screen. Just add a jolt here for feel.
 func _on_car_gap_failed(_can_respawn: bool) -> void:
 	_shake = maxf(_shake, 0.5)
+
+# --- sprint mode: race the clock on "sprint"-mode maps (currently: canyon) --------
+
+## Reseed the countdown for the active map's mode. Classic maps stay inactive
+## (no timer shown, no death-on-zero) — this is purely opt-in per map.
+func _reset_sprint_state() -> void:
+	_sprint_active = MAPS[_map].mode == "sprint"
+	_sprint_time = SPRINT_TIME
+	_sprint_next_checkpoint = SPRINT_CHECKPOINT_M
+
+## Tick the countdown while a sprint run is live; award +time every checkpoint
+## distance and end the run (via the car's normal death flow) at zero.
+func _update_sprint(delta: float) -> void:
+	if not _sprint_active or _car == null or bool(_car.get("dead")):
+		return
+	var dist: float = _car.get("distance")
+	if dist >= _sprint_next_checkpoint:
+		_sprint_next_checkpoint += SPRINT_CHECKPOINT_M
+		_sprint_time += SPRINT_BONUS_S
+		_car.set("trick_text", "+%ds  CHECKPOINT" % int(SPRINT_BONUS_S))
+		_car.set("_trick_timer", 2.0)
+		if _audio:
+			_audio.call("play_coin")
+	_sprint_time -= delta
+	if _sprint_time <= 0.0:
+		_sprint_time = 0.0
+		_car.set("health", 0.0)   # normal death/shop flow takes it from here
 
 # --- feel: speed-lines overlay ----------------------------------------------
 
@@ -618,24 +854,40 @@ func _build_start_menu() -> void:
 	dim.color = Color(0.03, 0.04, 0.06, 0.9)
 	_start_layer.add_child(dim)
 
+	# ADAPTIVE layout: the old fixed 720x640 panel at a hand-placed offset overflowed
+	# the 720 px window once the MAP row landed — START rendered BELOW the screen edge
+	# and the game looked "stuck" (nothing clickable could unpause it). Now the panel
+	# centres itself at any size, the how-to text scrolls, and MAP + START stay pinned.
+	var center := CenterContainer.new()
+	center.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_start_layer.add_child(center)
 	var panel := PanelContainer.new()
-	panel.set_anchors_preset(Control.PRESET_CENTER)
-	panel.custom_minimum_size = Vector2(720, 640)
-	panel.position = Vector2(-360, -320)
-	_start_layer.add_child(panel)
+	panel.custom_minimum_size = Vector2(720, 0)
+	center.add_child(panel)
 	var pad := MarginContainer.new()
 	for m in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
-		pad.add_theme_constant_override(m, 26)
+		pad.add_theme_constant_override(m, 20)
 	panel.add_child(pad)
 	var box := VBoxContainer.new()
-	box.add_theme_constant_override("separation", 10)
+	box.add_theme_constant_override("separation", 8)
 	pad.add_child(box)
 
 	_shop_label(box, "🏎  HILL CLIMB RACER", 34, Color(1, 0.82, 0.42))
 	_shop_label(box, "Drive as far as you can. Fuel is your timer — don't run dry.", 16, Color(0.72, 0.78, 0.9))
 	box.add_child(HSeparator.new())
 
-	_shop_label(box, "CONTROLS", 16, Color(0.8, 0.85, 1.0))
+	# scrollable middle (controls + tips) so the pinned MAP/START rows below always
+	# fit on screen no matter how much how-to text accumulates
+	var sc := ScrollContainer.new()
+	sc.custom_minimum_size = Vector2(672, 290)
+	sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	box.add_child(sc)
+	var scb := VBoxContainer.new()
+	scb.add_theme_constant_override("separation", 8)
+	scb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	sc.add_child(scb)
+
+	_shop_label(scb, "CONTROLS", 16, Color(0.8, 0.85, 1.0))
 	var ctrls := [
 		"Throttle / Brake:   W / S   ·   RT / LT",
 		"Steer:   A / D   ·   left stick",
@@ -644,10 +896,10 @@ func _build_start_menu() -> void:
 		"Recover if flipped:   R / Y      Garage:   Tab / Start",
 	]
 	for c in ctrls:
-		_shop_label(box, "•  " + c, 15, Color(0.86, 0.88, 0.92))
-	box.add_child(HSeparator.new())
+		_shop_label(scb, "•  " + c, 15, Color(0.86, 0.88, 0.92))
+	scb.add_child(HSeparator.new())
 
-	_shop_label(box, "TIPS", 16, Color(0.8, 0.85, 1.0))
+	_shop_label(scb, "TIPS", 16, Color(0.8, 0.85, 1.0))
 	var tips := [
 		"Drift around most corners — brake while turning, or flick the wheel hard, to break the rear loose. Take a fast corner on pure grip and a top-heavy ride will TIP and roll out of control.",
 		"Read EVERY upgrade — each changes how the car handles, not just its numbers. (Downforce = tips far less · Aerodynamics = higher top speed · Bigger Wheels = clearance.)",
@@ -656,9 +908,27 @@ func _build_start_menu() -> void:
 		"Every vehicle feels different — try them all in the Garage (van → hot rod → monster → sports → F1).",
 	]
 	for t in tips:
-		var l := _shop_label(box, "•  " + t, 14, Color(0.7, 0.74, 0.8))
+		var l := _shop_label(scb, "•  " + t, 14, Color(0.7, 0.74, 0.8))
 		l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		l.custom_minimum_size = Vector2(668, 0)
+		l.custom_minimum_size = Vector2(640, 0)
+	box.add_child(HSeparator.new())
+
+	_shop_label(box, "MAP", 16, Color(0.8, 0.85, 1.0))
+	var map_row := HBoxContainer.new()
+	map_row.add_theme_constant_override("separation", 8)
+	box.add_child(map_row)
+	_map_btns.clear()
+	for mk in MAP_KEYS:
+		var mbtn := Button.new()
+		mbtn.text = MAPS[mk].name
+		mbtn.tooltip_text = MAPS[mk].desc
+		mbtn.custom_minimum_size = Vector2(0, 40)
+		mbtn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		mbtn.toggle_mode = true
+		mbtn.pressed.connect(_on_title_map_button.bind(mk))
+		map_row.add_child(mbtn)
+		_map_btns[mk] = mbtn
+	_refresh_map_buttons()
 	box.add_child(HSeparator.new())
 
 	_start_btn = Button.new()
@@ -713,6 +983,23 @@ func _build_shop() -> void:
 	_shop_money = _shop_label(box, "", 19, Color(0.65, 1.0, 0.7))
 	var sep := HSeparator.new()
 	box.add_child(sep)
+
+	# MAP switcher: change tracks between runs (cycles through MAPS + rebuilds).
+	var map_row := HBoxContainer.new()
+	map_row.add_theme_constant_override("separation", 10)
+	box.add_child(map_row)
+	_map_row_lbl = Label.new()
+	_map_row_lbl.add_theme_font_size_override("font_size", 15)
+	_map_row_lbl.add_theme_color_override("font_color", Color(0.8, 0.85, 1.0))
+	_map_row_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	map_row.add_child(_map_row_lbl)
+	var map_switch := Button.new()
+	map_switch.text = "switch"
+	map_switch.custom_minimum_size = Vector2(90, 32)
+	map_switch.pressed.connect(_cycle_map)
+	map_row.add_child(map_switch)
+	_update_map_row()
+	box.add_child(HSeparator.new())
 
 	# Three tabs — Garage, Upgrades, Cosmetics — so no section crowds another and every
 	# option stays on screen (LB/RB or Q/E switch tabs). Each tab scrolls on its own;
@@ -1120,6 +1407,7 @@ func _swap_vehicle(vk: String) -> void:
 	_apply_upgrades()
 	_cam_heading = Vector3(0, 0, -1)
 	_was_dead = false
+	_reset_sprint_state()
 	if was_visible:
 		_refresh_shop()
 
@@ -1335,6 +1623,14 @@ func _setup_hud() -> void:
 	_score_lbl.add_theme_font_size_override("font_size", 24)
 	_score_lbl.add_theme_color_override("font_color", Color(1, 0.95, 0.5))
 	layer.add_child(_score_lbl)
+	_sprint_lbl = Label.new()
+	_sprint_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	_sprint_lbl.position = Vector2(-120, 60)
+	_sprint_lbl.custom_minimum_size = Vector2(240, 0)
+	_sprint_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_sprint_lbl.add_theme_font_size_override("font_size", 44)
+	_sprint_lbl.add_theme_color_override("font_color", Color(0.6, 1.0, 0.7))
+	layer.add_child(_sprint_lbl)
 	_trick_lbl = Label.new()
 	_trick_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
 	_trick_lbl.position = Vector2(-240, 120)
@@ -1378,7 +1674,16 @@ func _update_hud() -> void:
 	_info.text = "%d m    %d km/h%s" % [int(dist), int(_car.call("get_speed_kmh")), air]
 	_score_lbl.text = "SCORE %d" % int(_car.get("score"))
 	_trick_lbl.text = _car.get("trick_text")
+	_update_sprint_hud()
 	_update_gap_telegraph()
+
+## Sprint-mode countdown: hidden on classic maps, big + red under 10s on sprint maps.
+func _update_sprint_hud() -> void:
+	if not _sprint_active or _car == null or bool(_car.get("dead")):
+		_sprint_lbl.text = ""
+		return
+	_sprint_lbl.text = "%d" % ceili(_sprint_time)
+	_sprint_lbl.add_theme_color_override("font_color", Color(1.0, 0.3, 0.3) if _sprint_time < 10.0 else Color(0.6, 1.0, 0.7))
 
 ## Warn the player to build speed on a gap run-up (green = you'll make it).
 func _update_gap_telegraph() -> void:

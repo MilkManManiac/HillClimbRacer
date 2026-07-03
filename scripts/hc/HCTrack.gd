@@ -12,6 +12,7 @@ extends Node3D
 signal pickup_collected(kind: String, value: float)
 
 const HCPickup := preload("res://scripts/hc/HCPickup.gd")
+const GlbUtil := preload("res://scripts/GlbUtil.gd")
 
 const STEP := 4.0            # path sample spacing (m)
 const N_MAX := 7000          # samples -> 28 km of road
@@ -29,6 +30,25 @@ const CELL := 24.0           # spatial-hash cell size for projection + overlap t
 @export var max_turn_deg := 130.0      # biggest turn a sweeper can make
 @export var turn_radius_min := 30.0    # tightest turn radius (m) — small = drift-friendly
 @export var turn_radius_max := 85.0    # loosest turn radius (m)
+
+# --- map-readiness: seeds + palette + scatter, set by a future maps system BEFORE
+# add_child (read once in _build_path / _mats / _ensure_scatter_meshes) --------
+@export var path_seed := 20260630      # centre-line RNG seed (straights/turns/widen)
+@export var noise_seed := 777          # hill-noise seed
+@export var noise_frequency := 0.0026  # hill-noise wavelength (lower = gentler, longer rolls)
+@export var grass_color := Color(0.28, 0.44, 0.20)
+@export var asphalt_color := Color(0.16, 0.16, 0.18)
+@export var centre_line_color := Color(0.86, 0.74, 0.22)   # dashed centre stripe
+@export var edge_line_color := Color(0.92, 0.92, 0.88)     # solid verge-edge stripe
+@export var rail_post_color := Color(0.5, 0.5, 0.55)       # guardrail posts + strip base
+@export var rail_band_color := Color(0.9, 0.3, 0.25)       # emissive top band / cap rail
+@export_range(0.0, 1.0) var scatter_density := 0.6         # 0..1 chance of a prop per verge slot
+@export var scatter_kinds: Array[String] = [
+	"res://assets/trees/pine_quaternius_cc0.glb",
+	"res://assets/trees/pine_tall_quaternius_cc0.glb",
+	"res://assets/rocks/rock_quaternius_1_cc0.glb",
+	"res://assets/rocks/rock_quaternius_2_cc0.glb",
+]
 
 # --- jumps (gaps) on the winding road ---------------------------------------
 @export var gap_start := 320.0         # no jumps before this distance-along-road
@@ -76,6 +96,16 @@ var _proj_i := 0                  # stateful nearest-sample hint for the target
 var _tiles := {}                  # tile index -> Node3D container
 var _road_mat: StandardMaterial3D
 var _rail_mat: StandardMaterial3D
+var _rail_cap_mat: StandardMaterial3D
+var _post_mat: StandardMaterial3D
+
+# --- roadside scatter (trees/rocks) — meshes loaded ONCE and reused per-tile via
+# MultiMesh, so streaming a tile never touches disk. Keyed by the GLB path in
+# scatter_kinds so a maps system can swap in a different kind list.
+var _scatter_meshes_loaded := false
+var _scatter_kind_mesh := {}    # glb path -> Mesh
+var _scatter_kind_scale := {}   # glb path -> base scale (normalises native mesh size)
+var _post_mesh: BoxMesh         # shared guardrail-post mesh
 
 func _ready() -> void:
 	_build_path()
@@ -84,14 +114,14 @@ func _ready() -> void:
 # --- deterministic 2-D path generation with hard no-overlap -------------------
 func _build_path() -> void:
 	_noise = FastNoiseLite.new()
-	_noise.seed = 777
+	_noise.seed = noise_seed
 	_noise.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
 	_noise.fractal_type = FastNoiseLite.FRACTAL_FBM
 	_noise.fractal_octaves = 1     # ONE octave = smooth long rolls, no small bumps
-	_noise.frequency = 0.0026      # long wavelength (~380 m) so hills are gentle sweeps
+	_noise.frequency = noise_frequency   # long wavelength so hills are gentle sweeps
 	_px.resize(N_MAX); _pz.resize(N_MAX); _ph.resize(N_MAX); _pw.resize(N_MAX)
 	var rng := RandomNumberGenerator.new()
-	rng.seed = 20260630
+	rng.seed = path_seed
 	var x := 0.0
 	var z := 0.0
 	var th := 0.0
@@ -244,6 +274,50 @@ func _lateral(i: int, x: float, z: float) -> float:
 	var rx := cos(_ph[i]); var rz := sin(_ph[i])   # right vector
 	return (x - _px[i]) * rx + (z - _pz[i]) * rz
 
+## CONTINUOUS projection of (x,z) onto the centre-line. The old integer-sample
+## projection quantised s (and lateral) to 4 m steps, which turned every height/
+## gradient query into a staircase — the root of the ramp-launch spikes and the
+## per-sample "ticks" the car felt at speed. This projects onto the polyline
+## SEGMENTS around the nearest sample instead, so s, lat and widen vary smoothly.
+## Returns {"s": arc-length, "lat": signed lateral, "w": widen 0..1, "i": sample}.
+func _project_at(i: int, x: float, z: float) -> Dictionary:
+	var best_s := float(i) * STEP
+	var best_lat := _lateral(i, x, z)
+	var best_w := _pw[i]
+	var best_h := _ph[i]                 # heading, interpolated along the winning segment
+	# the per-sample values above are only the LAST-RESORT fallback (degenerate path);
+	# seed the search at INF so a real segment projection always wins — seeding with the
+	# sample's lateral distance TIES with the segment candidates on straights, which kept
+	# the quantised fallback and reintroduced the 4 m height staircase this replaces.
+	var best_d2 := INF
+	for j in [i - 1, i]:                 # the two segments touching sample i
+		if j < 0 or j + 1 >= _n:
+			continue
+		var ax := _px[j]; var az := _pz[j]
+		var dx := _px[j + 1] - ax; var dz := _pz[j + 1] - az
+		var len2 := dx * dx + dz * dz
+		if len2 < 0.0001:
+			continue
+		var t := clampf(((x - ax) * dx + (z - az) * dz) / len2, 0.0, 1.0)
+		var cx := ax + dx * t; var cz := az + dz * t
+		var ox := x - cx; var oz := z - cz
+		var d2 := ox * ox + oz * oz
+		if d2 < best_d2:
+			var inv := 1.0 / sqrt(len2)            # segment forward, normalised
+			var fx := dx * inv; var fz := dz * inv
+			best_d2 = d2
+			best_s = (float(j) + t) * STEP
+			best_lat = ox * -fz + oz * fx          # right = (-fz, fx): signed lateral
+			best_w = lerpf(_pw[j], _pw[j + 1], t)
+			best_h = lerp_angle(_ph[j], _ph[j + 1], t)
+	return {"s": best_s, "lat": best_lat, "w": best_w, "h": best_h, "i": i}
+
+## Continuous projection seeded from the stateful hint (cheap; for the car).
+func _project(x: float, z: float) -> Dictionary:
+	var i := _nearest_from(x, z, _proj_i)
+	_proj_i = i
+	return _project_at(i, x, z)
+
 # --- public interface (matches HCTerrain so it drops in behind the toggle) ----
 func set_target(t: Node3D) -> void:
 	_target = t
@@ -263,28 +337,60 @@ func spawn_pos() -> Vector3:
 
 ## Distance-along-road (arc-length) at a world position — drives distance/money.
 func progress(pos: Vector3) -> float:
-	var i := _nearest_from(pos.x, pos.z, _proj_i)
-	_proj_i = i
-	return float(i) * STEP
+	return _project(pos.x, pos.z).s
 
 ## Lateral distance off the road centre-line (for off-road detection).
 func lateral_off(pos: Vector3) -> float:
-	var i := _nearest_from(pos.x, pos.z, _proj_i)
-	return absf(_lateral(i, pos.x, pos.z))
+	return absf(_project(pos.x, pos.z).lat)
 
 ## Drivable half-width here (wider through turns).
 func road_half_here(pos: Vector3) -> float:
-	var i := _nearest_from(pos.x, pos.z, _proj_i)
-	return lerpf(road_half, road_half_turn, _pw[i])
+	return lerpf(road_half, road_half_turn, _project(pos.x, pos.z).w)
 
 ## Ground height at an arbitrary world (x,z) — rolling hills + carved jumps.
+## Continuous everywhere (segment-projected s/lat), so finite-difference
+## gradients over it are smooth — safe for suspension and ramp launches.
 func height_at(x: float, z: float) -> float:
 	if _n == 0:
 		return 0.0
-	var i := _nearest_grid(x, z)
-	var lat := _lateral(i, x, z)
-	var rh := lerpf(road_half, road_half_turn, _pw[i])
-	return _carved_height(float(i) * STEP, lat, rh)
+	var p := _project_at(_nearest_grid(x, z), x, z)
+	var rh: float = lerpf(road_half, road_half_turn, p.w)
+	return _carved_height(p.s, p.lat, rh)
+
+## World centre-line point `dist` metres further along the road from pos's
+## projection (dist 0 = the projection itself). Lets the camera read bends early —
+## the old road_center_x(z) look-ahead only made sense on the straight z-corridor.
+func path_ahead(pos: Vector3, dist: float) -> Vector3:
+	if _n == 0:
+		return pos
+	var p := _project(pos.x, pos.z)
+	var fi: float = clampf((p.s + dist) / STEP, 0.0, float(_n - 1))
+	var i := int(fi)
+	var t := fi - float(i)
+	var j := mini(i + 1, _n - 1)
+	return Vector3(lerpf(_px[i], _px[j], t), 0.0, lerpf(_pz[i], _pz[j], t))
+
+## Analytic ground for the car's suspension: smooth height AND surface normal in
+## ONE projection. Riding this field instead of raycasting the trimesh tiles kills
+## the facet/seam bumps entirely — the wheels follow the same C1 noise curve the
+## road mesh was sampled from, independent of collision streaming.
+func ground_info(x: float, z: float) -> Dictionary:
+	if _n == 0:
+		return {"h": 0.0, "n": Vector3.UP}
+	var p := _project(x, z)
+	var s: float = p.s
+	var lat: float = p.lat
+	var rh: float = lerpf(road_half, road_half_turn, p.w)
+	var h := _carved_height(s, lat, rh)
+	# partial derivatives in the road frame (forward = +s, right = +lat)
+	var e := 0.9
+	var dh_ds := (_carved_height(s + e, lat, rh) - _carved_height(s - e, lat, rh)) / (2.0 * e)
+	var dh_dl := (_carved_height(s, lat + e, rh) - _carved_height(s, lat - e, rh)) / (2.0 * e)
+	var hd: float = p.h                             # continuous heading (no 4 m steps)
+	var fx := sin(hd); var fz := -cos(hd)           # world forward
+	var rx := cos(hd); var rz := sin(hd)            # world right
+	var n := Vector3(-(dh_ds * fx + dh_dl * rx), 1.0, -(dh_ds * fz + dh_dl * rz)).normalized()
+	return {"h": h, "n": n}
 
 ## Base rolling-hill height (no jumps) at distance s, lateral lat.
 func _base_hill(s: float, lat: float, rh: float) -> float:
@@ -369,14 +475,15 @@ func _is_straight(s0: float, s1: float) -> bool:
 
 ## Jump state at a world position, for the car's _check_gap (mirrors the z-terrain).
 func gap_state(pos: Vector3) -> Dictionary:
-	var i := _nearest_from(pos.x, pos.z, _proj_i)
+	var p := _project(pos.x, pos.z)
+	var i: int = p.i
 	var gi := _gsamp[i] if i < _gsamp.size() else -1
 	if gi < 0:
 		return {"active": false}
 	var g: Dictionary = _gaps[gi]
-	var s := float(i) * STEP
-	var lat := absf(_lateral(i, pos.x, pos.z))
-	var rh := lerpf(road_half, road_half_turn, _pw[i])
+	var s: float = p.s
+	var lat: float = absf(p.lat)
+	var rh: float = lerpf(road_half, road_half_turn, p.w)
 	var lip: float = g.cs - g.vw * 0.5
 	var far: float = g.cs + g.vw * 0.5
 	return {
@@ -517,6 +624,20 @@ func _mats() -> void:
 		_rail_mat.vertex_color_use_as_albedo = true
 		_rail_mat.roughness = 0.6
 		_rail_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	if _rail_cap_mat == null:
+		# dedicated material for the thin top cap strip + posts so only the red band
+		# glows — StandardMaterial3D emission is a flat property, not vertex-driven,
+		# so a separate solid-color material is the simplest way to isolate it.
+		_rail_cap_mat = StandardMaterial3D.new()
+		_rail_cap_mat.albedo_color = rail_band_color
+		_rail_cap_mat.roughness = 0.5
+		_rail_cap_mat.emission_enabled = true
+		_rail_cap_mat.emission = rail_band_color
+		_rail_cap_mat.emission_energy_multiplier = 0.6
+	if _post_mat == null:
+		_post_mat = StandardMaterial3D.new()
+		_post_mat.albedo_color = rail_post_color
+		_post_mat.roughness = 0.85
 
 # lateral cross-section offsets (fractions of the meshed half-width) for the ribbon.
 const LAT_FR := [-1.0, -0.8, -0.62, -0.5, -0.32, -0.12, 0.0, 0.12, 0.32, 0.5, 0.62, 0.8, 1.0]
@@ -565,9 +686,11 @@ func _build_tile(t: int) -> void:
 	mi.mesh = st.commit()
 	mi.material_override = _road_mat
 	container.add_child(mi)
-	# rails down both edges
-	container.add_child(_rail_strip(rows, -1.0))
-	container.add_child(_rail_strip(rows, 1.0))
+	# rails down both edges (band + emissive cap + posts)
+	_build_rail_side(container, rows, -1.0)
+	_build_rail_side(container, rows, 1.0)
+	# roadside scatter (trees/rocks) — purely visual, verge band only
+	_scatter_tile(t, rows, container)
 	# collision
 	var body := StaticBody3D.new()
 	var cs := CollisionShape3D.new()
@@ -591,8 +714,11 @@ func _in_void_s(s: float) -> bool:
 	return s > g.cs - g.vw * 0.5 and s < g.cs + g.vw * 0.5
 
 func _surface_color(d: float, lat: float, rh: float) -> Color:
-	var grass := Color(0.28, 0.44, 0.20)
-	var asphalt := Color(0.16, 0.16, 0.18)
+	# cheap high-frequency detail: sample the SAME noise field but at scaled-up
+	# coordinates so a flat asphalt/grass fill isn't perfectly uniform, without
+	# touching _noise's persistent frequency (that field also drives the hills).
+	var vh := _noise.get_noise_2d(d * 9.0, lat * 9.0)   # -1..1, deterministic per-vertex
+	var grass := _varied_grass(vh)
 	var al := absf(lat)
 	if al > rh + 1.0:
 		return grass
@@ -606,36 +732,175 @@ func _surface_color(d: float, lat: float, rh: float) -> Color:
 			return Color(0.92, 0.78, 0.12) if fmod(d, 4.0) < 2.0 else Color(0.1, 0.1, 0.11)
 		elif d >= far and d < far + gap_land_len:
 			return Color(0.16, 0.5, 0.3).lerp(grass, smoothstep(rh - 1.5, rh + 1.0, al))
-	var road := asphalt
+	var road := _varied_asphalt(vh)
 	if al < 1.3 and fmod(d, 7.0) < 4.0:
-		road = Color(0.86, 0.74, 0.22)   # soft dashed centre line
+		road = centre_line_color   # soft dashed centre line
+	elif al >= rh - 1.2 and al <= rh - 0.6:
+		return edge_line_color     # solid verge edge line, kept crisp (no grass blend)
 	var edge := smoothstep(rh - 1.5, rh + 1.0, al)   # fade to grass at the verge
 	return road.lerp(grass, edge)
 
-func _rail_strip(rows: Array, side: float) -> MeshInstance3D:
+## Grass with subtle deterministic variation (~±8% value, slight yellow-green shift
+## on the bright side) so the verge doesn't read as one flat fill.
+func _varied_grass(vh: float) -> Color:
+	var gv := 1.0 + vh * 0.08
+	var warm := maxf(vh, 0.0) * 0.10   # only warms up on the bright side
+	return Color(
+		clampf(grass_color.r * gv + warm * 0.5, 0.0, 1.0),
+		clampf(grass_color.g * gv + warm, 0.0, 1.0),
+		clampf(grass_color.b * gv - warm * 0.6, 0.0, 1.0),
+	)
+
+## Asphalt with subtle deterministic value variation (~±4%).
+func _varied_asphalt(vh: float) -> Color:
+	var av := 1.0 + vh * 0.04
+	return Color(asphalt_color.r * av, asphalt_color.g * av, asphalt_color.b * av)
+
+## Builds one side's guardrail into `container`: the grey->red gradient band strip
+## (as before), PLUS a thin emissive cap along the very top edge (so the "rail glows"
+## reads as a deliberate top band, not a uniformly-lit strip), PLUS short vertical
+## posts every couple of rows so it reads as a guardrail rather than a floating ribbon.
+func _build_rail_side(container: Node3D, rows: Array, side: float) -> void:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var cap := SurfaceTool.new()
+	cap.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var prev_lo := Vector3.ZERO
 	var prev_hi := Vector3.ZERO
+	var prev_cap := Vector3.ZERO
 	var have := false
+	var post_xforms: Array[Transform3D] = []
+	var row_idx := 0
 	for r in rows:
 		var rh: float = r.rh
 		var lat := side * rh
 		var lo := Vector3(r.cx + r.rx * lat, _height_lat(r.d, lat, rh) - 0.3, r.cz + r.rz * lat)
 		var hi := lo + Vector3(0, 1.6, 0)
+		var cap_top := hi + Vector3(0, 0.25, 0)   # thin sliver above hi = the glowing cap rail
 		if have:
-			st.set_color(Color(0.75, 0.75, 0.8)); st.add_vertex(prev_lo)
-			st.set_color(Color(0.9, 0.3, 0.25)); st.add_vertex(prev_hi)
-			st.set_color(Color(0.9, 0.3, 0.25)); st.add_vertex(hi)
-			st.set_color(Color(0.75, 0.75, 0.8)); st.add_vertex(prev_lo)
-			st.set_color(Color(0.9, 0.3, 0.25)); st.add_vertex(hi)
-			st.set_color(Color(0.75, 0.75, 0.8)); st.add_vertex(lo)
-		prev_lo = lo; prev_hi = hi; have = true
+			st.set_color(rail_post_color); st.add_vertex(prev_lo)
+			st.set_color(rail_band_color); st.add_vertex(prev_hi)
+			st.set_color(rail_band_color); st.add_vertex(hi)
+			st.set_color(rail_post_color); st.add_vertex(prev_lo)
+			st.set_color(rail_band_color); st.add_vertex(hi)
+			st.set_color(rail_post_color); st.add_vertex(lo)
+			cap.set_color(rail_band_color); cap.add_vertex(prev_hi)
+			cap.set_color(rail_band_color); cap.add_vertex(prev_cap)
+			cap.set_color(rail_band_color); cap.add_vertex(cap_top)
+			cap.set_color(rail_band_color); cap.add_vertex(prev_hi)
+			cap.set_color(rail_band_color); cap.add_vertex(cap_top)
+			cap.set_color(rail_band_color); cap.add_vertex(hi)
+		if row_idx % 2 == 0:   # a post every other row (~8 m) — enough to read as a guardrail
+			_ensure_post_mesh()
+			var yaw := atan2(r.rx, r.rz)   # align the post's thin axis across the road
+			var pb := Basis(Vector3.UP, yaw)
+			post_xforms.append(Transform3D(pb, lo + Vector3(0, 0.5, 0)))
+		prev_lo = lo; prev_hi = hi; prev_cap = cap_top; have = true
+		row_idx += 1
 	st.generate_normals()
+	cap.generate_normals()
 	var mi := MeshInstance3D.new()
 	mi.mesh = st.commit()
 	mi.material_override = _rail_mat
-	return mi
+	container.add_child(mi)
+	var cap_mi := MeshInstance3D.new()
+	cap_mi.mesh = cap.commit()
+	cap_mi.material_override = _rail_cap_mat
+	container.add_child(cap_mi)
+	if not post_xforms.is_empty():
+		var mm := MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.mesh = _post_mesh
+		mm.instance_count = post_xforms.size()
+		for i in range(post_xforms.size()):
+			mm.set_instance_transform(i, post_xforms[i])
+		var mmi := MultiMeshInstance3D.new()
+		mmi.multimesh = mm
+		mmi.material_override = _post_mat
+		mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		container.add_child(mmi)
+
+## Shared post mesh, built once — a short dark box that sits at the rail base.
+func _ensure_post_mesh() -> void:
+	if _post_mesh != null:
+		return
+	_post_mesh = BoxMesh.new()
+	_post_mesh.size = Vector3(0.18, 1.0, 0.18)
+
+# --- roadside scatter (trees/rocks) -------------------------------------------
+
+## Loads every kind in scatter_kinds ONCE (lazy) and merges each into a single Mesh
+## (via GlbUtil.load_mesh) for MultiMesh instancing — never touches disk per-tile.
+## Also derives a per-kind base scale from the native mesh size so trees/rocks of
+## very different native scale (Quaternius rocks range from tiny to huge) all read
+## as similarly-sized roadside props before the per-instance 0.8-1.6x variance.
+func _ensure_scatter_meshes() -> void:
+	if _scatter_meshes_loaded:
+		return
+	_scatter_meshes_loaded = true
+	for k in scatter_kinds:
+		var m := GlbUtil.load_mesh(k)
+		if m == null:
+			continue
+		_scatter_kind_mesh[k] = m
+		var aabb := m.get_aabb()
+		var is_tree: bool = k.contains("/trees/")
+		var native: float = aabb.size.y if is_tree else maxf(aabb.size.x, aabb.size.z)
+		var target: float = 9.0 if is_tree else 2.0   # trees ~9m tall, rocks ~2m wide
+		_scatter_kind_scale[k] = (target / native) if native > 0.01 else 1.0
+
+## Scatters trees/rocks along tile `t`'s verge band, deterministically from a local
+## RNG seeded off the tile index (NOT global randi — streaming must be repeatable).
+## Kept lateral OUTSIDE the meshed drivable band (road_half*_here + 5) and INSIDE the
+## meshed ground (road_half_turn + mesh_verge - 2) so props never float off the mesh.
+func _scatter_tile(t: int, rows: Array, container: Node3D) -> void:
+	if scatter_density <= 0.0 or scatter_kinds.is_empty():
+		return
+	_ensure_scatter_meshes()
+	if _scatter_kind_mesh.is_empty():
+		return
+	var rng := RandomNumberGenerator.new()
+	rng.seed = hash(Vector3i(t, int(path_seed) & 0xffff, 90210))
+	var half_mesh := road_half_turn + mesh_verge
+	var buckets := {}
+	for k in scatter_kinds:
+		buckets[k] = [] as Array[Transform3D]
+	for r in rows:
+		if r.void:
+			continue
+		var rh: float = r.rh
+		var lo: float = rh + 5.0
+		var hi: float = half_mesh - 2.0
+		if hi <= lo:
+			continue
+		for side in [-1.0, 1.0]:
+			if rng.randf() > scatter_density:
+				continue
+			var lat: float = lerpf(lo, hi, rng.randf()) * side
+			var kind: String = scatter_kinds[rng.randi() % scatter_kinds.size()]
+			if not _scatter_kind_mesh.has(kind):
+				continue
+			var wx: float = r.cx + r.rx * lat
+			var wz: float = r.cz + r.rz * lat
+			var wy: float = _carved_height(r.d, lat, rh)
+			var s: float = rng.randf_range(0.8, 1.6) * float(_scatter_kind_scale.get(kind, 1.0))
+			var b := Basis(Vector3.UP, rng.randf() * TAU).scaled(Vector3(s, s, s))
+			buckets[kind].append(Transform3D(b, Vector3(wx, wy, wz)))
+	for kind in buckets.keys():
+		var xforms: Array = buckets[kind]
+		if xforms.is_empty():
+			continue
+		var mm := MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.mesh = _scatter_kind_mesh[kind]
+		mm.instance_count = xforms.size()
+		for i in range(xforms.size()):
+			mm.set_instance_transform(i, xforms[i])
+		var mmi := MultiMeshInstance3D.new()
+		mmi.multimesh = mm
+		mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		mmi.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
+		container.add_child(mmi)
 
 func _quad(st: SurfaceTool, a: Vector3, b: Vector3, c: Vector3, d: Vector3, ca: Color, cb: Color, cc: Color, cd: Color) -> void:
 	st.set_color(ca); st.add_vertex(a)

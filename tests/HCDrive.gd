@@ -3,9 +3,13 @@ var _f := 0; var _car: RigidBody3D; var _root: Node
 var _streak := 0; var _maxstreak := 0
 var _wings := false
 func _ready() -> void:
+	# the title screen pauses the whole tree at boot — run through it and dismiss it,
+	# or _physics_process never ticks and the probe hangs forever
+	process_mode = Node.PROCESS_MODE_ALWAYS
 	_root = load("res://scenes/HillClimb.tscn").instantiate()
 	add_child(_root)
 	await get_tree().process_frame
+	if _root.has_method("_begin_game"): _root.call("_begin_game")
 	for c in _root.get_children():
 		if c is RigidBody3D: _car = c
 	_wings = OS.get_cmdline_user_args().has("wings")
