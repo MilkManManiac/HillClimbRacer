@@ -23,6 +23,21 @@ Design pillars (in priority order):
    all-drift sprint against the clock, big-air snow ridge. More flavors welcome.
 5. **Session-friendly.** Death → shop → retry in seconds. No friction.
 
+## Update (2026-07-03, third pass — "HC v5")
+
+- **Random pop/hop bug fixed** (anti-tunnel floor now per-corner with a 0.35 m dead-band);
+  smoothness baseline improved — gates are now vert rms ≤ 3.0 / jerk ≤ 0.6 (see CLAUDE.md).
+- **Clean-landing math**: damage vs the surface NORMAL, flat-landing vs the slope, and a
+  ski-jump landing profile (steepest at the lip, easing to grade, longer catch on wider
+  gaps). Riding a landing downslope is free at any speed — bot finishes hills at ~96 hp.
+- **All 5 procedural bodies detailed** (seams/lights/mirrors/plates + per-ride character)
+  and every car has real SpotLight3D headlights behind `set_headlights(on)`.
+- **4th map: Midnight Run** — neon night cruise (per-map `night: true` flag drives
+  headlights + a night env branch in `_tune_arcade_environment`). Map switches now
+  correctly re-apply sky colors (was a latent bug).
+- Owner has still not play-approved canyon/alpine/midnight — that's the standing ask.
+  Audio remains the top roadmap item after that.
+
 ## Update (2026-07-03, second pass — "HC v4")
 
 Since the list below was written, these shipped and verified:
