@@ -122,12 +122,31 @@ var gaps_cleared: int = 0
 var _gap_armed: bool = false    # airborne over a void, outcome pending
 var _falling_out: bool = false  # fell in; awaiting respawn (suspends anti-tunnel)
 
+# --- damage panel-shedding (procedural bodies only; see _check_panel_shed) ---
+var _prev_health: float = 100.0             # last frame's health, to detect threshold crossings
+var _shed_panels: Array[MeshInstance3D] = []  # originals hidden by shedding (un-hidden on reset_run)
+var _shed_flying: Array[MeshInstance3D] = []  # free-flying clones currently animating (tracked so a
+                                               # run reset can force-clear them early)
+var _panel_pop: GPUParticles3D                # small dust/spark puff at the detach point
+var _shed_clone_script: GDScript              # lazily-built self-contained tumble/fade script (see
+                                               # _get_shed_clone_script) so clones keep animating and
+                                               # free themselves even if the car node itself is freed
+                                               # (vehicle swap)
+
 # --- vehicle identity --------------------------------------------------------
 # Which ride this body is. Set by HCMain BEFORE add_child (so _ready builds the
 # right geometry). HCMain.VEHICLES holds the handling/economy tuning; VSPEC here
 # holds just the structural geometry (mass, collision box, wheel track) so the
 # two stay decoupled. Switch vehicles = HCMain frees & recreates the car node.
 @export var vehicle_type: String = "hotrod"
+# Optional imported shell: path to a .glb in assets/car/ (set by HCMain BEFORE
+# add_child, like vehicle_type; "" = the procedural panel body). Physics model is
+# untouched — but if the asset names its wheel nodes, the ray/wheel stance
+# auto-fits to the model's real wheel positions so the body never hovers over
+# misplaced wheels. Falls back to the procedural body if the file fails to load.
+@export var body_glb: String = ""
+const HCCarBody := preload("res://scripts/hc/HCCarBody.gd")
+var _glb_top: float = 0.0   # imported shell's roof height (car-local); 0 = procedural body
 # INVARIANT: the box bottom (col_y - col.y/2) MUST sit BELOW the wheel-ray origin
 # (local y=0.5). If the box catches the car deeper than that, the ray origins drop
 # under the ground when the car bottoms out, the rays stop seeing ground, the
@@ -174,6 +193,7 @@ func _ready() -> void:
 	apply_com()   # per-vehicle CoM height (tippy rides ride higher/heavier up top)
 	fuel = max_fuel
 	health = max_health
+	_prev_health = max_health
 	_build_collision()
 	_build_rays()
 	_build_springs()
@@ -409,6 +429,12 @@ func _physics_process(delta: float) -> void:
 
 	_animate_surfaces(delta)
 
+	# --- damage panel-shedding: pop small body panels at HP thresholds --------
+	# telegraphs health without reading the HUD; funny on a stacked-panel car. Must
+	# run AFTER _animate_surfaces per CLAUDE.md (nothing touches the suspension/ground
+	# block above), and is purely visual so it's fine to sit in the FX section.
+	_check_panel_shed()
+
 	# --- smoke: tire smoke while drifting, exhaust while on the gas / boosting ---
 	# tire smoke rides the ACTUAL (suspension-compressed) rear wheel positions, and its
 	# initial velocity scales with current speed so a fast drift kicks a bigger plume
@@ -608,6 +634,21 @@ func reset_run(start: Vector3) -> void:
 	angular_velocity = Vector3.ZERO
 	global_transform = Transform3D(Basis(), start)
 	reset_physics_interpolation()
+	_restore_shed_panels()   # full health again -> put the panels back on
+
+## Un-hide every panel shedding hid, clear the shed-tracking list, drop the
+## threshold memory back to full health, and free any clones still tumbling
+## through the air (a reset mid-flight shouldn't leave orphaned FX).
+func _restore_shed_panels() -> void:
+	for mi in _shed_panels:
+		if is_instance_valid(mi):
+			mi.visible = true
+	_shed_panels.clear()
+	for c in _shed_flying:
+		if is_instance_valid(c):
+			c.queue_free()
+	_shed_flying.clear()
+	_prev_health = max_health
 
 func get_speed_kmh() -> float: return linear_velocity.length() * 3.6
 
@@ -696,6 +737,10 @@ func respawn_at(z: float) -> void:
 	_air_time = 0.0
 	_flip_accum = 0.0
 	reset_physics_interpolation()
+	# NOTE: health is NOT restored on a checkpoint respawn (only reset_run does that),
+	# so shed panels intentionally stay off — the car should still look as beat-up as
+	# its HP says. Any clones still tumbling from the wipeout keep animating/self-free
+	# on their own timer regardless (see _get_shed_clone_script).
 
 # --- build -------------------------------------------------------------------
 
@@ -780,6 +825,23 @@ func apply_suspension(level: int) -> void:
 ## (baked into apply_wings/apply_rockets/apply_engine) or set directly here for the
 ## visibility-only parts (cage / cans / air-brake) whose apply_* never touch scale.
 func _fit_parts() -> void:
+	# imported shell: only the HEIGHTS need refitting (footprint already matches the
+	# vehicle's collision box, but the roof can sit anywhere) — lift the bolt-ons so
+	# wings/rockets/cage land ON the model instead of inside it, then stop; the
+	# monster's hand-tuned block below is for its procedural hull only.
+	if _glb_top > 0.0:
+		var ppy: float = clampf(_glb_top / 1.25, 0.85, 2.2)   # 1.25 = procedural hot-rod roofline
+		var gmove: Array = []
+		gmove.append_array(_wings)
+		gmove.append_array(_rockets)
+		for c in _cans:
+			gmove.append(c)
+		for n in [_rudder, _engine, _airbrake, _cage]:
+			if n:
+				gmove.append(n)
+		for n in gmove:
+			n.position.y *= ppy
+		return
 	if vehicle_type != "monster":
 		return
 	var pp := Vector3(1.5, 1.65, 1.4)   # mirror the hull scale so parts track the body
@@ -899,6 +961,60 @@ func _panel(parent: Node3D, size: Vector3, pos: Vector3, col: Color, rough := 0.
 	parent.add_child(mi)
 	return mi
 
+## Imported GLB shell: fitted to this vehicle's collision footprint, matted so AI/
+## photoreal PBR doesn't read "wet" next to the flat-shaded world, asset wheels
+## hidden (the game animates its own suspension wheels), and — when the asset names
+## its wheel nodes — the ray/wheel stance re-anchored to the model's real wheels.
+## Returns false on any load problem so _build_body falls back to procedural.
+func _build_glb_body() -> bool:
+	var wrapper: Node3D = HCCarBody.load_body(body_glb, Vector3(_vs.col.x, _vs.col.y, _vs.col.z))
+	if wrapper == null:
+		push_warning("HCCar: failed to load body glb '%s' — using procedural body" % body_glb)
+		return false
+	HCCarBody.matte_materials(wrapper)
+	var winfo: Array[Dictionary] = HCCarBody.wheel_info(wrapper)
+	HCCarBody.hide_wheels(wrapper)
+	# rest the shell's floor on the chassis at the collision box's bottom face
+	var bottom: float = float(_vs.col_y) - _vs.col.y * 0.5
+	wrapper.position = Vector3(0, bottom, 0)
+	_body.add_child(wrapper)
+	_glb_top = bottom + HCCarBody.body_aabb(wrapper).size.y * wrapper.scale.y
+	_fit_wheels_to_body(winfo, bottom)
+	return true
+
+## Re-anchor the four wheel rays/visuals to the imported model's wheel positions
+## (footprint only — the ray origin stays at local y=0.5, the suspension frame).
+## Skipped when the asset has no named wheels (e.g. wheel-less Tripo bodies): the
+## VSPEC stance is already correct for those. Spares (5th wheel on a tailgate) are
+## dropped by keeping the 4 LOWEST wheels.
+func _fit_wheels_to_body(winfo: Array[Dictionary], bottom: float) -> void:
+	if winfo.size() < 4 or _rays.size() < 4:
+		return
+	winfo.sort_custom(func(a, b): return a.center.y < b.center.y)
+	var four: Array = winfo.slice(0, 4)
+	# order to match _wheel_positions: [FL, FR, RL, RR]; forward = -Z
+	four.sort_custom(func(a, b): return a.center.z < b.center.z)
+	var front: Array = [four[0], four[1]]
+	var rear: Array = [four[2], four[3]]
+	front.sort_custom(func(a, b): return a.center.x < b.center.x)
+	rear.sort_custom(func(a, b): return a.center.x < b.center.x)
+	var ordered: Array = [front[0], front[1], rear[0], rear[1]]
+	# degenerate wheel layout (all clustered — mis-named nodes)? keep the VSPEC stance
+	if absf(float(rear[0].center.z) - float(front[0].center.z)) < 1.0:
+		return
+	for i in range(4):
+		var c: Vector3 = ordered[i].center
+		_wheel_positions[i] = Vector3(c.x, 0.5, c.z)
+		_rays[i].position = _wheel_positions[i]
+	wheelbase = maxf(absf(float(rear[0].center.z) - float(front[0].center.z)), 1.6)
+	var r_avg := 0.0
+	for w in ordered:
+		r_avg += float(w.radius)
+	# base radius from the asset so the game wheels sit flush in its arches (the
+	# Bigger Wheels upgrade re-applies over this later — gameplay owns final size)
+	wheel_radius = clampf(r_avg / 4.0, 0.3, 0.75)
+	apply_wheel_size()
+
 ## Open-top CONVERTIBLE hot-rod built from panels so the driver is visible and the
 ## whole body scales cleanly for the Stretch/Wide upgrades. Faces -Z.
 ## Composed from many stepped boxes/prisms + chrome trim, lights, fenders, bumpers,
@@ -906,6 +1022,8 @@ func _panel(parent: Node3D, size: Vector3, pos: Vector3, col: Color, rough := 0.
 func _build_body() -> void:
 	_body = Node3D.new()
 	add_child(_body)
+	if body_glb != "" and _build_glb_body():
+		return   # imported shell in place; procedural panels skipped
 	match vehicle_type:
 		"monster":
 			_build_monster_body(); return
@@ -1724,6 +1842,9 @@ func _build_dust() -> void:
 	_dust = _make_dust(24, 0.6, 1.5, 3.5, 65.0, 0.4, 1.0, 0.6)          # soft touchdown
 	_dust_big = _make_dust(46, 0.95, 3.0, 6.0, 72.0, 0.75, 1.7, 0.72)   # hard impact
 	_build_ring_puff()
+	# small, subtle pop at a panel's spot the instant it detaches — reuses the same
+	# dust-puff shape/material as landings, just tiny, so it doesn't need its own asset.
+	_panel_pop = _make_dust(10, 0.4, 1.0, 2.4, 55.0, 0.12, 0.3, 0.5)
 
 ## A brief expanding ring of dust that hugs the ground — only fires on the really
 ## hard landings. Uses an emission RING (flat, at ground level) with radial
@@ -1762,6 +1883,136 @@ func _build_ring_puff() -> void:
 	qm.material = dm
 	_ring_puff.draw_pass_1 = qm
 	add_child(_ring_puff)
+
+# --- damage panel-shedding ----------------------------------------------------
+## Health-threshold panel pops: 2 panels fly off crossing below 70% HP, 3 more
+## below 40%, 3 more below 20%. Skipped entirely for imported-GLB bodies (single
+## mesh — nothing small to detach) and for parametric bodies with no _body built
+## yet. Compares against _prev_health so each threshold fires once per DOWNWARD
+## crossing; healing back above a line (a cleared gap) and dropping through it
+## again is allowed to pop more panels — that's the intended "still taking a
+## beating" read, not a bug.
+func _check_panel_shed() -> void:
+	if _glb_top > 0.0 or _body == null:
+		return
+	var frac: float = health / max_health if max_health > 0.0 else 0.0
+	var prev_frac: float = _prev_health / max_health if max_health > 0.0 else 0.0
+	if prev_frac >= 0.70 and frac < 0.70:
+		_shed_n_panels(2)
+	if prev_frac >= 0.40 and frac < 0.40:
+		_shed_n_panels(3)
+	if prev_frac >= 0.20 and frac < 0.20:
+		_shed_n_panels(3)
+	_prev_health = health
+
+## Pop up to n eligible panels (fewer if the body's running low on small ones —
+## the main tub/hood are never eligible, so this can't strip the car bare).
+func _shed_n_panels(n: int) -> void:
+	var candidates := _collect_shed_candidates()
+	for i in range(n):
+		if candidates.is_empty():
+			break
+		var idx := randi() % candidates.size()
+		var mi: MeshInstance3D = candidates[idx]
+		candidates.remove_at(idx)
+		_shed_panel(mi)
+
+## Every MeshInstance3D under _body that's small enough to plausibly be a bolt-on
+## panel (not the tub/hood), isn't glass, and hasn't already been shed.
+func _collect_shed_candidates() -> Array[MeshInstance3D]:
+	var out: Array[MeshInstance3D] = []
+	_collect_mesh_children(_body, out)
+	return out
+
+func _collect_mesh_children(node: Node, out: Array[MeshInstance3D]) -> void:
+	for c in node.get_children():
+		if c is MeshInstance3D and _panel_eligible(c) and not _shed_panels.has(c):
+			out.append(c)
+		if c.get_child_count() > 0:
+			_collect_mesh_children(c, out)
+
+## SMALL only (world-space AABB volume < ~0.35 m^3) so the main tub/hood can
+## never vanish, and skip glass (a missing windshield reads as a hole, not damage).
+func _panel_eligible(mi: MeshInstance3D) -> bool:
+	if mi.mesh == null or not mi.visible:
+		return false
+	var mat := mi.material_override as StandardMaterial3D
+	if mat and mat.transparency != BaseMaterial3D.TRANSPARENCY_DISABLED:
+		return false
+	var sz := mi.mesh.get_aabb().size
+	var sc := mi.global_transform.basis.get_scale()
+	var vol: float = (sz.x * sc.x) * (sz.y * sc.y) * (sz.z * sc.z)
+	return vol > 0.0005 and vol < 0.35
+
+## Hide the real panel, remember it for reset_run to restore, spawn its free-flying
+## clone, and pop a small dust puff at the detach point.
+func _shed_panel(mi: MeshInstance3D) -> void:
+	if not is_instance_valid(mi):
+		return
+	mi.visible = false
+	_shed_panels.append(mi)
+	_spawn_shed_clone(mi)
+	if _panel_pop:
+		_panel_pop.global_position = mi.global_position
+		_panel_pop.restart()
+
+## A one-shot self-contained visual: a plain clone of the panel's mesh/material,
+## parented to the CAR'S PARENT (not the car) at the panel's world transform, with
+## its own tiny script driving gravity + tumble + a sink-out over ~2.5s. No
+## RigidBody3D — pure visual, zero physics cost, can't collide with anything.
+## Parenting off the car (and giving it its own _process) means it keeps animating
+## and frees itself on schedule even if the car node is freed mid-flight (vehicle
+## swap) or the car dies (freeze) — it never depends on the car existing.
+func _spawn_shed_clone(mi: MeshInstance3D) -> void:
+	var host := get_parent()
+	if host == null:
+		return
+	var clone := MeshInstance3D.new()
+	clone.mesh = mi.mesh
+	clone.material_override = mi.material_override
+	clone.global_transform = mi.global_transform
+	clone.set_script(_get_shed_clone_script())
+	host.add_child(clone)
+	var away: Vector3 = mi.global_position - global_position
+	away.y = 0.0
+	if away.length() < 0.05:
+		away = Vector3(randf() - 0.5, 0.0, randf() - 0.5)
+	away = away.normalized()
+	# fly up/backward relative to the car's own velocity (a panel pops off and gets
+	# left behind), plus an outward kick so a panel from the left flank flies left.
+	clone.set("vel", -linear_velocity * 0.35 + Vector3.UP * randf_range(3.0, 5.5) + away * randf_range(1.5, 3.5))
+	clone.set("spin", Vector3(randf_range(-9.0, 9.0), randf_range(-9.0, 9.0), randf_range(-9.0, 9.0)))
+	clone.set("life", 2.5)
+	_shed_flying.append(clone)
+
+## Lazily-built script for shed-panel clones: gravity + tumble + shrink-to-nothing
+## (cheaper than fading alpha, which would need a duplicated/unique material per
+## clone) then queue_free. Runs on _process (not _physics_process) so it's fully
+## independent of the car's RigidBody3D — it doesn't care if the car freezes, dies,
+## or is freed entirely.
+func _get_shed_clone_script() -> GDScript:
+	if _shed_clone_script == null:
+		var gs := GDScript.new()
+		gs.source_code = "extends MeshInstance3D\n" \
+			+ "var vel: Vector3 = Vector3.ZERO\n" \
+			+ "var spin: Vector3 = Vector3.ZERO\n" \
+			+ "var age: float = 0.0\n" \
+			+ "var life: float = 2.5\n" \
+			+ "func _process(delta: float) -> void:\n" \
+			+ "\tage += delta\n" \
+			+ "\tvel.y -= 9.0 * delta\n" \
+			+ "\tglobal_position += vel * delta\n" \
+			+ "\trotate_x(spin.x * delta)\n" \
+			+ "\trotate_y(spin.y * delta)\n" \
+			+ "\trotate_z(spin.z * delta)\n" \
+			+ "\tif age > life * 0.6:\n" \
+			+ "\t\tvar t: float = clampf((age - life * 0.6) / (life * 0.4), 0.0, 1.0)\n" \
+			+ "\t\tscale = Vector3.ONE * (1.0 - t)\n" \
+			+ "\tif age >= life:\n" \
+			+ "\t\tqueue_free()\n"
+		gs.reload()
+		_shed_clone_script = gs
+	return _shed_clone_script
 
 # --- tire + exhaust smoke ----------------------------------------------------
 ## A reusable billowing-smoke emitter (starts off; toggled each frame).

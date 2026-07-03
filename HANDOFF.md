@@ -23,7 +23,36 @@ Design pillars (in priority order):
    all-drift sprint against the clock, big-air snow ridge. More flavors welcome.
 5. **Session-friendly.** Death → shop → retry in seconds. No friction.
 
-## Where it stands today (2026-07-03)
+## Update (2026-07-03, second pass — "HC v4")
+
+Since the list below was written, these shipped and verified:
+- **Persistence**: money/upgrades/vehicles/cosmetics/map/best-distances/body-kits save to
+  `user://hc_save.json` (disabled under headless so probes stay hermetic).
+- **GLB body kits, end-to-end**: Garage tab picker cycles any .glb in assets/car/ onto the
+  active ride; wheel stance auto-fits to the model's named wheels; AI-glossy materials
+  auto-matted; procedural fallback on bad files. (`HCCar._build_glb_body`, `tests/BodyKitProbe`.)
+- **THE COLOR FIX**: ground vertex colors were rendering several stops too bright —
+  `vertex_color_is_srgb` was missing on the road/rail materials. The entire art direction
+  was hiding behind that flag. Road markings are now real overlay-strip geometry
+  (`_build_lines`) instead of smeared vertex paint. If you add a vertex-colored
+  material, SET `vertex_color_is_srgb = true`.
+- **Auto-driver bot** (`tests/AutoDrive.tscn`): plays all 3 maps unattended, reports
+  distance/fuel/hp/cause-of-death. Use it to validate any tuning change.
+- **Bot-driven tuning**: sprint checkpoints now REFUEL (+40% tank) and PAY (escalating cash)
+  — a stock van chains them (992 m vs 698 m before); alpine's first jumps softened
+  (start 340 m, rise 6.0, width 24) but a no-air-control bot still dies there — HUMAN
+  playtest still needed; per-vehicle `speed_cap` ends the maxed-F1 ~184 m/s runaway.
+- **Damage juice**: body panels visibly fly off at 70/40/20% health (procedural bodies
+  only; restored on retry). **Chevron warning signs** on the outside of bends.
+- Visual harnesses: `tests/KitShot.tscn` / `tests/MapShot.tscn` render real-camera PNGs
+  (run WITHOUT --headless). Probes that boot the game must `set("save_enabled", false)`
+  unless testing saves.
+
+Roadmap deltas: items 2 (GLB garage) and 5 (persistence) are DONE; item 1 is bot-tuned but
+awaits the owner's play-approval; **item 3 (audio) is now the top priority**, then 4
+(tricks/combo), 6 (pause/settings), 7 (world variety), 8 (contraptions).
+
+## Where it stands today (2026-07-03, first pass)
 
 Shipped and verified (all tests green — see CLAUDE.md battery):
 - **Buttery driving**: analytic-ground suspension (no trimesh contact for wheels), fixed

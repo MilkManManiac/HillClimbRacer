@@ -41,11 +41,15 @@ const MAPS := {
 		},
 	},
 	"alpine": {
-		"name": "Alpine Ridge", "desc": "Big snowy hills, big-air jumps — send it.",
+		"name": "Alpine Ridge", "desc": "Big snowy hills, big-air jumps — bring suspension upgrades.",
 		"mode": "classic", "sky_time": 0.45,
 		"overrides": {
+			# bot-tuned (tests/AutoDrive.gd): the old 240 m / rise-8.5 first jump zeroed a
+			# stock car's health on its first landing — later start, lower kick, longer
+			# landing downslope keep it BIG but survivable
 			"hill_amp": 14.0, "straight_bias": 0.7, "turn_radius_min": 50.0, "turn_radius_max": 95.0,
-			"gap_start": 240.0, "gap_spacing": 230.0, "gap_ramp_rise": 8.5, "noise_frequency": 0.0034,
+			"gap_start": 340.0, "gap_spacing": 280.0, "gap_ramp_rise": 6.0, "gap_land_len": 75.0,
+			"gap_base_width": 24.0, "gap_grow": 12.0, "noise_frequency": 0.0034,
 			"path_seed": 1337, "noise_seed": 2026,
 			"grass_color": Color(0.88, 0.90, 0.94), "asphalt_color": Color(0.10, 0.10, 0.12),
 			"centre_line_color": Color(0.85, 0.4, 0.2), "edge_line_color": Color(0.25, 0.3, 0.4),
@@ -61,13 +65,20 @@ const MAPS := {
 }
 const MAP_KEYS := ["hills", "canyon", "alpine"]
 var _map := "hills"
+var _best := {}            # map_key -> best distance (m) reached on that map, persisted
 var _map_btns := {}       # key -> Button (title-screen row)
 var _map_row_lbl: Label   # shop/death-screen "MAP: <name>" readout
 
 # --- sprint mode (mode "sprint" — race the clock) -------------------------
-const SPRINT_TIME := 40.0        # starting countdown (s)
+# Bot-tuned (tests/AutoDrive.gd data): a stock car burns its tank mid-run and coasts
+# to a clock death — so checkpoints REFUEL as well as add time, making the sprint a
+# self-sustaining chain you keep alive by pace, and they PAY so the mode earns money.
+const SPRINT_TIME := 45.0        # starting countdown (s)
 const SPRINT_CHECKPOINT_M := 350.0
-const SPRINT_BONUS_S := 15.0
+const SPRINT_BONUS_S := 18.0
+const SPRINT_FUEL_FRAC := 0.4    # tank fraction refilled per checkpoint
+const SPRINT_CASH_BASE := 100    # checkpoint payout: base + step per checkpoint index
+const SPRINT_CASH_STEP := 50
 var _sprint_active := false
 var _sprint_time := 0.0
 var _sprint_next_checkpoint := 0.0
@@ -118,7 +129,7 @@ const VEHICLES := {
 		"name": "Rust-Bucket Van", "price": 0,
 		"desc": "The free starter. Slow, soft and boxy with wide floaty turns — you'll want out of it fast. Every upgrade (and the next ride) feels like a huge step up.",
 		"engine_base": 6000.0, "engine_per": 3000.0,
-		"speed_base": 16.0, "speed_per": 8.0,
+		"speed_base": 16.0, "speed_per": 8.0, "speed_cap": 40.0,
 		"fuel_base": 90.0, "fuel_per": 48.0, "fuel_burn": 1.1,
 		"land_base": 8.0, "susp_rest": 0.6, "susp_per": 0.16, "wheel_rad": 0.46, "wheel_per": 0.1,
 		"health_base": 95.0, "grip": 7.5, "gravity": 17.0, "steer": 0.36, "corner_grip": 15.0,
@@ -129,7 +140,7 @@ const VEHICLES := {
 		"name": "Hot Rod", "price": 1200,
 		"desc": "Balanced convertible — light, quick, corners well, gets big air. The first real upgrade over the van.",
 		"engine_base": 8000.0, "engine_per": 3600.0,
-		"speed_base": 24.0, "speed_per": 12.0,
+		"speed_base": 24.0, "speed_per": 12.0, "speed_cap": 55.0,
 		"fuel_base": 70.0, "fuel_per": 44.0, "fuel_burn": 1.0,
 		"land_base": 9.0, "susp_rest": 0.55, "susp_per": 0.18, "wheel_rad": 0.5, "wheel_per": 0.12,
 		"health_base": 100.0, "grip": 8.5, "gravity": 17.0, "steer": 0.4, "corner_grip": 24.0,
@@ -140,7 +151,7 @@ const VEHICLES := {
 		"name": "Monster Truck", "price": 3200,
 		"desc": "Giant heavy 4x4 — climbs anything, tanky, huge air with rockets, but slow, thirsty and TERRIBLE in corners (wide + tippy). Dinky wheels that the Bigger Wheels upgrade makes RIDICULOUS.",
 		"engine_base": 15000.0, "engine_per": 5400.0,
-		"speed_base": 22.0, "speed_per": 10.0,
+		"speed_base": 22.0, "speed_per": 10.0, "speed_cap": 45.0,
 		"fuel_base": 100.0, "fuel_per": 52.0, "fuel_burn": 1.5,
 		"land_base": 11.0, "susp_rest": 0.85, "susp_per": 0.34, "wheel_rad": 0.5, "wheel_per": 0.38,
 		"health_base": 165.0, "grip": 12.0, "gravity": 20.0, "steer": 0.34, "corner_grip": 14.0,
@@ -151,7 +162,7 @@ const VEHICLES := {
 		"name": "Sports Car", "price": 5500,
 		"desc": "Low, wide and grippy — the corner carver. Fast, sharp turns, made for the winding road. Not much air.",
 		"engine_base": 12000.0, "engine_per": 4200.0,
-		"speed_base": 40.0, "speed_per": 16.0,
+		"speed_base": 40.0, "speed_per": 16.0, "speed_cap": 75.0,
 		"fuel_base": 75.0, "fuel_per": 42.0, "fuel_burn": 1.15,
 		"land_base": 10.0, "susp_rest": 0.45, "susp_per": 0.14, "wheel_rad": 0.5, "wheel_per": 0.11,
 		"health_base": 95.0, "grip": 10.0, "gravity": 17.0, "steer": 0.42, "corner_grip": 32.0,
@@ -162,7 +173,7 @@ const VEHICLES := {
 		"name": "F1 Car", "price": 13000,
 		"desc": "Open-wheel track weapon — razor-sharp cornering and blistering top speed, but fragile and slammed to the ground. Master of the road, awful everywhere else.",
 		"engine_base": 21000.0, "engine_per": 6000.0,
-		"speed_base": 64.0, "speed_per": 20.0,
+		"speed_base": 64.0, "speed_per": 20.0, "speed_cap": 95.0,
 		"fuel_base": 65.0, "fuel_per": 38.0, "fuel_burn": 1.3,
 		"land_base": 9.0, "susp_rest": 0.35, "susp_per": 0.1, "wheel_rad": 0.55, "wheel_per": 0.1,
 		"health_base": 75.0, "grip": 15.0, "gravity": 17.0, "steer": 0.46, "corner_grip": 74.0,
@@ -173,6 +184,15 @@ const VEHICLES := {
 }
 const VEH_KEYS := ["minivan", "hotrod", "monster", "sports", "f1"]
 var _vehicle := "minivan"
+
+# --- body kits: optional imported GLB shell per vehicle ("" = procedural body) ----
+# Options are scanned from assets/car/*.glb at boot, picked in the Garage tab, and
+# persisted. Physics is untouched — HCCar auto-fits its wheel stance to the model
+# (see HCCar.body_glb / _build_glb_body). Drop new .glb files in assets/car/ (specs
+# in assets/car/README.md) and they appear in the picker on next boot.
+var _body_kits := {}                       # vehicle key -> glb path ("" = stock)
+var _kit_options: Array[String] = [""]     # "" (stock) + every assets/car/*.glb
+var _kit_lbl: Label                        # garage "BODY KIT" readout
 var _owned := {"minivan": true, "hotrod": false, "monster": false, "sports": false, "f1": false}
 var _was_dead := false
 var _respawning := false
@@ -236,11 +256,134 @@ var _speed_lines: Control              # full-screen streak overlay (mouse-ignor
 var _speed_line_nodes: Array[Line2D] = []
 var _speed_lines_size := Vector2.ZERO  # viewport size the streaks were laid out for
 
+# --- persistence ---------------------------------------------------------------
+# Schema v1: {"version", "money", "levels" (vehicle_key -> {upgrade_key: int}),
+# "owned" ([vehicle_key,...]), "vehicle", "cosm_owned" ([cosm_key,...]),
+# "cosm_color" (cosm_key -> "#rrggbb"), "map", "best" (map_key -> float metres)}.
+# _collect_save() / _apply_save() are the single choke point for the schema — adding
+# a field later is "write it in one, read it with .get(key, fallback) in the other."
+const SAVE_PATH := "user://hc_save.json"
+## Persistence is OFF under the headless driver so the verification battery stays
+## hermetic — otherwise MapProbe ending on Alpine writes map=alpine and the next
+## SmoothProbe boots onto the jump map and blows its rms gates (and headless probes
+## would trash the developer's real save). Real play is never headless; SaveProbe
+## opts back in with `root.set("save_enabled", true)` BEFORE add_child — the same
+## pre-_ready override window the map system uses.
+var save_enabled := DisplayServer.get_name() != "headless"
+
+## Snapshot everything that should survive a restart into a plain Dictionary (mirrors
+## _apply_save). Colors serialize as "#rrggbb" html strings, not Godot Color objects —
+## JSON has no native Color type.
+func _collect_save() -> Dictionary:
+	var levels_out := {}
+	for vk in VEH_KEYS:
+		levels_out[vk] = _all_levels[vk].duplicate()
+	var owned_out := []
+	for vk in VEH_KEYS:
+		if bool(_owned.get(vk, false)):
+			owned_out.append(vk)
+	var cosm_owned_out := []
+	for ck in COSM_KEYS:
+		if bool(_cosm_owned.get(ck, false)):
+			cosm_owned_out.append(ck)
+	var cosm_color_out := {}
+	for ck in COSM_KEYS:
+		cosm_color_out[ck] = (_cosm_color[ck] as Color).to_html(false)   # no alpha channel
+	var best_out := {}
+	for mk in _best:
+		best_out[mk] = _best[mk]
+	return {
+		"version": 1,
+		"money": money,
+		"levels": levels_out,
+		"owned": owned_out,
+		"vehicle": _vehicle,
+		"cosm_owned": cosm_owned_out,
+		"cosm_color": cosm_color_out,
+		"map": _map,
+		"best": best_out,
+		"body_kits": _body_kits.duplicate(),
+	}
+
+## Merge a loaded save dict onto the in-memory defaults. EVERY read goes through
+## `.get(key, fallback)` so a save missing newer fields (an older version) still loads
+## cleanly instead of erroring — this is what makes adding fields later a one-line change.
+func _apply_save(d: Dictionary) -> void:
+	money = int(d.get("money", money))
+	var levels_in: Dictionary = d.get("levels", {})
+	for vk in VEH_KEYS:
+		if levels_in.has(vk):
+			var lv: Dictionary = levels_in[vk]
+			for k in UP_KEYS:
+				_all_levels[vk][k] = int(lv.get(k, _all_levels[vk][k]))
+	var owned_in: Array = d.get("owned", [])
+	for vk in owned_in:
+		if _owned.has(vk):
+			_owned[vk] = true
+	var veh_in: String = str(d.get("vehicle", _vehicle))
+	if VEHICLES.has(veh_in):
+		_vehicle = veh_in
+	_levels = _all_levels[_vehicle]   # re-point at the (possibly restored) active ride's tree
+	var cosm_owned_in: Array = d.get("cosm_owned", [])
+	for ck in cosm_owned_in:
+		if _cosm_owned.has(ck):
+			_cosm_owned[ck] = true
+	var cosm_color_in: Dictionary = d.get("cosm_color", {})
+	for ck in COSM_KEYS:
+		if cosm_color_in.has(ck):
+			_cosm_color[ck] = Color.html(str(cosm_color_in[ck]))
+	var map_in: String = str(d.get("map", _map))
+	if MAPS.has(map_in):
+		_map = map_in
+	var best_in: Dictionary = d.get("best", {})
+	for mk in best_in:
+		_best[mk] = float(best_in[mk])
+	# body kits: only accept paths that still exist in assets/car/ (scanned into
+	# _kit_options before load) so a deleted .glb falls back to the stock body
+	var kits_in: Dictionary = d.get("body_kits", {})
+	for vk in kits_in:
+		if VEHICLES.has(vk) and _kit_options.has(str(kits_in[vk])):
+			_body_kits[vk] = str(kits_in[vk])
+
+## Write the full save snapshot to disk. Cheap enough to call on every purchase/switch/
+## death — it's a few hundred bytes of JSON, not a hot-path concern.
+func _save_game() -> void:
+	if not save_enabled:
+		return
+	var f := FileAccess.open(SAVE_PATH, FileAccess.WRITE)
+	if f == null:
+		return   # e.g. read-only user dir — fail silent, in-memory play carries on
+	f.store_string(JSON.stringify(_collect_save()))
+	f.close()
+
+## Load persisted progress, if any. No file = fresh start (normal on first launch).
+## Corrupt/unparseable file = ALSO a silent fresh start — never crash or spam errors
+## over a bad save; the player just starts over as if it were new.
+func _load_game() -> void:
+	if not save_enabled:
+		return
+	if not FileAccess.file_exists(SAVE_PATH):
+		return
+	var f := FileAccess.open(SAVE_PATH, FileAccess.READ)
+	if f == null:
+		return
+	var txt := f.get_as_text()
+	f.close()
+	# a JSON instance (not JSON.parse_string) — parse_string ERR-prints on bad input,
+	# and a corrupt save must be a SILENT fresh start, not console spam
+	var json := JSON.new()
+	if json.parse(txt) != OK or typeof(json.data) != TYPE_DICTIONARY:
+		return
+	_apply_save(json.data)
+
 func _ready() -> void:
 	for ck in COSM_KEYS:
 		_cosm_color[ck] = COSMETICS[ck].default   # seed chosen colours from defaults
 	_setup_input()
 	_init_levels()
+	_scan_body_kits()   # before _load_game so a saved kit path can be validated
+	_load_game()   # restore money/levels/owned/vehicle/cosmetics/map/best BEFORE anything
+	               # below reads them — terrain (_map) and car (_vehicle) are built next
 	_setup_sky()
 	_setup_terrain_and_car()
 	_setup_camera()
@@ -250,6 +393,32 @@ func _ready() -> void:
 	_apply_upgrades()
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 	_build_start_menu()   # title + how-to-play; pauses the game until you hit START
+
+## Find every .glb in assets/car/ for the Garage's body-kit picker. Runtime-loaded
+## (GlbUtil), so files just dropped in the folder work without an editor import pass.
+func _scan_body_kits() -> void:
+	_kit_options = [""]
+	var dir := DirAccess.open("res://assets/car")
+	if dir == null:
+		return
+	for f in dir.get_files():
+		if f.get_extension().to_lower() == "glb":
+			_kit_options.append("res://assets/car/" + f)
+
+## Display name for a kit path: "Stock" or a cleaned-up filename.
+func _kit_name(path: String) -> String:
+	if path == "":
+		return "Stock"
+	return path.get_file().get_basename().replace("_", " ")
+
+## Cycle the ACTIVE vehicle's body kit and rebuild the car wearing it.
+func _cycle_body_kit() -> void:
+	if _audio:
+		_audio.call("play_click")
+	var cur: String = str(_body_kits.get(_vehicle, ""))
+	var i: int = _kit_options.find(cur)
+	_body_kits[_vehicle] = _kit_options[(i + 1) % _kit_options.size()]
+	_swap_vehicle(_vehicle)   # full rebuild in the new shell (+ saves + refreshes shop)
 
 func _input(event: InputEvent) -> void:
 	# works for keyboard (Enter/Tab) AND gamepad (Back / Start) via the input actions
@@ -386,6 +555,7 @@ func _setup_terrain_and_car() -> void:
 	_car = RigidBody3D.new()
 	_car.set_script(HCCarScript)
 	_car.set("vehicle_type", _vehicle)   # set BEFORE add_child so _ready builds the right ride
+	_car.set("body_glb", str(_body_kits.get(_vehicle, "")))   # imported shell, if one is picked
 	add_child(_car)
 	_car.set("road_half", _terrain.get("road_half") if USE_TRACK else _terrain.get("road_half_width"))
 	_car.set("terrain", _terrain)
@@ -408,7 +578,15 @@ func _setup_terrain_and_car() -> void:
 func _apply_map_overrides(terrain: Node3D) -> void:
 	var overrides: Dictionary = MAPS[_map].overrides
 	for k in overrides:
-		terrain.set(k, overrides[k])
+		if k == "scatter_kinds":
+			# the export is a TYPED Array[String]; set() silently rejects a plain Array
+			# (the canyon kept its pine trees this way) — rebuild it typed first
+			var arr: Array[String] = []
+			for p in overrides[k]:
+				arr.append(str(p))
+			terrain.set(k, arr)
+		else:
+			terrain.set(k, overrides[k])
 
 ## Called by the title-screen map row / shop "MAP" switcher (and MapProbe). Rebuilds
 ## the terrain fresh with the new map's overrides, respawns the car on it, and resets
@@ -452,6 +630,7 @@ func _apply_map() -> void:
 	_cam_look_ready = false
 	_was_dead = false
 	_update_map_row()
+	_save_game()   # persist the map selection
 	if _shop and _shop.visible:
 		_refresh_shop()
 
@@ -518,6 +697,10 @@ func _process(delta: float) -> void:
 		_was_dead = true
 		_last_earned = int(float(_car.get("distance")) * MONEY_PER_M * _cash_mult())
 		money += _last_earned
+		var dist_now: float = _car.get("distance")
+		if dist_now > float(_best.get(_map, 0.0)):
+			_best[_map] = dist_now   # new PB on this map
+		_save_game()   # persist the bank + best BEFORE the shop even opens
 		if _audio:
 			_audio.call("play_wreck")
 		_show_shop()
@@ -664,9 +847,16 @@ func _update_sprint(delta: float) -> void:
 		return
 	var dist: float = _car.get("distance")
 	if dist >= _sprint_next_checkpoint:
+		var cp_idx: int = int(_sprint_next_checkpoint / SPRINT_CHECKPOINT_M)   # 1-based
 		_sprint_next_checkpoint += SPRINT_CHECKPOINT_M
 		_sprint_time += SPRINT_BONUS_S
-		_car.set("trick_text", "+%ds  CHECKPOINT" % int(SPRINT_BONUS_S))
+		# refuel + pay: keeps the chain alive (fuel starved out mid-run otherwise) and
+		# makes sprint runs worth money beyond the distance payout
+		var mf: float = float(_car.get("max_fuel"))
+		_car.set("fuel", minf(float(_car.get("fuel")) + mf * SPRINT_FUEL_FRAC, mf))
+		var cash: int = int((SPRINT_CASH_BASE + SPRINT_CASH_STEP * (cp_idx - 1)) * _cash_mult())
+		money += cash
+		_car.set("trick_text", "CHECKPOINT  +%ds  ⛽  +$%d" % [int(SPRINT_BONUS_S), cash])
 		_car.set("_trick_timer", 2.0)
 		if _audio:
 			_audio.call("play_coin")
@@ -790,7 +980,10 @@ func _apply_upgrades() -> void:
 	# starter is intentionally weak/slow; upgrades ramp it up hard
 	_car.set("engine_force", float(v.engine_base) + _levels.engine * float(v.engine_per))
 	# AERODYNAMICS (was Stretch): slippier body — raises top speed (soft cap tracks it).
-	_car.set("max_speed", float(v.speed_base) + _levels.engine * float(v.speed_per) + _levels.stretch * 5.0)
+	# speed_cap = per-vehicle CEILING so maxed engines can't run away to absurd speeds
+	# (an engine-maxed F1 used to reach ~184 m/s); the ladder stays intact because each
+	# faster ride's cap sits above the previous one's.
+	_car.set("max_speed", minf(float(v.speed_base) + _levels.engine * float(v.speed_per) + _levels.stretch * 5.0, float(v.get("speed_cap", 60.0))))
 	if _car.has_method("apply_engine"):
 		_car.call("apply_engine", _levels.engine)
 	# fuel is the run timer — VERY low stock so you can barely move; two upgrades fix it:
@@ -1042,6 +1235,23 @@ func _build_shop() -> void:
 		if _first_veh_btn == null:
 			_first_veh_btn = vbuy
 		_veh_rows[vk] = {"label": vlbl, "buy": vbuy}
+	# --- BODY KIT: dress the active ride in an imported .glb shell -------------
+	list.add_child(HSeparator.new())
+	var khint := _shop_label(list, "BODY KIT — a 3-D model shell for the ACTIVE ride (free; drop .glb files into assets/car/). Wheels auto-fit to the model.", 13, Color(0.62, 0.64, 0.7))
+	khint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	var krow := HBoxContainer.new()
+	krow.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	krow.add_theme_constant_override("separation", 10)
+	list.add_child(krow)
+	_kit_lbl = Label.new()
+	_kit_lbl.add_theme_font_size_override("font_size", 16)
+	_kit_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	krow.add_child(_kit_lbl)
+	var kbtn := Button.new()
+	kbtn.text = "next kit ▸"
+	kbtn.custom_minimum_size = Vector2(110, 40)
+	kbtn.pressed.connect(_cycle_body_kit)
+	krow.add_child(kbtn)
 	# --- UPGRADES tab ----------------------------------------------------------
 	list = upgrade_list
 	for key in UP_KEYS:
@@ -1168,6 +1378,7 @@ func _build_shop() -> void:
 ## TEST-ONLY: dump a million dollars in the bank and refresh the shop.
 func _on_test_money() -> void:
 	money += 1000000
+	_save_game()
 	_refresh_shop()
 
 ## HOLD up/down (d-pad or arrow keys) to keep moving the shop focus, instead of tapping
@@ -1332,7 +1543,8 @@ var _shop_summary := ""
 
 func _show_shop() -> void:
 	_shop_header.text = "WRECKED!"
-	_shop_summary = "You reached %d m  —  earned +$%d this run" % [int(_car.get("distance")), _last_earned]
+	var best_m := int(float(_best.get(_map, 0.0)))
+	_shop_summary = "You reached %d m  —  earned +$%d this run\nBEST: %d m" % [int(_car.get("distance")), _last_earned, best_m]
 	_shop.visible = true
 	_refresh_shop()
 	# focus RETRY so a gamepad can just press A to go again (d-pad to browse upgrades)
@@ -1390,6 +1602,7 @@ func _swap_vehicle(vk: String) -> void:
 	_car = RigidBody3D.new()
 	_car.set_script(HCCarScript)
 	_car.set("vehicle_type", _vehicle)
+	_car.set("body_glb", str(_body_kits.get(_vehicle, "")))   # imported shell, if one is picked
 	add_child(_car)
 	_car.set("road_half", _terrain.get("road_half") if USE_TRACK else _terrain.get("road_half_width"))
 	_car.set("terrain", _terrain)
@@ -1408,6 +1621,7 @@ func _swap_vehicle(vk: String) -> void:
 	_cam_heading = Vector3(0, 0, -1)
 	_was_dead = false
 	_reset_sprint_state()
+	_save_game()   # persists both the purchase (if any) and the new active vehicle
 	if was_visible:
 		_refresh_shop()
 
@@ -1425,12 +1639,17 @@ func _fresh_start() -> void:
 	money = 0
 	_last_earned = 0
 	_shop_summary = ""
+	_best = {}
 	_init_levels()                                    # zero every vehicle's tree
 	_owned = {"minivan": true, "hotrod": false, "monster": false, "sports": false, "f1": false}
 	for ck in COSM_KEYS:
 		_cosm_owned[ck] = false
 		_cosm_color[ck] = COSMETICS[ck].default
+	_body_kits = {}   # back to stock shells on every ride
+	if save_enabled and FileAccess.file_exists(SAVE_PATH):
+		DirAccess.remove_absolute(SAVE_PATH)   # wipe the on-disk save, not just memory
 	_swap_vehicle("minivan")                          # rebuild the car clean + re-apply zeros
+	                                                   # (this also re-saves the blank state)
 	if _reset_btn:
 		_reset_btn.text = "🔄 NEW GAME  —  wipe ALL upgrades & money"
 	_refresh_shop()
@@ -1442,6 +1661,8 @@ func _refresh_shop() -> void:
 		_reset_btn.text = "🔄 NEW GAME  —  wipe ALL upgrades & money"
 	var bank := "TOTAL MONEY:  $%d   (kept between tries)" % money
 	_shop_money.text = (_shop_summary + "\n" + bank) if _shop_summary != "" else bank
+	if _kit_lbl:
+		_kit_lbl.text = "BODY KIT:  %s" % _kit_name(str(_body_kits.get(_vehicle, "")))
 	_refresh_cosmetics()
 	for vk in VEH_KEYS:
 		var vrow: Dictionary = _veh_rows[vk]
@@ -1496,6 +1717,7 @@ func _buy(key: String) -> void:
 	if _audio:
 		_audio.call("play_cash")
 	_apply_upgrades()
+	_save_game()
 	_refresh_shop()
 
 const SELL_REFUND := 0.7   # sell a level back for 70% of what that level cost
@@ -1510,6 +1732,7 @@ func _sell(key: String) -> void:
 	money += int(paid * SELL_REFUND)
 	_levels[key] -= 1
 	_apply_upgrades()
+	_save_game()
 	_refresh_shop()
 
 func _buy_cosmetic(key: String) -> void:
@@ -1523,6 +1746,7 @@ func _buy_cosmetic(key: String) -> void:
 	if _audio:
 		_audio.call("play_cash")
 	_apply_cosmetics()
+	_save_game()
 	_refresh_shop()
 
 func _pick_cosmetic(key: String, col: Color) -> void:
@@ -1532,6 +1756,7 @@ func _pick_cosmetic(key: String, col: Color) -> void:
 	if _audio:
 		_audio.call("play_click")
 	_apply_cosmetics()
+	_save_game()   # persist the chosen colour, not just the unlock
 	_refresh_swatch_selection(key)
 
 ## Ring the currently-selected swatch (and clear the others) so the chosen colour reads.

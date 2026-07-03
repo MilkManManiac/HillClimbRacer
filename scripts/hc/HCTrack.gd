@@ -107,6 +107,14 @@ var _scatter_kind_mesh := {}    # glb path -> Mesh
 var _scatter_kind_scale := {}   # glb path -> base scale (normalises native mesh size)
 var _post_mesh: BoxMesh         # shared guardrail-post mesh
 
+# --- chevron turn-warning signs (outside of bends) — one shared mesh (red panel +
+# emissive white arrow), built once and reused via a MeshInstance3D per placement -----
+var _chevron_mesh: ArrayMesh
+const CHEVRON_TURN_THRESH := 1.0     # deg per sample (~ radius < 230 m) to count as "a turn"
+const CHEVRON_STRIDE := 6            # place a board every N samples (~24 m) through a turn
+const CHEVRON_OFFSET := 2.5          # metres past the road edge (outside of the bend)
+const CHEVRON_HEIGHT := 1.1          # board centre height above ground
+
 func _ready() -> void:
 	_build_path()
 	_build_gaps()
@@ -618,11 +626,21 @@ func _mats() -> void:
 	if _road_mat == null:
 		_road_mat = StandardMaterial3D.new()
 		_road_mat.vertex_color_use_as_albedo = true
+		# CRITICAL: SurfaceTool COLOR attributes are read as LINEAR by default, but our
+		# palette colors are authored as sRGB — without this flag the whole ground
+		# renders several stops too bright (grass/asphalt wash out to pastel white).
+		_road_mat.vertex_color_is_srgb = true
 		_road_mat.roughness = 0.95
+		# KILL the specular sheen: at the chase camera's grazing angle the default 0.5
+		# specular turns the whole ground into one white sun-glare sheet (road and grass
+		# indistinguishable). Matte vertex-colored ground wants essentially none.
+		_road_mat.metallic_specular = 0.03
 	if _rail_mat == null:
 		_rail_mat = StandardMaterial3D.new()
 		_rail_mat.vertex_color_use_as_albedo = true
+		_rail_mat.vertex_color_is_srgb = true   # same linear-vs-sRGB washout as the road
 		_rail_mat.roughness = 0.6
+		_rail_mat.metallic_specular = 0.1
 		_rail_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 	if _rail_cap_mat == null:
 		# dedicated material for the thin top cap strip + posts so only the red band
@@ -689,8 +707,12 @@ func _build_tile(t: int) -> void:
 	# rails down both edges (band + emissive cap + posts)
 	_build_rail_side(container, rows, -1.0)
 	_build_rail_side(container, rows, 1.0)
+	# painted markings (dashed centre + solid edges) as crisp overlay strips
+	container.add_child(_build_lines(rows))
 	# roadside scatter (trees/rocks) — purely visual, verge band only
 	_scatter_tile(t, rows, container)
+	# chevron turn-warning boards — purely visual, outside edge of bends only
+	_build_chevrons(t, container)
 	# collision
 	var body := StaticBody3D.new()
 	var cs := CollisionShape3D.new()
@@ -732,13 +754,53 @@ func _surface_color(d: float, lat: float, rh: float) -> Color:
 			return Color(0.92, 0.78, 0.12) if fmod(d, 4.0) < 2.0 else Color(0.1, 0.1, 0.11)
 		elif d >= far and d < far + gap_land_len:
 			return Color(0.16, 0.5, 0.3).lerp(grass, smoothstep(rh - 1.5, rh + 1.0, al))
+	# NOTE: centre/edge line markings are dedicated overlay strips (_build_lines), NOT
+	# vertex paint — cross-section vertices sit ~4.5 m apart, so colouring the centre
+	# vertex smeared a ~9 m wide wedge across the road.
 	var road := _varied_asphalt(vh)
-	if al < 1.3 and fmod(d, 7.0) < 4.0:
-		road = centre_line_color   # soft dashed centre line
-	elif al >= rh - 1.2 and al <= rh - 0.6:
-		return edge_line_color     # solid verge edge line, kept crisp (no grass blend)
 	var edge := smoothstep(rh - 1.5, rh + 1.0, al)   # fade to grass at the verge
 	return road.lerp(grass, edge)
+
+## Crisp painted road markings as thin overlay strips: a dashed centre line plus a
+## solid edge line each side, floated 3 cm above the deck (avoids z-fighting). Real
+## geometry so the lines are ~0.4 m wide regardless of the road mesh's coarse
+## cross-section; reuses _road_mat (vertex-color, sRGB) for the colours.
+func _build_lines(rows: Array) -> MeshInstance3D:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var lift := Vector3(0, 0.03, 0)
+	for r in range(rows.size() - 1):
+		var a: Dictionary = rows[r]
+		var b: Dictionary = rows[r + 1]
+		if a.void or b.void:
+			continue
+		# dashed centre line: ~3.5 m dash / 3.5 m gap, phased by arc-length so dashes
+		# are stable per-location no matter which tile builds them
+		if fmod(float(a.d), 7.0) < 3.5:
+			_line_quad(st, a, b, -0.18, 0.18, -0.18, 0.18, centre_line_color, lift)
+		# solid edge line just inside each drivable edge (tracks the widen through turns)
+		for side in [-1.0, 1.0]:
+			var ea: float = (float(a.rh) - 0.9) * side
+			var eb: float = (float(b.rh) - 0.9) * side
+			_line_quad(st, a, b, ea - 0.22, ea + 0.22, eb - 0.22, eb + 0.22, edge_line_color, lift)
+	st.generate_normals()
+	var mi := MeshInstance3D.new()
+	mi.mesh = st.commit()
+	mi.material_override = _road_mat
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	return mi
+
+## One marking quad between two rows, given per-row lateral extents.
+func _line_quad(st: SurfaceTool, a: Dictionary, b: Dictionary, la0: float, la1: float, lb0: float, lb1: float, col: Color, lift: Vector3) -> void:
+	var p0 := _row_pt(a, la0) + lift
+	var p1 := _row_pt(a, la1) + lift
+	var p2 := _row_pt(b, lb0) + lift
+	var p3 := _row_pt(b, lb1) + lift
+	_quad(st, p0, p1, p2, p3, col, col, col, col)
+
+## World point on a row's cross-section at lateral offset `lat`.
+func _row_pt(r: Dictionary, lat: float) -> Vector3:
+	return Vector3(float(r.cx) + float(r.rx) * lat, _height_lat(float(r.d), lat, float(r.rh)), float(r.cz) + float(r.rz) * lat)
 
 ## Grass with subtle deterministic variation (~±8% value, slight yellow-green shift
 ## on the bright side) so the verge doesn't read as one flat fill.
@@ -901,6 +963,106 @@ func _scatter_tile(t: int, rows: Array, container: Node3D) -> void:
 		mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		mmi.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
 		container.add_child(mmi)
+
+# --- chevron turn-warning signs ------------------------------------------------
+
+## Places classic red/white chevron boards on the OUTSIDE of any bend spanned by tile
+## `t`, spaced deterministically (index-based, never random) so streaming a tile in
+## or out always produces the same boards. Heading DELTA between consecutive samples
+## is the local curvature; its sign gives the turn direction, which fixes both which
+## side is "outside" (opposite the turn) and which way the arrow must point (inside).
+func _build_chevrons(t: int, container: Node3D) -> void:
+	_ensure_chevron_mesh()
+	var i0 := t * TILE_SAMPLES
+	var i1 := mini(i0 + TILE_SAMPLES, _n - 1)
+	for i in range(i0, i1):
+		if i % CHEVRON_STRIDE != 0:
+			continue
+		var dph := _ph[i + 1] - _ph[i]     # local curvature (no wrap needed: th is a
+		                                    # continuous accumulator, never wrapped)
+		if absf(dph) <= deg_to_rad(CHEVRON_TURN_THRESH):
+			continue
+		var d := float(i) * STEP
+		if _in_void_s(d):                  # never plant a sign over a jump's void
+			continue
+		var rh: float = lerpf(road_half, road_half_turn, _pw[i])
+		var side := -signf(dph)            # outside = opposite the turn direction
+		var lat: float = side * (rh + CHEVRON_OFFSET)
+		var ph: float = _ph[i]
+		var rx := cos(ph); var rz := sin(ph)             # road right vector
+		var fx := sin(ph); var fz := -cos(ph)            # road forward vector
+		var wx := _px[i] + rx * lat
+		var wz := _pz[i] + rz * lat
+		var wy := height_at(wx, wz) + CHEVRON_HEIGHT
+		# arrow must point toward the INSIDE of the turn: mirror the mesh's local
+		# +X (its authored arrow direction) across the turn direction sign.
+		var flip := -1.0 if dph < 0.0 else 1.0
+		var right_axis := Vector3(rx, 0.0, rz) * flip
+		var up_axis := Vector3.UP
+		var back_axis := Vector3(-fx, 0.0, -fz)          # faces oncoming (opposite travel)
+		var mi := MeshInstance3D.new()
+		mi.mesh = _chevron_mesh
+		mi.transform = Transform3D(Basis(right_axis, up_axis, back_axis), Vector3(wx, wy, wz))
+		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		container.add_child(mi)
+
+## Builds the shared chevron sign mesh ONCE: a red backing panel (surface 0) plus a
+## single white ">" arrow made of two angled stripes (surface 1, mildly emissive so it
+## reads at dusk). Authored pointing local +X; `_build_chevrons` mirrors it per-instance
+## via a flipped right-axis so the same mesh serves both left- and right-hand bends.
+func _ensure_chevron_mesh() -> void:
+	if _chevron_mesh != null:
+		return
+	var panel_mat := StandardMaterial3D.new()
+	panel_mat.albedo_color = Color(0.78, 0.08, 0.06)
+	panel_mat.roughness = 0.75
+	# the board faces oncoming traffic, i.e. usually AWAY from the sun — without a touch
+	# of emission the back-lit red panel renders near-black and the sign loses its colour
+	panel_mat.emission_enabled = true
+	panel_mat.emission = Color(0.78, 0.08, 0.06)
+	panel_mat.emission_energy_multiplier = 0.25
+	panel_mat.cull_mode = BaseMaterial3D.CULL_DISABLED   # per-instance mirroring flips winding
+	var stripe_mat := StandardMaterial3D.new()
+	stripe_mat.albedo_color = Color(0.95, 0.95, 0.92)
+	stripe_mat.roughness = 0.6
+	stripe_mat.emission_enabled = true
+	stripe_mat.emission = Color(0.95, 0.95, 0.92)
+	stripe_mat.emission_energy_multiplier = 0.4
+	stripe_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+
+	var panel := SurfaceTool.new()
+	panel.begin(Mesh.PRIMITIVE_TRIANGLES)
+	_chevron_quad(panel, Vector2(-0.8, -0.5), Vector2(0.8, -0.5), Vector2(0.8, 0.5), Vector2(-0.8, 0.5), 0.0)
+	panel.generate_normals()
+
+	var stripe := SurfaceTool.new()
+	stripe.begin(Mesh.PRIMITIVE_TRIANGLES)
+	_chevron_stripe(stripe, Vector2(-0.62, 0.32), Vector2(0.08, 0.0), 0.11, 0.045)   # upper arm
+	_chevron_stripe(stripe, Vector2(-0.62, -0.32), Vector2(0.08, 0.0), 0.11, 0.045)  # lower arm
+	stripe.generate_normals()
+
+	_chevron_mesh = ArrayMesh.new()
+	panel.commit(_chevron_mesh)
+	stripe.commit(_chevron_mesh)
+	_chevron_mesh.surface_set_material(0, panel_mat)
+	_chevron_mesh.surface_set_material(1, stripe_mat)
+
+## One angled stripe (a thin parallelogram of half-width `halfw`) from pa to pb in the
+## sign's local XY plane, at local depth z (slightly proud of the panel).
+func _chevron_stripe(st: SurfaceTool, pa: Vector2, pb: Vector2, halfw: float, z: float) -> void:
+	var dir := (pb - pa).normalized()
+	var perp := Vector2(-dir.y, dir.x) * halfw
+	_chevron_quad(st, pa + perp, pb + perp, pb - perp, pa - perp, z)
+
+## A flat quad in the sign's local XY plane at depth z, wound so its normal faces +Z
+## (the panel's authored "front" — oriented to face oncoming traffic at placement time).
+func _chevron_quad(st: SurfaceTool, p0: Vector2, p1: Vector2, p2: Vector2, p3: Vector2, z: float) -> void:
+	st.add_vertex(Vector3(p0.x, p0.y, z))
+	st.add_vertex(Vector3(p1.x, p1.y, z))
+	st.add_vertex(Vector3(p2.x, p2.y, z))
+	st.add_vertex(Vector3(p0.x, p0.y, z))
+	st.add_vertex(Vector3(p2.x, p2.y, z))
+	st.add_vertex(Vector3(p3.x, p3.y, z))
 
 func _quad(st: SurfaceTool, a: Vector3, b: Vector3, c: Vector3, d: Vector3, ca: Color, cb: Color, cc: Color, cd: Color) -> void:
 	st.set_color(ca); st.add_vertex(a)

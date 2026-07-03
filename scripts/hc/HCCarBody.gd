@@ -66,6 +66,58 @@ static func load_body(glb_path: String, target_size: Vector3, flip_forward: bool
 
 	return wrapper
 
+## Per-wheel geometry for auto-fitting the game's wheel/ray stance to the asset.
+## Call AFTER load_body. Returns one entry per OUTERMOST wheel-named node:
+##   {"center": Vector3 (wrapper-local, wrapper scale already applied),
+##    "radius": float (scaled)}
+## Nested wheel-named children (a mesh inside a wheel container) are skipped so a
+## 4-wheel car yields 4 entries, and spares can be filtered by the caller (they sit
+## higher than the ground wheels).
+static func wheel_info(wrapper: Node3D) -> Array[Dictionary]:
+	var out: Array[Dictionary] = []
+	var s: float = wrapper.scale.x
+	for w in find_wheels(wrapper):
+		var nested := false
+		var p := w.get_parent()
+		while p != null and p != wrapper:
+			var lname := String(p.name).to_lower()
+			for kw in _WHEEL_KEYWORDS:
+				if lname.find(kw) != -1:
+					nested = true
+					break
+			if nested:
+				break
+			p = p.get_parent()
+		if nested:
+			continue
+		var t := _xform_to_root(w, wrapper)
+		var center := t.origin
+		var radius := 0.3
+		var meshes: Array = []
+		_collect_meshes(w, meshes)
+		if not meshes.is_empty():
+			var ab: AABB = (meshes[0] as MeshInstance3D).get_aabb()
+			for k in range(1, meshes.size()):
+				ab = ab.merge((meshes[k] as MeshInstance3D).get_aabb())
+			center = t * ab.get_center()
+			radius = ab.size.y * 0.5          # wheel circle spans the local Y extent
+		out.append({"center": center * s, "radius": radius * s})
+	return out
+
+## Clamp imported PBR toward matte. AI-generated / photoreal materials come in glossy
+## and read "wet" next to the game's flat-shaded procedural look; pulling roughness up
+## and metallic down blends them in without touching albedo.
+static func matte_materials(root: Node3D, min_rough := 0.6, max_metal := 0.5) -> void:
+	var meshes: Array = []
+	_collect_meshes(root, meshes)
+	for mi in meshes:
+		var m3 := mi as MeshInstance3D
+		for si in range(m3.mesh.get_surface_count()):
+			for m in [m3.mesh.surface_get_material(si), m3.get_surface_override_material(si)]:
+				if m is BaseMaterial3D:
+					m.roughness = maxf(m.roughness, min_rough)
+					m.metallic = minf(m.metallic, max_metal)
+
 ## Returns descendant nodes of root whose name case-insensitively contains
 ## "wheel", "tire", or "tyre".
 static func find_wheels(root: Node3D) -> Array[Node3D]:
