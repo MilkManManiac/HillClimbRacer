@@ -425,13 +425,14 @@ func _gap_index_at_s(s: float) -> int:
 	var i := clampi(int(s / STEP), 0, _gsamp.size() - 1)
 	return _gsamp[i]
 
-## Height profile of a jump at distance s: ramp kicks up, void drops, landing flat.
+## Height profile of a jump at distance s: ramp kicks up, void drops, landing catches.
 func _gap_profile(g: Dictionary, s: float) -> float:
 	var lvl: float = g.lvl
 	var lip: float = g.cs - g.vw * 0.5
 	var far: float = g.cs + g.vw * 0.5
 	var ramp0: float = lip - gap_ramp_len
-	var land1: float = far + gap_land_len
+	var ll: float = g.get("ll", gap_land_len)   # per-gap landing length (wider gap = longer catch)
+	var land1: float = far + ll
 	if s < lip:
 		# ramp: rise from the surrounding ground up to the launch lip
 		var t: float = clampf((s - ramp0) / gap_ramp_len, 0.0, 1.0)
@@ -439,12 +440,18 @@ func _gap_profile(g: Dictionary, s: float) -> float:
 	elif s < far:
 		return gap_pit    # the void
 	else:
-		# landing DOWNSLOPE: an elevated lip at the far edge sloping gently down to the
-		# ground, so a descending jump touches down moving ALONG the slope (smooth) instead
-		# of slamming onto a flat pad.
-		var t2: float = clampf((s - far) / gap_land_len, 0.0, 1.0)
+		# SKI-JUMP landing: the old smoothstep had ZERO slope right at the landing lip —
+		# exactly where jumps touch down — so every landing slapped a flat pad. This
+		# ease-out curve is STEEPEST at the lip (initial grade ≈ 2.6 × drop/length, in the
+		# same range as the trajectory family's descent angles) and flattens toward the
+		# runout, so slow jumps land early on the steep part and fast jumps land deep on
+		# the still-descending part — both meet the surface moving ALONG it. Pairs with
+		# HCCar measuring landing damage against the surface NORMAL, which is what makes
+		# "ride the downslope" free at any speed.
+		var t2: float = clampf((s - far) / ll, 0.0, 1.0)
 		var land_top: float = lvl + gap_land_rise
-		return lerpf(land_top, _base_hill(land1, 0.0, road_half), smoothstep(0.0, 1.0, t2))
+		var f: float = 1.0 - pow(1.0 - t2, 2.6)
+		return lerpf(land_top, _base_hill(land1, 0.0, road_half), f)
 
 # --- jump scheduling ---------------------------------------------------------
 ## Place jumps on STRAIGHT stretches (progressive spacing), marking the samples they
@@ -458,11 +465,12 @@ func _build_gaps() -> void:
 	var limit := float(N_MAX) * STEP - gap_land_len - 60.0
 	while s < limit and idx < 400:
 		var vw := minf(gap_base_width + float(idx) * gap_grow, gap_max_width)
-		var span := gap_ramp_len + vw + gap_land_len + 24.0
+		var ll := gap_land_len + vw * 0.5   # wider void = faster jump = longer landing catch
+		var span := gap_ramp_len + vw + ll + 24.0
 		if _is_straight(s - span * 0.5, s + span * 0.5):
-			_gaps.append({"cs": s, "vw": vw, "lvl": _base_hill(s, 0.0, road_half), "idx": idx})
+			_gaps.append({"cs": s, "vw": vw, "ll": ll, "lvl": _base_hill(s, 0.0, road_half), "idx": idx})
 			var i0 := clampi(int((s - vw * 0.5 - gap_ramp_len) / STEP), 0, _n - 1)
-			var i1 := clampi(int((s + vw * 0.5 + gap_land_len) / STEP), 0, _n - 1)
+			var i1 := clampi(int((s + vw * 0.5 + ll) / STEP), 0, _n - 1)
 			for i in range(i0, i1 + 1):
 				_gsamp[i] = idx
 			idx += 1
@@ -752,7 +760,7 @@ func _surface_color(d: float, lat: float, rh: float) -> Color:
 		var far: float = g.cs + g.vw * 0.5
 		if d > lip - gap_ramp_len and d < lip:
 			return Color(0.92, 0.78, 0.12) if fmod(d, 4.0) < 2.0 else Color(0.1, 0.1, 0.11)
-		elif d >= far and d < far + gap_land_len:
+		elif d >= far and d < far + float(g.get("ll", gap_land_len)):
 			return Color(0.16, 0.5, 0.3).lerp(grass, smoothstep(rh - 1.5, rh + 1.0, al))
 	# NOTE: centre/edge line markings are dedicated overlay strips (_build_lines), NOT
 	# vertex paint — cross-section vertices sit ~4.5 m apart, so colouring the centre

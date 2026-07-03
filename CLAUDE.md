@@ -30,9 +30,11 @@ first so you can checkpoint and diff your own work.
 <console> --headless --path . tests/CarBodyProbe.tscn   # GLB car bodies load/scale
 ```
 
-Baseline SmoothProbe numbers: `vert_accel rms=3.36`, `pitch_jerk rms=0.53` (both dominated
-by the one-time spawn drop; healthy mid-run windows print 0.00). If pitch_jerk rms rises
-above ~0.7, the driving got rougher — find out why before proceeding.
+Baseline SmoothProbe numbers (HC v5): `vert_accel rms=2.70` (worst ~26), `pitch_jerk
+rms=0.51` — both dominated by the one-time spawn drop; healthy mid-run windows print
+0.00, and gap/ramp zones are excluded from the metric (launches are intentional vertical
+acceleration). Gates: vert rms ≤ 3.0, pitch_jerk rms ≤ 0.6 — if either rises, the
+driving got rougher; find out why before proceeding.
 
 For **visual** changes, don't trust "parses + boots": capture a rendered screenshot with the
 `tests/TitleShot.gd` pattern (runs the real renderer in a brief window, saves a PNG, quits)

@@ -4,7 +4,7 @@ extends Node
 
 var _rf := 0
 var _root: Node
-var _maps := ["canyon", "alpine"]
+var _maps := ["canyon", "alpine", "midnight"]
 var _idx := 0
 
 func _ready() -> void:

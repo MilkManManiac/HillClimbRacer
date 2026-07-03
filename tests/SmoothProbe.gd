@@ -42,6 +42,16 @@ func _physics_process(delta: float) -> void:
 		var vy: float = _car.linear_velocity.y
 		var right: Vector3 = _car.global_transform.basis.x
 		var pitch_rate: float = _car.angular_velocity.dot(right)
+		# skip gap zones: riding a launch ramp is INTENTIONAL vertical acceleration,
+		# not roughness — counting it makes the metric depend on where gaps land
+		var in_gap := false
+		var terr: Node = _car.get("terrain")
+		if terr and terr.has_method("gap_state"):
+			in_gap = bool((terr.call("gap_state", _car.global_position) as Dictionary).get("active", false))
+		if in_gap:
+			_prev_vy = vy
+			_prev_pitch_rate = pitch_rate
+			return
 		if bool(_car.get("airborne")):
 			_air_ticks += 1
 		else:

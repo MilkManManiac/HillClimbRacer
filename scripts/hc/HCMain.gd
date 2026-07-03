@@ -41,7 +41,7 @@ const MAPS := {
 		},
 	},
 	"alpine": {
-		"name": "Alpine Ridge", "desc": "Big snowy hills, big-air jumps — bring suspension upgrades.",
+		"name": "Alpine Ridge", "desc": "Big snowy hills, big-air jumps — a stock ride can't clear them; bring engine + suspension upgrades.",
 		"mode": "classic", "sky_time": 0.45,
 		"overrides": {
 			# bot-tuned (tests/AutoDrive.gd): the old 240 m / rise-8.5 first jump zeroed a
@@ -62,8 +62,30 @@ const MAPS := {
 			],
 		},
 	},
+	"midnight": {
+		"name": "Midnight Run", "desc": "Neon night cruise — headlights on, follow the glow.",
+		"mode": "classic", "sky_time": 0.95, "night": true,
+		"overrides": {
+			"straight_bias": 0.45, "turn_radius_min": 34.0, "turn_radius_max": 70.0,
+			"road_half": 19.0, "hill_amp": 5.0, "noise_frequency": 0.003,
+			"gap_start": 500.0, "gap_spacing": 380.0,
+			"path_seed": 20261111, "noise_seed": 611,
+			# lightened slightly from a first pass (0.06/0.07-ish) that crushed to pure
+			# black even under the tuned night lighting — still reads as dark night
+			# grass/asphalt, just not literally unlit black
+			"grass_color": Color(0.09, 0.13, 0.11), "asphalt_color": Color(0.11, 0.11, 0.14),
+			"centre_line_color": Color(1.0, 0.85, 0.3), "edge_line_color": Color(0.85, 0.9, 1.0),
+			"rail_band_color": Color(0.1, 0.9, 0.85), "rail_post_color": Color(0.25, 0.28, 0.35),
+			"scatter_density": 0.5,
+			"scatter_kinds": [
+				"res://assets/rocks/rock_quaternius_1_cc0.glb",
+				"res://assets/rocks/rock_quaternius_2_cc0.glb",
+				"res://assets/trees/pine_tall_quaternius_cc0.glb",
+			],
+		},
+	},
 }
-const MAP_KEYS := ["hills", "canyon", "alpine"]
+const MAP_KEYS := ["hills", "canyon", "alpine", "midnight"]
 var _map := "hills"
 var _best := {}            # map_key -> best distance (m) reached on that map, persisted
 var _map_btns := {}       # key -> Button (title-screen row)
@@ -501,50 +523,113 @@ func _setup_sky() -> void:
 ## cycle (long shadow draw distance, volumetric fog, etc). We stay inside HCMain.gd's
 ## scope by reaching into the nodes it already created and retuning them for a cheap,
 ## bright, always-readable arcade look — Sky.gd itself belongs to another mode/owner.
+## Branches on MAPS[_map].night: day maps keep the exact original tuning; the night
+## map (midnight) gets a dim, cool retune so it reads as genuine night instead of the
+## same bright-afternoon settings just painted a dark colour.
 func _tune_arcade_environment(sky: Node3D) -> void:
 	var env: Environment = sky.get("_env")
 	var sun: DirectionalLight3D = sky.get("_sun")
+	var night: bool = bool(MAPS[_map].get("night", false))
 	if env:
-		# filmic tonemap with a light exposure lift so the bright, colorful palette pops
-		env.tonemap_mode = Environment.TONE_MAPPER_ACES
-		env.tonemap_exposure = 1.3
-		# ambient bounce from the sky itself, lifted a touch so shadows never read as dead
-		env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
-		env.ambient_light_energy = 1.2
-		# glow: only strong emissive (coin pickups, brake lights, nitro) should bloom —
-		# a high threshold keeps the sky/road from washing out into a soft haze
-		env.glow_enabled = true
-		env.glow_intensity = 0.35
-		env.glow_bloom = 0.06
-		env.glow_hdr_threshold = 1.3
-		env.glow_blend_mode = Environment.GLOW_BLEND_MODE_SOFTLIGHT
-		# perf: cut anything heavy — no volumetric fog / SSR / SDFGI in this mode
-		env.volumetric_fog_enabled = false
-		env.ssr_enabled = false
-		env.sdfgi_enabled = false
-		# cheap depth fog for an aerial-perspective feel: starts well past normal
-		# reaction range so it beautifies the horizon without hiding the road ahead
-		env.fog_enabled = true
-		env.fog_mode = Environment.FOG_MODE_DEPTH
-		env.fog_depth_begin = 130.0
-		env.fog_depth_end = 950.0
-		env.fog_density = 0.01
-		env.fog_aerial_perspective = 0.4
-		env.fog_sky_affect = 0.55
-		env.fog_light_color = Color(0.95, 0.85, 0.72)   # warm horizon haze
-		# a small saturation/contrast lift so the arcade colors read punchy, not flat
-		env.adjustment_enabled = true
-		env.adjustment_saturation = 1.15
-		env.adjustment_contrast = 1.06
-		env.adjustment_brightness = 1.02
+		if night:
+			# filmic tonemap with a moderate exposure lift — a real night still needs the
+			# road readable; a first pass at 1.1 with low ambient read as pure black
+			env.tonemap_mode = Environment.TONE_MAPPER_ACES
+			env.tonemap_exposure = 1.35
+			# AMBIENT_SOURCE_SKY samples the sky's actual radiance texture — at deep night
+			# that texture is itself near-black (see Sky.gd's KEYS table), so no energy
+			# multiplier on it can lift the ground above near-invisible; a first pass at
+			# energy 0.8 on AMBIENT_SOURCE_SKY proved this (still pure black). Decouple
+			# ambient from the (correctly dim) sky texture with a flat COLOR source
+			# instead — an arcade liberty, same spirit as the day tuning's own departures
+			# from physically-accurate lighting in favour of readability.
+			env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+			env.ambient_light_color = Color(0.12, 0.16, 0.24)   # cool dim night fill
+			env.ambient_light_energy = 2.0
+			# lower glow threshold so the neon rail band / centre line / coins bloom —
+			# that bloom IS the "neon at night" read
+			env.glow_enabled = true
+			env.glow_intensity = 0.55
+			env.glow_bloom = 0.14
+			env.glow_hdr_threshold = 1.0
+			env.glow_blend_mode = Environment.GLOW_BLEND_MODE_SOFTLIGHT
+			env.volumetric_fog_enabled = false
+			env.ssr_enabled = false
+			env.sdfgi_enabled = false
+			# near-black-blue fog, closer-in than the day haze so distant road fades to
+			# night rather than hazing out to a bright horizon
+			env.fog_enabled = true
+			env.fog_mode = Environment.FOG_MODE_DEPTH
+			env.fog_depth_begin = 60.0
+			env.fog_depth_end = 650.0
+			env.fog_density = 0.015
+			env.fog_aerial_perspective = 0.3
+			env.fog_sky_affect = 0.6
+			env.fog_light_color = Color(0.03, 0.05, 0.10)   # near-black blue-night haze
+			env.adjustment_enabled = true
+			env.adjustment_saturation = 1.1
+			env.adjustment_contrast = 1.05
+			env.adjustment_brightness = 1.15
+		else:
+			# filmic tonemap with a light exposure lift so the bright, colorful palette pops
+			env.tonemap_mode = Environment.TONE_MAPPER_ACES
+			env.tonemap_exposure = 1.3
+			# ambient bounce from the sky itself, lifted a touch so shadows never read as dead
+			env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
+			env.ambient_light_energy = 1.2
+			# glow: only strong emissive (coin pickups, brake lights, nitro) should bloom —
+			# a high threshold keeps the sky/road from washing out into a soft haze
+			env.glow_enabled = true
+			env.glow_intensity = 0.35
+			env.glow_bloom = 0.06
+			env.glow_hdr_threshold = 1.3
+			env.glow_blend_mode = Environment.GLOW_BLEND_MODE_SOFTLIGHT
+			# perf: cut anything heavy — no volumetric fog / SSR / SDFGI in this mode
+			env.volumetric_fog_enabled = false
+			env.ssr_enabled = false
+			env.sdfgi_enabled = false
+			# cheap depth fog for an aerial-perspective feel: starts well past normal
+			# reaction range so it beautifies the horizon without hiding the road ahead
+			env.fog_enabled = true
+			env.fog_mode = Environment.FOG_MODE_DEPTH
+			env.fog_depth_begin = 130.0
+			env.fog_depth_end = 950.0
+			env.fog_density = 0.01
+			env.fog_aerial_perspective = 0.4
+			env.fog_sky_affect = 0.55
+			env.fog_light_color = Color(0.95, 0.85, 0.72)   # warm horizon haze
+			# a small saturation/contrast lift so the arcade colors read punchy, not flat
+			env.adjustment_enabled = true
+			env.adjustment_saturation = 1.15
+			env.adjustment_contrast = 1.06
+			env.adjustment_brightness = 1.02
 	if sun:
-		sun.light_color = Color(1.0, 0.92, 0.78)   # warm afternoon sun
-		sun.light_energy = 1.9
-		sun.shadow_enabled = true
-		sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
-		sun.directional_shadow_max_distance = 150.0   # cheaper than Sky.gd's default 320m
-		sun.shadow_bias = 0.05
-		sun.shadow_blur = 1.5   # soft-edged shadows, not razor-hard arcade shadows
+		if night:
+			# Sky.gd's own _apply() both (a) sets sun.visible = false once the real sun is
+			# below the horizon (true at our deep-night time_of_day) and (b) leaves its
+			# rotation aimed for that below-horizon sun — pointing the light rays UP, not
+			# down at the road. Either alone made every color/energy tweak here a no-op.
+			# Force it back on AND re-aim it at a fixed, plausible moonlight elevation
+			# (~50deg, same heading Sky.gd uses) so it's a real downward key light —
+			# Sky.gd's own moon light still runs too, this is just insurance that
+			# something directional actually reaches the ground near the camera.
+			sun.visible = true
+			sun.rotation = Vector3(deg_to_rad(-50.0), deg_to_rad(-40.0), 0.0)
+			sun.light_color = Color(0.55, 0.62, 0.9)
+			sun.light_energy = 0.7
+			sun.shadow_enabled = true
+			sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
+			sun.directional_shadow_max_distance = 150.0
+			sun.shadow_bias = 0.05
+			sun.shadow_blur = 1.5
+		else:
+			sun.light_color = Color(1.0, 0.92, 0.78)   # warm afternoon sun
+			sun.light_energy = 1.9
+			sun.shadow_enabled = true
+			sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
+			sun.directional_shadow_max_distance = 150.0   # cheaper than Sky.gd's default 320m
+			sun.shadow_bias = 0.05
+			sun.shadow_blur = 1.5   # soft-edged shadows, not razor-hard arcade shadows
 
 func _setup_terrain_and_car() -> void:
 	_terrain = Node3D.new()
@@ -569,9 +654,18 @@ func _setup_terrain_and_car() -> void:
 	_car.connect("gap_failed", _on_car_gap_failed)
 	_car.connect("landed", _on_car_landed)
 	_terrain.connect("pickup_collected", _on_pickup_collected)
+	_apply_headlights()
 	# audio intentionally OFF for now (user will source better sounds later). The
 	# HCAudio synth + all play_* calls stay guarded by `if _audio:` so leaving
 	# _audio null = fully silent; flip this back on by instancing HCAudioScript here.
+
+## Switch the car's headlights on for the active map's "night" flag, if the car
+## supports it. Guarded by has_method so this works whether or not the concurrent
+## HCCar change (adding set_headlights) has landed yet — a per-map flag rather than
+## hardcoding the "midnight" key so any future night map picks this up for free.
+func _apply_headlights() -> void:
+	if _car and _car.has_method("set_headlights"):
+		_car.call("set_headlights", bool(MAPS[_map].get("night", false)))
 
 ## Push the active map's HCTrack export overrides onto a not-yet-added terrain node.
 ## Must run set_script -> this -> add_child, since HCTrack builds its road in _ready.
@@ -621,8 +715,17 @@ func _apply_map() -> void:
 	_terrain.connect("pickup_collected", _on_pickup_collected)
 	if _sky:
 		_sky.set("time_of_day", MAPS[_map].sky_time)
+		# time_of_day is a plain @export with no setter — Sky.gd only computes the actual
+		# sky/sun/moon colors once, in its own _apply() (called from _ready, and again
+		# every frame IF auto_advance were on — it's off here). Setting the property alone
+		# leaves the boot-time palette on screen after a map switch, so nudge it to
+		# recompute directly (duck-typed, like the terrain/car calls elsewhere in this file).
+		if _sky.has_method("_apply"):
+			_sky.call("_apply", MAPS[_map].sky_time)
+		_tune_arcade_environment(_sky)   # night/day env retune — must re-run on every map switch
 	if _car:
 		_car.call("reset_run", _start)
+	_apply_headlights()
 	_reset_sprint_state()
 	if _cam:
 		_cam.global_position = _start + Vector3(0, 6, 12)
@@ -1617,6 +1720,7 @@ func _swap_vehicle(vk: String) -> void:
 	_terrain.connect("pickup_collected", _on_pickup_collected)
 	if _audio:
 		_audio.call("setup", _car)   # re-point the engine synth at the new body
+	_apply_headlights()
 	_apply_upgrades()
 	_cam_heading = Vector3(0, 0, -1)
 	_was_dead = false
