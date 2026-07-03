@@ -12,6 +12,14 @@ alone unless asked. Read `HANDOFF.md` for vision, current state, and the roadmap
 - Parse-check: `<console> --headless --path . --check-only --script scripts/hc/HCCar.gd`
 - Boot smoke: `<console> --headless --path . --quit-after 200`
 
+**Fresh machine?** If the paths above don't exist: download **Godot 4.6.x stable**
+(standard build, not .NET) from godotengine.org, use the `_console` executable for all
+headless commands (on Linux/mac the single binary + `--headless` works the same), and
+substitute your path everywhere `<console>` appears. The project has no other
+dependencies — all assets are in `assets/`, everything else is procedural. If this
+arrived as a zip (no `.git`), run `git init && git add -A && git commit -m "import HC v3"`
+first so you can checkpoint and diff your own work.
+
 ## Verification battery — run after every meaningful change
 
 ```
