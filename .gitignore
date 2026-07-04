@@ -11,3 +11,6 @@ shot*.png
 assets/car/kenney_car-kit/
 assets/**/*.zip
 hc.png
+DEFERRED.md
+.scratch/
+thoughts/

@@ -23,6 +23,35 @@ Design pillars (in priority order):
    all-drift sprint against the clock, big-air snow ridge. More flavors welcome.
 5. **Session-friendly.** Death → shop → retry in seconds. No friction.
 
+## Update (2026-07-03, fourth pass — "HC v6: the foundation pass")
+
+Structural shoring-up, no new features. Multi-model build (Codex/Cursor implement,
+cross-family reviews, coordinator-verified). Verified cross-platform: the full battery
+runs green on macOS with numbers identical to the Windows baseline.
+
+- **Battery is a real gate now**: `bash tests/run_battery.sh` (any OS, one command,
+  exits nonzero). SmoothProbe/HCDrive gate their own thresholds; new hermetic
+  **GapProbe** pins `gap_ahead()` semantics. Six probes total.
+- **Seven bugs fixed**, headline: the "SEND IT!/GO FASTER" gap telegraph had been
+  silently dead on every map (it duck-called a method only the legacy terrain had) —
+  rewired via new `HCTrack.gap_ahead()`. Also: drift state no longer survives retry;
+  test-money button debug-gated; sidecar CoM respects `com_height`; dead `tippiness`
+  data removed; AutoDrive covers all maps via `MAP_KEYS`; CC-BY tree credits added.
+- **HCTerrain deleted** (858 lines of unreachable legacy corridor terrain + stale
+  GapTest). One road system. `has_method` guards stripped where a null-check suffices —
+  missing terrain methods now crash loudly instead of silently disabling features.
+- **God files split, behavior-preserving**: HCMain 2036→~1400 (shop/garage UI →
+  `HCShop.gd`); HCCar 2685→~1720 (procedural bodies → `HCCarBodyBuilder.gd`, car-child
+  FX → `HCCarFX.gd`). GLB kit path, bolt-ons, skids, shed panels stayed on HCCar by
+  design. The HCCar↔helper preload cycle is deliberate (see design-doc waivers).
+- **Acceptance**: battery ×5 zero flakes; AutoDrive telemetry decimeter-identical to
+  pre-refactor on all 4 maps (712.6/992.2/346.4/479.1 m); title + map screenshots
+  eyeballed (midnight headlights confirmed working through the extracted builder).
+- Full design doc + review trail: `docs/plans/2026-07-03-foundation-pass-design.md`.
+  Deferred/fiddle-later backlog: `DEFERRED.md` (local, gitignored).
+- Owner play-approval of canyon/alpine/midnight is STILL the standing ask; audio is
+  still the top feature-roadmap item. The foundation is now clean to build both on.
+
 ## Update (2026-07-03, third pass — "HC v5")
 
 - **Random pop/hop bug fixed** (anti-tunnel floor now per-corner with a 0.35 m dead-band);

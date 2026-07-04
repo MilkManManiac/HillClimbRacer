@@ -1,7 +1,7 @@
 extends Area3D
-## A collectible floating along the road / over the gap jumps. Three flavours:
-## coin (cash), fuel (refill), nitro (boost). Built entirely in code so there's no
-## scene dependency. The player car is a RigidBody3D on physics layer 1 that adds
+## A collectible floating along the road / over the gap jumps. Four flavours:
+## coin (cash), fuel (refill), nitro (boost), milk (rare big refuel — ask Milky).
+## Built entirely in code so there's no scene dependency. The player car is a RigidBody3D on physics layer 1 that adds
 ## itself to the "car" group in _ready; this Area3D monitors layer 1 and only reacts
 ## to that body, emitting `collected(kind, value)` then freeing itself.
 
@@ -61,6 +61,34 @@ func _build_visual() -> void:
 			mat.emission_enabled = true
 			mat.emission = Color(0.4, 0.05, 0.04)
 			mat.emission_energy_multiplier = 0.3
+		"milk":
+			# A wholesome low-poly milk carton (a tribute to the game's owner, "Milky").
+			# Spins and bobs like a coin so it reads as the rare, special one.
+			var body := BoxMesh.new()
+			body.size = Vector3(0.52, 0.72, 0.52)
+			mi.mesh = body
+			mat.albedo_color = Color(0.96, 0.96, 0.94)
+			mat.roughness = 0.55
+			mat.emission_enabled = true
+			mat.emission = Color(0.85, 0.88, 0.95)
+			mat.emission_energy_multiplier = 0.25
+			var gable := MeshInstance3D.new()
+			var prism := PrismMesh.new()
+			prism.size = Vector3(0.52, 0.3, 0.52)
+			gable.mesh = prism
+			gable.position = Vector3(0, 0.51, 0)
+			gable.material_override = mat
+			_visual.add_child(gable)
+			var band := MeshInstance3D.new()
+			var band_box := BoxMesh.new()
+			band_box.size = Vector3(0.54, 0.2, 0.54)
+			band.mesh = band_box
+			band.position = Vector3(0, -0.1, 0)
+			var band_mat := StandardMaterial3D.new()
+			band_mat.albedo_color = Color(0.3, 0.5, 0.85)
+			band_mat.roughness = 0.55
+			band.material_override = band_mat
+			_visual.add_child(band)
 		"nitro":
 			var bottle := CylinderMesh.new()
 			bottle.top_radius = 0.18
@@ -108,13 +136,15 @@ func _on_body_entered(body: Node) -> void:
 	_spawn_collect_burst()
 	queue_free()
 
-## Gold sparks for a coin, red for fuel, cyan for nitro.
+## Gold sparks for a coin, red for fuel, cyan for nitro, milk-white for milk.
 func _burst_color() -> Color:
 	match kind:
 		"fuel":
 			return Color(0.95, 0.18, 0.14)
 		"nitro":
 			return Color(0.15, 0.85, 0.95)
+		"milk":
+			return Color(0.97, 0.97, 0.92)
 		_:
 			return Color(1.0, 0.84, 0.2)
 

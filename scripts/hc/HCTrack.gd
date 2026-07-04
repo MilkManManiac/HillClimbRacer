@@ -76,6 +76,9 @@ const PK_BEHIND := 60.0          # free pickups once this far behind the car
 const PK_COIN_VALUE := 20.0      # cash per coin
 const PK_FUEL_VALUE := 14.0      # fuel units per can (deliberately small — a sip, not a fill)
 const PK_FUEL_SLOT := 8          # a fuel can every Nth slot (~128 m); the rest are coins
+const PK_MILK_VALUE := 0.3       # milk refills this FRACTION of the tank (handler scales it)
+const PK_MILK_SLOT := 29         # rare milk carton every Nth slot (~464 m; prime, so it
+                                 # rarely collides with the fuel cadence — fuel wins ties)
 const PK_ARC_COINS := 6          # coins arced over each gap jump
 const PK_ARC_PEAK := 7.0         # arc apex above the launch level
 var _pk_root: Node3D
@@ -326,7 +329,7 @@ func _project(x: float, z: float) -> Dictionary:
 	_proj_i = i
 	return _project_at(i, x, z)
 
-# --- public interface (matches HCTerrain so it drops in behind the toggle) ----
+# --- public interface (consumed by HCCar / HCMain through their `terrain` ref) ---
 func set_target(t: Node3D) -> void:
 	_target = t
 	_proj_i = 0
@@ -354,6 +357,25 @@ func lateral_off(pos: Vector3) -> float:
 ## Drivable half-width here (wider through turns).
 func road_half_here(pos: Vector3) -> float:
 	return lerpf(road_half, road_half_turn, _project(pos.x, pos.z).w)
+
+## First gap ahead of `pos` within `max_dist` metres of arc-length.
+## Returns {} when none. dist = metres from pos to the void lip.
+func gap_ahead(pos: Vector3, max_dist: float = 100.0) -> Dictionary:
+	if _gsamp.is_empty() or _gaps.is_empty():
+		return {}
+	var p := _project(pos.x, pos.z)
+	var s: float = p.s
+	var i: int = clampi(p.i, 0, _gsamp.size() - 1)
+	var last := mini(_gsamp.size() - 1, i + maxi(0, int(max_dist / STEP)))
+	for j in range(i, last + 1):
+		var gi := _gsamp[j]
+		if gi < 0:
+			continue
+		var g: Dictionary = _gaps[gi]
+		var lip: float = g.cs - g.vw * 0.5
+		if lip > s:
+			return {"dist": lip - s, "vw": g.vw}
+	return {}
 
 ## Ground height at an arbitrary world (x,z) — rolling hills + carved jumps.
 ## Continuous everywhere (segment-projected s/lat), so finite-difference
@@ -564,6 +586,9 @@ func _spawn_pickup_at_s(s: float) -> void:
 	if slot % PK_FUEL_SLOT == 0:
 		kind = "fuel"
 		value = PK_FUEL_VALUE
+	elif slot > 0 and slot % PK_MILK_SLOT == 0:
+		kind = "milk"
+		value = PK_MILK_VALUE
 	# lateral weave for coins so the line isn't a dead-straight rail (perp = road right)
 	var off := 0.0
 	if kind == "coin":

@@ -23,5 +23,7 @@ func _physics_process(_d: float) -> void:
 			_streak += 1; _maxstreak = maxi(_maxstreak, _streak)
 		else: _streak = 0
 	if _f == 1800:
-		print("[hc] wings=%s longest_jump=%d frames (%.2fs at 120hz)" % [str(_wings), _maxstreak, _maxstreak/120.0])
-		get_tree().quit()
+		var dist := float(_car.get("distance"))
+		var ok := dist >= 150.0 and not bool(_car.get("dead"))
+		print("[hc] wings=%s longest_jump=%d frames (%.2fs at 120hz) dist=%.0fm %s" % [str(_wings), _maxstreak, _maxstreak / 120.0, dist, "PASS" if ok else "FAIL (need alive + dist>=150m)"])
+		get_tree().quit(0 if ok else 1)

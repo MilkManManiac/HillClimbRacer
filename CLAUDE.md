@@ -7,8 +7,11 @@ alone unless asked. Read `HANDOFF.md` for vision, current state, and the roadmap
 
 ## Godot (not on PATH)
 
-- GUI: `C:\Users\weshu\Tools\Godot\Godot_v4.6.3-stable_win64.exe --path .`
-- Console (headless/CI): `C:\Users\weshu\Tools\Godot\Godot_v4.6.3-stable_win64_console.exe`
+- Windows GUI: `C:\Users\weshu\Tools\Godot\Godot_v4.6.3-stable_win64.exe --path .`
+- Windows console (headless/CI): `C:\Users\weshu\Tools\Godot\Godot_v4.6.3-stable_win64_console.exe`
+- macOS (Trey's MacBook): `~/Tools/Godot/Godot.app/Contents/MacOS/Godot` — one binary
+  for GUI and headless (add `--headless`). Verified 2026-07-03: full battery green,
+  SmoothProbe numbers identical to the Windows baseline.
 - Parse-check: `<console> --headless --path . --check-only --script scripts/hc/HCCar.gd`
 - Boot smoke: `<console> --headless --path . --quit-after 200`
 
@@ -21,6 +24,15 @@ arrived as a zip (no `.git`), run `git init && git add -A && git commit -m "impo
 first so you can checkpoint and diff your own work.
 
 ## Verification battery — run after every meaningful change
+
+One command (any OS, exits nonzero on any failure — SmoothProbe and HCDrive gate
+their thresholds themselves now):
+
+```
+bash tests/run_battery.sh          # GODOT=/path/to/binary overrides discovery
+```
+
+Or the individual probes:
 
 ```
 <console> --headless --path . tests/SmoothProbe.tscn    # REQUIRED: vert rms ≤ 3.6, pitch_jerk rms ≤ 0.6
