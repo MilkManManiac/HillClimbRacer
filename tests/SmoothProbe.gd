@@ -5,6 +5,9 @@ extends Node
 ## RMS + worst-case at the end. Run headless:
 ##   <godot_console> --headless --path . tests/SmoothProbe.tscn
 
+const MAX_VERT_RMS := 3.0
+const MAX_JERK_RMS := 0.6
+
 var _f := 0
 var _car: RigidBody3D
 var _root: Node
@@ -73,7 +76,14 @@ func _physics_process(delta: float) -> void:
 			_win_n0 = _samples
 	if _f == 2400 or (_f > 240 and bool(_car.get("dead"))):
 		var n := maxi(_samples, 1)
+		var vert_rms := sqrt(_acc_sq / n)
+		var jerk_rms := sqrt(_jerk_sq / n)
 		print("[smooth] dist=%.0fm grounded_ticks=%d air_ticks=%d" % [float(_car.get("distance")), _samples, _air_ticks])
-		print("[smooth] vert_accel  rms=%.2f m/s^2   worst=%.2f m/s^2" % [sqrt(_acc_sq / n), _worst_acc])
-		print("[smooth] pitch_jerk  rms=%.2f rad/s^2 worst=%.2f rad/s^2" % [sqrt(_jerk_sq / n), _worst_jerk])
-		get_tree().quit()
+		print("[smooth] vert_accel  rms=%.2f m/s^2   worst=%.2f m/s^2" % [vert_rms, _worst_acc])
+		print("[smooth] pitch_jerk  rms=%.2f rad/s^2 worst=%.2f rad/s^2" % [jerk_rms, _worst_jerk])
+		# gate: these thresholds are the project's smoothness contract (see CLAUDE.md).
+		# Death by fuel exhaustion near the end is a normal probe conclusion — only
+		# the smoothness numbers gate.
+		var ok := vert_rms <= MAX_VERT_RMS and jerk_rms <= MAX_JERK_RMS and _samples > 0
+		print("[smooth] %s" % ("PASS" if ok else "FAIL (gates: vert rms<=%.1f jerk rms<=%.1f)" % [MAX_VERT_RMS, MAX_JERK_RMS]))
+		get_tree().quit(0 if ok else 1)
