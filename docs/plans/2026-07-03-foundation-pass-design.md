@@ -165,6 +165,32 @@ Audio revival, trick system, pause menu, per-map sprint constants, VSPEC/VEHICLE
 merge, shed-clone script file, nitro pickups, tile-build threading, horror-game
 cleanup, export configuration — all logged in DEFERRED.md, untouched here.
 
+## Amendments (2026-07-03 design review, codex safe lane — 5 findings, all dispositioned)
+
+- **A1 (accepted-reduced, was Major):** `HCCarBodyBuilder` extracts ONLY the procedural
+  body builders + geometry/material helpers. The GLB body-kit path (`_build_glb_body`,
+  `_fit_wheels_to_body`, wheel/ray mutation, `apply_wheel_size`) stays in HCCar,
+  untouched. Interface stands: `build(body_root, vehicle_type) -> Array[SpotLight3D]`.
+- **A2 (accepted-reduced, was Major):** extraction helpers are retained as host fields
+  (`var _shop: HCShop`). UI signal connections may target helper methods directly —
+  every connected Control is a descendant of the host and is freed with it, so no
+  after-free callback exists. No dispose()/validity machinery (YAGNI). External call
+  sites still go through host stubs.
+- **A3 (accepted-reduced, was Major):** skid marks and shed-panel logic (world-parented,
+  vehicle-swap-sensitive) STAY in HCCar. `HCCarFX` extracts only car-child FX: dust,
+  ring puff, tire/exhaust/damage smoke, backfire, wind streaks, boost flames/light,
+  underglow.
+- **A4 (accepted, Minor):** W1 adds `tests/GapProbe.gd/.tscn` — hermetic, bare HCTrack
+  with a fixed seed, asserts `gap_ahead()` at: before ramp (dist ≈ lip−s), on ramp
+  pre-lip (gap still reported), past lip (current gap NOT reported; next gap or {}),
+  and near path end ({}). Exits nonzero on failure; added to `tests/run_battery.sh`.
+- **A5 (accepted, Minor):** W2 guard policy rewritten — `has_method` guards are removed
+  only where a `terrain != null` (or `is_instance_valid`) check remains in force;
+  probes (BodyKitProbe, CarBodyProbe) legitimately build HCCar with `terrain == null`.
+  HCMain-owned terrain calls (terrain constructed unconditionally) may be direct.
+- **Rejected:** the verdict's "consider cutting W3 from the pass" — the owner
+  explicitly commissioned the god-file splits; A1–A3 remove the identified risk.
+
 ## Wave plan / lanes
 
 | Wave | Work | Implement | Review | Fix |
