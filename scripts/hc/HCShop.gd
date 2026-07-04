@@ -105,7 +105,11 @@ func _build_shop() -> void:
 	# the RETRY / NEW GAME footer stays pinned below the tabs.
 	_shop_tabs = TabContainer.new()
 	_shop_tabs.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_shop_tabs.custom_minimum_size = Vector2(624, 430)
+	# min height low enough that the footer (RETRY / NEW GAME / test money / hints)
+	# ALWAYS fits inside the 700px panel even with the tall death header — the tabs
+	# expand into whatever space is left and their lists scroll internally.
+	# 430 used to clip everything below RETRY off the panel (found in playtest).
+	_shop_tabs.custom_minimum_size = Vector2(624, 220)
 	_shop_tabs.tab_alignment = TabBar.ALIGNMENT_CENTER
 	box.add_child(_shop_tabs)
 	var garage_list := _make_tab("🚗  Garage")
