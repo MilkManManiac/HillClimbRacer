@@ -25,7 +25,7 @@ if [ -z "$GODOT_BIN" ]; then
 	exit 2
 fi
 
-PROBES=(SmoothProbe HCDrive MapProbe TitleFlowProbe CarBodyProbe)
+PROBES=(SmoothProbe HCDrive MapProbe TitleFlowProbe CarBodyProbe GapProbe)
 fails=0
 for p in "${PROBES[@]}"; do
 	out="$("$GODOT_BIN" --headless --path . "tests/$p.tscn" 2>&1)"

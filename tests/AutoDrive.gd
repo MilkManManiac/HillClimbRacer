@@ -1,5 +1,5 @@
 extends Node
-## Autonomous test-driver bot: plays all three HC maps like a decent (not perfect)
+## Autonomous test-driver bot: plays every HC map like a decent (not perfect)
 ## human, gathering full-run playability data. Data-gathering probe, not pass/fail —
 ## always exits 0. Run headless:
 ##   <godot_console> --headless --path . tests/AutoDrive.tscn
@@ -10,7 +10,6 @@ extends Node
 ## pattern (process_mode ALWAYS + _begin_game past the title pause).
 
 const HCMainScript := preload("res://scripts/hc/HCMain.gd")
-const MAP_KEYS := ["hills", "canyon", "alpine"]
 const MAX_FRAMES := 7200      # 60s @ 60Hz physics tick cap per map
 const SAMPLE_EVERY := 600     # 5s
 
@@ -18,7 +17,7 @@ func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	var root_scene := load("res://scenes/HillClimb.tscn") as PackedScene
 	var summary: Array = []
-	for key in MAP_KEYS:
+	for key in HCMainScript.MAP_KEYS:
 		var result: Dictionary = await _run_map(root_scene, key)
 		summary.append(result)
 	_release_all()

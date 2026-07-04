@@ -355,6 +355,25 @@ func lateral_off(pos: Vector3) -> float:
 func road_half_here(pos: Vector3) -> float:
 	return lerpf(road_half, road_half_turn, _project(pos.x, pos.z).w)
 
+## First gap ahead of `pos` within `max_dist` metres of arc-length.
+## Returns {} when none. dist = metres from pos to the void lip.
+func gap_ahead(pos: Vector3, max_dist: float = 100.0) -> Dictionary:
+	if _gsamp.is_empty() or _gaps.is_empty():
+		return {}
+	var p := _project(pos.x, pos.z)
+	var s: float = p.s
+	var i: int = clampi(p.i, 0, _gsamp.size() - 1)
+	var last := mini(_gsamp.size() - 1, i + maxi(0, int(max_dist / STEP)))
+	for j in range(i, last + 1):
+		var gi := _gsamp[j]
+		if gi < 0:
+			continue
+		var g: Dictionary = _gaps[gi]
+		var lip: float = g.cs - g.vw * 0.5
+		if lip > s:
+			return {"dist": lip - s, "vw": g.vw}
+	return {}
+
 ## Ground height at an arbitrary world (x,z) — rolling hills + carved jumps.
 ## Continuous everywhere (segment-projected s/lat), so finite-difference
 ## gradients over it are smooth — safe for suspension and ramp launches.

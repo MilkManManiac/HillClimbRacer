@@ -156,7 +156,7 @@ const VEHICLES := {
 		"land_base": 8.0, "susp_rest": 0.6, "susp_per": 0.16, "wheel_rad": 0.46, "wheel_per": 0.1,
 		"health_base": 95.0, "grip": 7.5, "gravity": 17.0, "steer": 0.36, "corner_grip": 15.0,
 		# lazy boxy tail, scrubs a lot, tall & tippy — wallows through bends
-		"drift_yaw_max": 2.4, "drift_snap": 4.0, "drift_scrub": 1.4, "tippiness": 0.55, "com_height": -0.2, "slide_thresh": 0.78,
+		"drift_yaw_max": 2.4, "drift_snap": 4.0, "drift_scrub": 1.4, "com_height": -0.2, "slide_thresh": 0.78,
 	},
 	"hotrod": {
 		"name": "Hot Rod", "price": 1200,
@@ -167,7 +167,7 @@ const VEHICLES := {
 		"land_base": 9.0, "susp_rest": 0.55, "susp_per": 0.18, "wheel_rad": 0.5, "wheel_per": 0.12,
 		"health_base": 100.0, "grip": 8.5, "gravity": 17.0, "steer": 0.4, "corner_grip": 24.0,
 		# the balanced baseline — an eager, catchable slide
-		"drift_yaw_max": 3.1, "drift_snap": 7.0, "drift_scrub": 0.9, "tippiness": 0.35, "com_height": -0.4, "slide_thresh": 0.85,
+		"drift_yaw_max": 3.1, "drift_snap": 7.0, "drift_scrub": 0.9, "com_height": -0.4, "slide_thresh": 0.85,
 	},
 	"monster": {
 		"name": "Monster Truck", "price": 3200,
@@ -178,7 +178,7 @@ const VEHICLES := {
 		"land_base": 11.0, "susp_rest": 0.85, "susp_per": 0.34, "wheel_rad": 0.5, "wheel_per": 0.38,
 		"health_base": 165.0, "grip": 12.0, "gravity": 20.0, "steer": 0.34, "corner_grip": 14.0,
 		# heavy lazy tail, scrubs HARD, wildly top-heavy — flops out of hard corners
-		"drift_yaw_max": 2.0, "drift_snap": 3.5, "drift_scrub": 1.8, "tippiness": 0.95, "com_height": 0.1, "slide_thresh": 0.72,
+		"drift_yaw_max": 2.0, "drift_snap": 3.5, "drift_scrub": 1.8, "com_height": 0.1, "slide_thresh": 0.72,
 	},
 	"sports": {
 		"name": "Sports Car", "price": 5500,
@@ -189,7 +189,7 @@ const VEHICLES := {
 		"land_base": 10.0, "susp_rest": 0.45, "susp_per": 0.14, "wheel_rad": 0.5, "wheel_per": 0.11,
 		"health_base": 95.0, "grip": 10.0, "gravity": 17.0, "steer": 0.42, "corner_grip": 32.0,
 		# sharp responsive rotation, keeps its momentum, low & glued — barely leans
-		"drift_yaw_max": 3.6, "drift_snap": 9.5, "drift_scrub": 0.5, "tippiness": 0.12, "com_height": -0.55, "slide_thresh": 0.95,
+		"drift_yaw_max": 3.6, "drift_snap": 9.5, "drift_scrub": 0.5, "com_height": -0.55, "slide_thresh": 0.95,
 	},
 	"f1": {
 		"name": "F1 Car", "price": 13000,
@@ -201,7 +201,7 @@ const VEHICLES := {
 		"health_base": 75.0, "grip": 15.0, "gravity": 17.0, "steer": 0.46, "corner_grip": 74.0,
 		# razor rotation, twitchy, glued to the deck — a track weapon that never leans.
 		# HIGH corner_grip = it holds tight lines on pure grip without breaking into a drift.
-		"drift_yaw_max": 3.8, "drift_snap": 11.0, "drift_scrub": 0.45, "tippiness": 0.05, "com_height": -0.6, "slide_thresh": 0.99,
+		"drift_yaw_max": 3.8, "drift_snap": 11.0, "drift_scrub": 0.45, "com_height": -0.6, "slide_thresh": 0.99,
 	},
 }
 const VEH_KEYS := ["minivan", "hotrod", "monster", "sports", "f1"]
@@ -217,7 +217,6 @@ var _kit_options: Array[String] = [""]     # "" (stock) + every assets/car/*.glb
 var _kit_lbl: Label                        # garage "BODY KIT" readout
 var _owned := {"minivan": true, "hotrod": false, "monster": false, "sports": false, "f1": false}
 var _was_dead := false
-var _respawning := false
 var _shake := 0.0           # camera shake magnitude (decays)
 var _shake_off := Vector3.ZERO
 var _fov_punch := 0.0       # transient FOV kick on hard landings
@@ -1452,14 +1451,15 @@ func _build_shop() -> void:
 	_reset_btn.pressed.connect(_on_reset_pressed)
 	box.add_child(_reset_btn)
 
-	# TEST-ONLY: instant cash so you can buy anything while iterating
-	_money_btn = Button.new()
-	_money_btn.text = "🧪 +$1,000,000  (test money)"
-	_money_btn.custom_minimum_size = Vector2(0, 34)
-	_money_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_money_btn.add_theme_color_override("font_color", Color(0.6, 1.0, 0.7))
-	_money_btn.pressed.connect(_on_test_money)
-	box.add_child(_money_btn)
+	if OS.is_debug_build():
+		# TEST-ONLY: instant cash so you can buy anything while iterating
+		_money_btn = Button.new()
+		_money_btn.text = "🧪 +$1,000,000  (test money)"
+		_money_btn.custom_minimum_size = Vector2(0, 34)
+		_money_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		_money_btn.add_theme_color_override("font_color", Color(0.6, 1.0, 0.7))
+		_money_btn.pressed.connect(_on_test_money)
+		box.add_child(_money_btn)
 
 	# navigation legend — keycap "icons" so it's obvious how to move through the menu
 	box.add_child(HSeparator.new())
@@ -1587,7 +1587,8 @@ func _relink_active_chain() -> void:
 				chain.append(_veh_rows[vk].buy)
 	chain.append(_restart_btn)
 	chain.append(_reset_btn)
-	chain.append(_money_btn)
+	if _money_btn:
+		chain.append(_money_btn)
 	_chain_focus(chain)
 
 ## Wire an ordered list of controls into a wrapping top/bottom focus ring.
@@ -2016,17 +2017,16 @@ func _update_sprint_hud() -> void:
 
 ## Warn the player to build speed on a gap run-up (green = you'll make it).
 func _update_gap_telegraph() -> void:
-	if _respawning or bool(_car.get("dead")):
+	if bool(_car.get("dead")):
 		return   # _big is owned by the wipeout / death screen
-	if not _terrain.has_method("_gap_for_z"):
+	if _terrain == null or not _terrain.has_method("gap_ahead"):
 		_big.text = ""   # no gaps on the winding-road track yet
 		return
-	var gz: float = _car.global_position.z
-	var g: Dictionary = _terrain.call("_gap_for_z", gz)
-	if g.is_empty() or gz <= g.lip_z or (gz - g.lip_z) > 75.0:
+	var g: Dictionary = _terrain.call("gap_ahead", _car.global_position)
+	if g.is_empty() or float(g.dist) > 75.0:
 		_big.text = ""   # not approaching a gap
 		return
-	var v_req: float = 6.0 + float(g.void_w) * 0.9        # m/s needed to clear it
+	var v_req: float = 6.0 + float(g.vw) * 0.9        # m/s needed to clear it
 	var spd: float = _car.linear_velocity.length()
 	if spd >= v_req:
 		_big.text = "SEND IT!  ▶▶"

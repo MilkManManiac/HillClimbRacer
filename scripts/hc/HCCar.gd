@@ -650,6 +650,10 @@ func reset_run(start: Vector3) -> void:
 	_trick_timer = 0.0
 	_air_time = 0.0
 	_flip_accum = 0.0
+	_grip_break = 0.0
+	_steer = 0.0
+	_drift_yaw_cur = 0.0
+	drifting = false
 	gaps_cleared = 0
 	checkpoint_z = 0.0
 	_gap_armed = false
@@ -1817,7 +1821,7 @@ func apply_sidecar(level: int) -> void:
 	# shift the center of mass toward the sidecar so it leans/pulls (its wheel
 	# keeps it supported, so it's wacky-but-drivable, not a death spin)
 	var shift: float = 0.0 if not _sidecar_on else clampf(float(level) * 0.06, 0.0, 0.34)
-	center_of_mass = Vector3(shift, -0.4, 0.0)
+	center_of_mass = Vector3(shift, com_height, 0.0)
 
 func _metal(col: Color, rough := 0.35) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()

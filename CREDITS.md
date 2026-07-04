@@ -11,4 +11,5 @@
 
 (Additional CC-BY assets downloaded but not currently used in-game:
 "80s Car" by Nick Ladd, "Old Car" by Attila Dobák, "Toyota Hilux 97" by
-Muhammad Reyhan, "Stop sign" by Poly by Google — all CC-BY via Poly Pizza.)
+Muhammad Reyhan, "Stop sign" by Poly by Google, "Pine Tree" by ballentine,
+"Pine Tree" by dannibittman, "Pine Tree" by minipoly — all CC-BY via Poly Pizza.)
