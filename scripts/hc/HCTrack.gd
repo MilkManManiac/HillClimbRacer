@@ -326,7 +326,7 @@ func _project(x: float, z: float) -> Dictionary:
 	_proj_i = i
 	return _project_at(i, x, z)
 
-# --- public interface (matches HCTerrain so it drops in behind the toggle) ----
+# --- public interface (consumed by HCCar / HCMain through their `terrain` ref) ---
 func set_target(t: Node3D) -> void:
 	_target = t
 	_proj_i = 0

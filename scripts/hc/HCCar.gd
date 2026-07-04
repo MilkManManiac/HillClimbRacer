@@ -242,7 +242,7 @@ func _physics_process(delta: float) -> void:
 	var was_grounded := _grounded
 	_grounded = false
 	var gnormal := Vector3.ZERO   # averaged ground normal under the wheels (for pitch stability)
-	var analytic: bool = terrain != null and terrain.has_method("ground_info")
+	var analytic: bool = terrain != null
 	for i in range(_rays.size()):
 		var d := -1.0   # contact distance from the wheel-ray origin (-1 = in the air)
 		if analytic:
@@ -507,7 +507,7 @@ func _physics_process(delta: float) -> void:
 	# convert forward speed into UPWARD velocity via the ramp's own slope (rate = slope x
 	# horizontal speed): you arc off the lip and the faster you hit it, the bigger the air.
 	# Gated to gap ramps so rolling hills never fling the car (that was the old follow_vy bug).
-	if _grounded and terrain and terrain.has_method("gap_state"):
+	if _grounded and terrain:
 		var gs: Dictionary = terrain.call("gap_state", global_position)
 		if gs.get("active", false) and gs.get("on_road", true) and not gs.get("over_void", false) and not gs.get("past_far", false):
 			var e := 1.5
@@ -559,7 +559,7 @@ func _physics_process(delta: float) -> void:
 	if _grounded and _road_off() > _road_half_here() + 1.5:
 		health = 0.0
 	fuel = maxf(fuel, 0.0)
-	if terrain and terrain.has_method("progress"):
+	if terrain:
 		distance = maxf(distance, terrain.call("progress", global_position))   # arc-length on the track
 	else:
 		distance = maxf(distance, -global_position.z)
@@ -573,7 +573,7 @@ func _on_land(vel: Vector3) -> void:
 	# even at high speed, so riding the slope down is free while pancaking onto
 	# flat ground from the same height still hurts.
 	var n := Vector3.UP
-	if terrain and terrain.has_method("ground_info"):
+	if terrain:
 		var gi: Dictionary = terrain.call("ground_info", global_position.x, global_position.z)
 		n = gi.n
 	var into: float = maxf(0.0, -vel.dot(n))
@@ -619,24 +619,16 @@ func _on_land(vel: Vector3) -> void:
 	_air_time = 0.0
 	_flip_accum = 0.0
 
-## Road centre-line X at our forward position (0 if the terrain has no curves).
-func _road_cx() -> float:
-	if terrain and terrain.has_method("road_center_x"):
-		return terrain.call("road_center_x", global_position.z)
-	return 0.0
-
 ## Lateral distance from the road centre (path-projected on the winding track).
 func _road_off() -> float:
-	if terrain and terrain.has_method("lateral_off"):
+	if terrain:
 		return terrain.call("lateral_off", global_position)
-	return absf(global_position.x - _road_cx())
+	return absf(global_position.x)
 
 ## Drivable half-width here (wider through curves); falls back to road_half.
 func _road_half_here() -> float:
-	if terrain and terrain.has_method("road_half_here"):
+	if terrain:
 		return terrain.call("road_half_here", global_position)
-	if terrain and terrain.has_method("road_half_at"):
-		return terrain.call("road_half_at", global_position.z)
 	return road_half
 
 func reset_run(start: Vector3) -> void:
@@ -686,30 +678,7 @@ func get_speed_kmh() -> float: return linear_velocity.length() * 3.6
 func _check_gap() -> void:
 	if terrain == null or dead or _falling_out:
 		return
-	if terrain.has_method("gap_state"):
-		_check_gap_track()
-		return
-	if not terrain.has_method("_gap_for_z"):
-		return
-	var z := global_position.z
-	var g: Dictionary = terrain.call("_gap_for_z", z)
-	if not g.is_empty():
-		var lvl: float = g.level
-		var over_void: bool = z < g.lip_z and z > g.far_z
-		if over_void and not _grounded:
-			_gap_armed = true   # airborne over the void
-		elif _gap_armed and z <= g.far_z and global_position.y > lvl - 3.5 and _road_off() <= _road_half_here():
-			# crossed the far edge ABOVE the fail line = you made it — clear it now, even
-			# mid-air. (A big jump can overshoot the whole landing platform; requiring a
-			# grounded touch there left the gap "armed" and falsely wrecked you on the
-			# lower terrain past it.)
-			_on_gap_cleared(int(g.idx))
-		# fell in: dropped below the gap table WHILE still over the void (also catches a
-		# grounded slide-in, since over_void is true whether or not a wheel is touching).
-		if over_void and global_position.y < lvl - 3.5:
-			_on_gap_failed()
-	elif _gap_armed and global_position.y < -12.0:
-		_on_gap_failed()
+	_check_gap_track()
 
 ## Jump resolution on the 2-D winding track (same rules as the z-corridor, but the
 ## track reports gap state by our world position instead of by z).

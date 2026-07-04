@@ -4,11 +4,9 @@ extends Node3D
 ## Enter restarts. Milestone 1 — prove the moment-to-moment is fun. No economy yet.
 
 const SkyScript := preload("res://scripts/Sky.gd")
-const HCTerrainScript := preload("res://scripts/hc/HCTerrain.gd")
 const HCTrackScript := preload("res://scripts/hc/HCTrack.gd")
 const HCCarScript := preload("res://scripts/hc/HCCar.gd")
 const HCAudioScript := preload("res://scripts/hc/HCAudio.gd")
-const USE_TRACK := true   # true = new 2-D winding road (HCTrack); false = classic corridor
 
 var _car: RigidBody3D
 var _audio: Node
@@ -632,8 +630,7 @@ func _tune_arcade_environment(sky: Node3D) -> void:
 
 func _setup_terrain_and_car() -> void:
 	_terrain = Node3D.new()
-	# TOGGLE: the new 2-D winding-ribbon road (HCTrack) vs the classic z-corridor.
-	_terrain.set_script(HCTrackScript if USE_TRACK else HCTerrainScript)
+	_terrain.set_script(HCTrackScript)
 	_apply_map_overrides(_terrain)   # map knobs must land BEFORE add_child (gen runs in _ready)
 	add_child(_terrain)
 	_car = RigidBody3D.new()
@@ -641,13 +638,10 @@ func _setup_terrain_and_car() -> void:
 	_car.set("vehicle_type", _vehicle)   # set BEFORE add_child so _ready builds the right ride
 	_car.set("body_glb", str(_body_kits.get(_vehicle, "")))   # imported shell, if one is picked
 	add_child(_car)
-	_car.set("road_half", _terrain.get("road_half") if USE_TRACK else _terrain.get("road_half_width"))
+	_car.set("road_half", _terrain.get("road_half"))
 	_car.set("terrain", _terrain)
 	# place start above the road so it drops onto it
-	if _terrain.has_method("spawn_pos"):
-		_start = _terrain.call("spawn_pos")   # track: a bit forward so we don't roll off the start
-	else:
-		_start.y = _terrain.call("height_at", 0.0, 0.0) + 4.0
+	_start = _terrain.call("spawn_pos")   # a bit forward so we don't roll off the start
 	_car.global_position = _start
 	_terrain.call("set_target", _car)
 	_car.connect("gap_failed", _on_car_gap_failed)
@@ -700,16 +694,13 @@ func _apply_map() -> void:
 		remove_child(old)
 		old.queue_free()
 	_terrain = Node3D.new()
-	_terrain.set_script(HCTrackScript if USE_TRACK else HCTerrainScript)
+	_terrain.set_script(HCTrackScript)
 	_apply_map_overrides(_terrain)
 	add_child(_terrain)
 	if _car:
-		_car.set("road_half", _terrain.get("road_half") if USE_TRACK else _terrain.get("road_half_width"))
+		_car.set("road_half", _terrain.get("road_half"))
 		_car.set("terrain", _terrain)
-	if _terrain.has_method("spawn_pos"):
-		_start = _terrain.call("spawn_pos")
-	else:
-		_start.y = _terrain.call("height_at", 0.0, 0.0) + 4.0
+	_start = _terrain.call("spawn_pos")
 	_terrain.call("set_target", _car)
 	_terrain.connect("pickup_collected", _on_pickup_collected)
 	if _sky:
@@ -833,7 +824,7 @@ func _update_camera(delta: float) -> void:
 	# when there's nothing to drive (dead / no car / shop open) so it never lingers.
 	var lead_target := Vector3.ZERO
 	var la_active: bool = not (_car == null or bool(_car.get("dead")) or (_shop != null and _shop.visible))
-	if la_active and _terrain != null and _terrain.has_method("path_ahead"):
+	if la_active and _terrain != null:
 		var here: Vector3 = _terrain.call("path_ahead", _car.global_position, 0.0)
 		var ahead: Vector3 = _terrain.call("path_ahead", _car.global_position, CAM_LOOKAHEAD_DIST)
 		var lead := ahead - here
@@ -905,7 +896,7 @@ func _update_camera(delta: float) -> void:
 func _restart() -> void:
 	_apply_upgrades()
 	_car.call("reset_run", _start)
-	if _terrain and _terrain.has_method("reset_pickups"):
+	if _terrain:
 		_terrain.call("reset_pickups")   # re-stock the whole track each run
 	_cam.global_position = _start + Vector3(0, 6, 12)
 	_cam_heading = Vector3(0, 0, -1)
@@ -1708,12 +1699,9 @@ func _swap_vehicle(vk: String) -> void:
 	_car.set("vehicle_type", _vehicle)
 	_car.set("body_glb", str(_body_kits.get(_vehicle, "")))   # imported shell, if one is picked
 	add_child(_car)
-	_car.set("road_half", _terrain.get("road_half") if USE_TRACK else _terrain.get("road_half_width"))
+	_car.set("road_half", _terrain.get("road_half"))
 	_car.set("terrain", _terrain)
-	if _terrain.has_method("spawn_pos"):
-		_start = _terrain.call("spawn_pos")
-	else:
-		_start.y = _terrain.call("height_at", 0.0, 0.0) + 4.0
+	_start = _terrain.call("spawn_pos")
 	_car.global_position = _start
 	_terrain.call("set_target", _car)
 	_car.connect("gap_failed", _on_car_gap_failed)
@@ -2019,8 +2007,8 @@ func _update_sprint_hud() -> void:
 func _update_gap_telegraph() -> void:
 	if bool(_car.get("dead")):
 		return   # _big is owned by the wipeout / death screen
-	if _terrain == null or not _terrain.has_method("gap_ahead"):
-		_big.text = ""   # no gaps on the winding-road track yet
+	if _terrain == null:
+		_big.text = ""
 		return
 	var g: Dictionary = _terrain.call("gap_ahead", _car.global_position)
 	if g.is_empty() or float(g.dist) > 75.0:
