@@ -49,7 +49,14 @@ runs green on macOS with numbers identical to the Windows baseline.
   eyeballed (midnight headlights confirmed working through the extracted builder).
 - Full design doc + review trail: `docs/plans/2026-07-03-foundation-pass-design.md`.
   Deferred/fiddle-later backlog: `DEFERRED.md` (local, gitignored).
-- Owner play-approval of canyon/alpine/midnight is STILL the standing ask; audio is
+- **Post-pass additions**: Trey's live playtest found the death-shop footer (NEW GAME /
+  test-money / nav hints) clipped off the 700px panel — fixed (tabs min-height 220 +
+  EXPAND_FILL; `tests/ShopShot.tscn` proves it). And the **milk economy** landed: rare
+  milk-carton pickup (~every 464 m, +30% tank, "GOT MILK?" popup) plus MILKY on every
+  procedural license plate (`tests/MilkShot.tscn` renders both). Ask Milky.
+- **Shipped as PR #1** to MilkManManiac/HillClimbRacer (branch `foundation-pass`).
+- Owner play-approval of canyon/alpine/midnight: Trey approved Midnight Run in a live
+  session ("that slapped") — canyon/alpine still await dedicated runs. Audio is
   still the top feature-roadmap item. The foundation is now clean to build both on.
 
 ## Update (2026-07-03, third pass — "HC v5")

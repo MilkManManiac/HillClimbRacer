@@ -35,11 +35,12 @@ bash tests/run_battery.sh          # GODOT=/path/to/binary overrides discovery
 Or the individual probes:
 
 ```
-<console> --headless --path . tests/SmoothProbe.tscn    # REQUIRED: vert rms ≤ 3.6, pitch_jerk rms ≤ 0.6
-<console> --headless --path . tests/HCDrive.tscn        # full-throttle drive; prints [hc] line
-<console> --headless --path . tests/MapProbe.tscn       # all three maps boot + drive
+<console> --headless --path . tests/SmoothProbe.tscn    # REQUIRED: vert rms ≤ 3.0, pitch_jerk rms ≤ 0.6
+<console> --headless --path . tests/HCDrive.tscn        # full-throttle drive; alive + ≥150 m
+<console> --headless --path . tests/MapProbe.tscn       # all maps boot + drive (reads MAP_KEYS)
 <console> --headless --path . tests/TitleFlowProbe.tscn # title → map click → START → alive
 <console> --headless --path . tests/CarBodyProbe.tscn   # GLB car bodies load/scale
+<console> --headless --path . tests/GapProbe.tscn       # hermetic gap_ahead semantics
 ```
 
 Baseline SmoothProbe numbers (HC v5): `vert_accel rms=2.70` (worst ~26), `pitch_jerk
