@@ -148,6 +148,10 @@ var _shed_clone_script: GDScript              # lazily-built self-contained tumb
 # misplaced wheels. Falls back to the procedural body if the file fails to load.
 @export var body_glb: String = ""
 const HCCarBody := preload("res://scripts/hc/HCCarBody.gd")
+const HCCarBodyBuilderScript := preload("res://scripts/hc/HCCarBodyBuilder.gd")
+const HCCarFXScript := preload("res://scripts/hc/HCCarFX.gd")
+var _body_builder: RefCounted
+var _fx: RefCounted
 var _glb_top: float = 0.0   # imported shell's roof height (car-local); 0 = procedural body
 # INVARIANT: the box bottom (col_y - col.y/2) MUST sit BELOW the wheel-ray origin
 # (local y=0.5). If the box catches the car deeper than that, the ray origins drop
@@ -196,6 +200,8 @@ func _ready() -> void:
 	fuel = max_fuel
 	health = max_health
 	_prev_health = max_health
+	_body_builder = HCCarBodyBuilderScript.new(self)
+	_fx = HCCarFXScript.new(self)
 	_build_collision()
 	_build_rays()
 	_build_springs()
@@ -205,12 +211,9 @@ func _ready() -> void:
 	_build_cage()
 	_build_airbrake()
 	_build_cans()
-	_build_dust()
+	_fx.build()
 	_build_rockets()
-	_build_smoke()
-	_build_wind()
 	_build_skids()
-	_build_underglow()
 	_fit_parts()   # raise/scale the bolt-on upgrade parts to fit this vehicle
 	# sidecar removed for now (functions kept dormant; not built/applied)
 
@@ -300,7 +303,7 @@ func _physics_process(delta: float) -> void:
 	if boosting:
 		apply_central_force(fwd * boost_force)
 		fuel -= delta * 45.0 * fuel_eff   # rockets CHUG fuel — short bursts only
-	_update_flames(boosting, delta)
+	_fx.update_flames(boosting, delta)
 
 	# throttle = RT / W / Shift; brake = LT / S; left stick (A/D) steer & air yaw;
 	# left stick Y (W/S) = air pitch; right stick X (Q/E) = air roll
@@ -437,37 +440,7 @@ func _physics_process(delta: float) -> void:
 	# block above), and is purely visual so it's fine to sit in the FX section.
 	_check_panel_shed()
 
-	# --- smoke: tire smoke while drifting, exhaust while on the gas / boosting ---
-	# tire smoke rides the ACTUAL (suspension-compressed) rear wheel positions, and its
-	# initial velocity scales with current speed so a fast drift kicks a bigger plume
-	# than a slow crawl — the toggle (emitting) logic itself is unchanged.
-	var speed_k: float = clampf(speed / max_speed, 0.0, 1.0)
-	for i in range(_tire_smoke.size()):
-		var ts := _tire_smoke[i]
-		ts.emitting = drifting and _grounded
-		var wi: int = i + 2   # rear wheels are _wheel_meshes indices 2, 3
-		if wi < _wheel_meshes.size():
-			ts.global_position = _wheel_meshes[wi].global_position
-		var tpm := ts.process_material as ParticleProcessMaterial
-		if tpm:
-			tpm.initial_velocity_min = 0.8 + speed_k * 1.4
-			tpm.initial_velocity_max = 2.4 + speed_k * 3.0
-	var puffing: bool = (drive > 0.05 and fuel > 0.0) or boosting
-	for es in _exhaust_smoke:
-		es.emitting = puffing
-	# thin speed-line streaks once you're really moving (subsides at low speed / airborne)
-	if _wind_streaks:
-		_wind_streaks.emitting = speed > max_speed * 0.6
-	# damage smoke once the frame's beat up
-	if _damage_smoke:
-		_damage_smoke.emitting = health < max_health * 0.5
-	# backfire pop when you snap OFF the throttle at speed
-	_backfire_cd = maxf(_backfire_cd - delta, 0.0)
-	if _prev_drive > 0.55 and drive < 0.15 and speed > 8.0 and _grounded and _backfire_cd <= 0.0:
-		for bf in _backfire:
-			bf.restart()
-		_backfire_cd = 0.5
-	_prev_drive = drive
+	_fx.tick(delta, drive, speed)
 	# skid marks under the rear wheels while drifting
 	_update_skids(delta)
 
@@ -604,17 +577,7 @@ func _on_land(vel: Vector3) -> void:
 	# live cheaply on a GPUParticles3D, so two pre-built emitters (small/big) cover the
 	# range; a really hard hit (impact > ~8, i.e. well past the damage threshold) also
 	# gets a brief ground-hugging ring puff on top.
-	if _air_time > 0.3:
-		var puff_pos := global_position + Vector3(0, -0.3, 0)
-		if impact > 8.0 and _dust_big:
-			_dust_big.global_position = puff_pos
-			_dust_big.restart()
-			if _ring_puff:
-				_ring_puff.global_position = puff_pos
-				_ring_puff.restart()
-		elif _dust:
-			_dust.global_position = puff_pos
-			_dust.restart()
+	_fx.on_land(impact, _air_time, global_position + Vector3(0, -0.3, 0))
 	landed.emit(into, _air_time)   # drives camera shake / FOV punch (surface-relative)
 	_air_time = 0.0
 	_flip_accum = 0.0
@@ -943,6 +906,58 @@ func apply_wheel_size() -> void:
 		# bottom of wheel sits at the rest ground level (local y = 0.5 - suspension_rest)
 		wm.position = Vector3(base.x, 0.5 - suspension_rest + wheel_radius, base.z)
 
+
+## Open-top CONVERTIBLE hot-rod built from panels so the driver is visible and the
+## whole body scales cleanly for the Stretch/Wide upgrades. Faces -Z.
+## Procedural geometry is built by HCCarBodyBuilder; GLB shells stay here (A1).
+func _build_body() -> void:
+	_body = Node3D.new()
+	add_child(_body)
+	if body_glb != "" and _build_glb_body():
+		return   # imported shell in place; procedural panels skipped
+	_headlights.assign(_body_builder.build(_body, vehicle_type))
+
+## Toggle every headlight spotlight this body owns (called by HCMain on the night map).
+func set_headlights(on: bool) -> void:
+	for sl in _headlights:
+		sl.visible = on
+
+## Toggle underglow on/off and set its colour (bought + picked in the garage).
+func apply_underglow(on: bool, color: Color) -> void:
+	if _fx == null:
+		return   # pre-_ready no-op, same as the old inline null checks
+	_fx.apply_underglow(on, color)
+
+## Tire-smoke colour (the puffs kicked up while drifting).
+func apply_smoke_color(color: Color) -> void:
+	if _fx == null:
+		return
+	_fx.apply_smoke_color(color)
+
+## Drift skid-streak colour (the marks laid under the rear wheels). Alpha is still
+## animated per-mark in _update_skids; we only set the RGB here.
+func apply_streak_color(color: Color) -> void:
+	for mi in _skid_marks:
+		var m := mi.material_override as StandardMaterial3D
+		if m:
+			m.albedo_color = Color(color.r, color.g, color.b, m.albedo_color.a)
+
+## Boost flame colour (the rocket jets). Core is pushed toward white so it still
+## reads as hot; the tint shows through the body and trailing edge of the jet.
+func apply_flame_color(color: Color) -> void:
+	if _fx == null:
+		return
+	_fx.apply_flame_color(color)
+
+## Polished chrome material (mirror-like): metallic 1.0, very low roughness.
+func _chrome(rough := 0.1) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = Color(0.92, 0.93, 0.96)
+	m.metallic = 1.0
+	m.roughness = rough
+	m.metallic_specular = 0.9
+	return m
+
 ## A small box helper for the procedural body panels.
 func _panel(parent: Node3D, size: Vector3, pos: Vector3, col: Color, rough := 0.5, metal := 0.0) -> MeshInstance3D:
 	var mi := MeshInstance3D.new()
@@ -1012,717 +1027,6 @@ func _fit_wheels_to_body(winfo: Array[Dictionary], bottom: float) -> void:
 	wheel_radius = clampf(r_avg / 4.0, 0.3, 0.75)
 	apply_wheel_size()
 
-## Open-top CONVERTIBLE hot-rod built from panels so the driver is visible and the
-## whole body scales cleanly for the Stretch/Wide upgrades. Faces -Z.
-## Composed from many stepped boxes/prisms + chrome trim, lights, fenders, bumpers,
-## grille, mirrors, exhausts, hood scoop, windshield glass and a little cockpit.
-func _build_body() -> void:
-	_body = Node3D.new()
-	add_child(_body)
-	if body_glb != "" and _build_glb_body():
-		return   # imported shell in place; procedural panels skipped
-	match vehicle_type:
-		"monster":
-			_build_monster_body(); return
-		"minivan":
-			_build_minivan_body(); return
-		"sports":
-			_build_sports_body(); return
-		"f1":
-			_build_f1_body(); return
-	var red := Color(0.86, 0.11, 0.09)        # saturated hot-rod paint
-	var red_dk := Color(0.5, 0.07, 0.06)       # shadowed paint for steps
-	var dark := Color(0.09, 0.09, 0.11)
-	var rubber := Color(0.05, 0.05, 0.06)
-
-	# --- lower rocker / floor pan (matte, ties the silhouette to the wheels) ---
-	_panel(_body, Vector3(1.92, 0.24, 3.7), Vector3(0, 0.33, 0), dark, 0.75)
-	_panel(_body, Vector3(2.0, 0.12, 3.5), Vector3(0, 0.27, 0), rubber, 0.85)   # skirt under-shadow
-
-	# --- main tub: stacked, slightly tapered boxes for a rounded shoulder line ---
-	_panel(_body, Vector3(1.84, 0.42, 3.5), Vector3(0, 0.58, 0), red, 0.35, 0.6)      # body sides
-	_panel(_body, Vector3(1.6, 0.3, 3.4), Vector3(0, 0.86, 0), red, 0.35, 0.6)        # upper shoulder
-	# beveled top edges (prisms) to knock the slab corners off the shoulder.
-	# These run FRONT-TO-BACK along the body (length on Z) and roll about Z to chamfer
-	# the top-outer corner. (A 90° YAW here was swinging the 3.4 m length out sideways
-	# into a red plank that looked exactly like a wing on the bare car.)
-	for sx_b in [-1.0, 1.0]:
-		var bev := _prism(_body, Vector3(0.4, 0.3, 3.4), Vector3(0.74 * sx_b, 0.9, 0.0), red, 0.35, 0.6)
-		bev.rotation_degrees = Vector3(0, 0, -35.0 * sx_b)
-
-	# --- hood: stepped down toward the nose, with a raised center spine ---------
-	_panel(_body, Vector3(1.6, 0.32, 1.25), Vector3(0, 0.82, -1.2), red, 0.32, 0.6)
-	_panel(_body, Vector3(1.5, 0.16, 1.0), Vector3(0, 0.97, -1.0), red, 0.32, 0.6)      # raised hood crown
-	_panel(_body, Vector3(0.5, 0.1, 1.15), Vector3(0, 1.05, -1.05), red_dk, 0.3, 0.6)   # center spine
-	# hood scoop (chunky box + a forward-facing mouth prism)
-	_panel(_body, Vector3(0.62, 0.2, 0.55), Vector3(0, 1.13, -0.78), dark, 0.4, 0.3)
-	var scoop := _prism(_body, Vector3(0.62, 0.2, 0.3), Vector3(0, 1.13, -1.04), rubber, 0.6)
-	scoop.rotation_degrees = Vector3(90, 0, 0)
-
-	# --- cowl in front of the windscreen ---------------------------------------
-	_panel(_body, Vector3(1.55, 0.16, 0.35), Vector3(0, 1.02, -0.35), red, 0.32, 0.6)
-
-	# --- rear deck: stepped up to a small ducktail --------------------------
-	_panel(_body, Vector3(1.62, 0.34, 1.0), Vector3(0, 0.9, 1.3), red, 0.32, 0.6)
-	_panel(_body, Vector3(1.5, 0.16, 0.55), Vector3(0, 1.06, 1.5), red, 0.32, 0.6)       # ducktail lip
-	var tail := _prism(_body, Vector3(1.5, 0.18, 0.4), Vector3(0, 1.05, 1.72), red, 0.32, 0.6)
-	tail.rotation_degrees = Vector3(180, 0, 0)
-
-	# --- cockpit side walls (driver sits between them, in the open) ------------
-	for sx in [-1.0, 1.0]:
-		_panel(_body, Vector3(0.18, 0.4, 1.6), Vector3(0.8 * sx, 1.0, 0.2), red, 0.35, 0.6)
-		# inner trim lip
-		_panel(_body, Vector3(0.08, 0.1, 1.5), Vector3(0.7 * sx, 1.18, 0.2), dark, 0.5)
-		# door seam + handle (the "door" is the front half of this side wall) + a
-		# racing-number roundel — the classic hot-rod door decal
-		_seam_v(_body, 0.9 * sx, 0.95, -0.35, 0.55)
-		_door_handle(_body, 0.9 * sx, 1.0, -0.7)
-		_panel(_body, Vector3(0.02, 0.34, 0.34), Vector3(0.9 * sx, 0.95, 0.05), Color(0.96, 0.94, 0.9), 0.5)   # roundel disc
-		_panel(_body, Vector3(0.03, 0.16, 0.03), Vector3(0.92 * sx, 0.95, 0.05), dark, 0.4)                    # "number" mark
-
-	# --- twin racing stripes over hood/crown/tail --------------------------
-	var stripe := Color(0.95, 0.95, 0.92)
-	for sx3 in [-0.28, 0.28]:
-		_panel(_body, Vector3(0.16, 0.02, 3.6), Vector3(sx3, 0.99, 0.0), stripe, 0.4)
-
-	# --- fenders / wheel arches over the four wheels ---------------------------
-	_build_fenders(red, rubber)
-
-	# --- chrome trim, bumpers, grille, lights, mirrors, exhaust, cockpit -------
-	_build_chrome_trim()
-	_build_bumpers()
-	_build_grille()
-	_build_car_lights()
-	_build_mirrors()
-	_build_exhausts()
-	_build_windshield()
-	_build_cockpit()
-	_plate(_body, 0, 0.62, -1.98)
-	_plate(_body, 0, 0.66, 1.98)
-	_add_headlights(_body, 0.66, 0.9, -1.95)
-
-	# --- engine-block pipes poking from the hood scoop (hot-rod signature) -----
-	for px in [-0.16, 0.0, 0.16]:
-		_chrome_cyl(_body, 0.035, 0.3, Vector3(px, 1.28, -0.9), Vector3(0, 0, 0), 0.15)
-
-## A boxy lifted 4x4 — a deliberately different silhouette from the hot-rod so the
-## Monster Truck reads at a glance: tall slab cab, roll bar with light pod, flat
-## bed, chunky guards. The huge wheels + ride height come from its VEHICLES tuning
-## (big wheel_radius / suspension_rest), so this just builds the shell. Faces -Z.
-func _build_monster_body() -> void:
-	# Build into a scaled HULL child so the whole truck is silly-big, while the
-	# parent _body stays unit-scaled for the Stretch/Wide chassis upgrades to scale.
-	var hull := Node3D.new()
-	hull.scale = Vector3(1.45, 1.65, 1.4)   # extra-tall, chunky monster proportions
-	_body.add_child(hull)
-	var body := Color(0.13, 0.45, 0.85)        # blue truck paint
-	var body_dk := Color(0.08, 0.28, 0.55)
-	var dark := Color(0.08, 0.08, 0.1)
-	var rubber := Color(0.05, 0.05, 0.06)
-
-	# --- heavy frame rails / skid plate (ties body to the tall stance) ---------
-	_panel(hull, Vector3(2.0, 0.3, 4.0), Vector3(0, 0.5, 0), dark, 0.8)
-	for sx in [-1.0, 1.0]:
-		_panel(hull, Vector3(0.18, 0.42, 3.8), Vector3(0.92 * sx, 0.55, 0), rubber, 0.85)
-
-	# --- flat cargo bed at the rear --------------------------------------------
-	_panel(hull, Vector3(2.1, 0.5, 1.8), Vector3(0, 0.95, 1.2), body, 0.45, 0.3)
-	_panel(hull, Vector3(2.1, 0.34, 0.16), Vector3(0, 1.25, 2.05), body_dk, 0.45)   # tailgate
-	for sx in [-1.0, 1.0]:
-		_panel(hull, Vector3(0.16, 0.34, 1.8), Vector3(1.0 * sx, 1.25, 1.2), body_dk, 0.45)   # bed walls
-
-	# --- tall boxy cab ----------------------------------------------------------
-	_panel(hull, Vector3(2.1, 1.0, 1.9), Vector3(0, 1.2, -0.7), body, 0.4, 0.3)     # cab lower
-	_panel(hull, Vector3(1.96, 0.7, 1.7), Vector3(0, 1.95, -0.6), body, 0.4, 0.3)   # cab upper / greenhouse
-	# wrap windows (glass band around the upper cab)
-	var glass := _glass(0.32)
-	for win in [Vector3(0, 1.98, -1.46), Vector3(0, 1.98, 0.28)]:
-		var w := _panel(hull, Vector3(1.7, 0.55, 0.06), win, Color(1,1,1), 0.05)
-		w.material_override = glass
-	for sx in [-1.0, 1.0]:
-		var ws := _panel(hull, Vector3(0.06, 0.5, 1.6), Vector3(0.99 * sx, 1.98, -0.6), Color(1,1,1), 0.05)
-		ws.material_override = glass
-	_panel(hull, Vector3(2.0, 0.16, 1.8), Vector3(0, 2.34, -0.6), body_dk, 0.4)     # roof cap
-	# cab door seam + handle + a two-tone contrast panel (lower cab skirt)
-	for sx in [-1.0, 1.0]:
-		_seam_v(hull, 1.05 * sx, 1.15, -0.7, 0.85)
-		_door_handle(hull, 1.06 * sx, 1.25, -1.05)
-		_panel(hull, Vector3(0.02, 0.24, 1.7), Vector3(1.05 * sx, 0.78, -0.7), body_dk, 0.45)
-
-	# --- hood + grille up front -------------------------------------------------
-	_panel(hull, Vector3(2.0, 0.55, 1.3), Vector3(0, 1.18, -2.05), body, 0.4, 0.3)
-	_seam_h(hull, 0, 1.46, -2.05, 1.9)   # hood shut-line
-	_panel(hull, Vector3(1.8, 0.5, 0.18), Vector3(0, 1.12, -2.74), dark, 0.5)        # grille
-	for gx in [-0.6, -0.2, 0.2, 0.6]:
-		_emit_panel(hull, Vector3(0.12, 0.42, 0.06), Vector3(gx, 1.12, -2.8), Color(0.9, 0.95, 1.0), 0.6)
-	# headlights (visual bulb + real spotlight) + a chrome bull-bar style snorkel
-	for sx in [-1.0, 1.0]:
-		_emit_panel(hull, Vector3(0.34, 0.26, 0.1), Vector3(0.74 * sx, 1.2, -2.78), Color(1.0, 0.96, 0.8), 2.2)
-	# real spotlights go on _body (not the scaled hull) so hull.scale doesn't distort
-	# the light's range/angle — coordinates below are the hull position pre-multiplied
-	# by hull.scale (1.45, 1.65, 1.4) to line up with the visual bulb above.
-	_add_headlights(_body, 0.74 * 1.45, 1.2 * 1.65, -2.78 * 1.4)
-	_plate(hull, 0, 0.78, -2.79)
-	# snorkel (air intake tube up the A-pillar, off-road detail)
-	_chrome_cyl(hull, 0.08, 1.1, Vector3(0.9, 2.1, -1.3), Vector3(0, 0, 0), 0.3)
-	_panel(hull, Vector3(0.2, 0.16, 0.2), Vector3(0.9, 2.7, -1.3), dark, 0.4)         # snorkel intake head
-
-	# --- roll bar over the bed with a light pod (classic monster look) ----------
-	for sx in [-1.0, 1.0]:
-		_chrome_cyl(hull, 0.07, 1.2, Vector3(0.85 * sx, 1.9, 0.9), Vector3(0, 0, 0))
-	_chrome_cyl(hull, 0.07, 1.7, Vector3(0, 2.5, 0.9), Vector3(0, 0, 90))            # top cross bar
-	_panel(hull, Vector3(1.5, 0.26, 0.3), Vector3(0, 2.62, 0.9), dark, 0.4)          # light pod
-	for lx in [-0.55, -0.18, 0.18, 0.55]:
-		_emit_panel(hull, Vector3(0.28, 0.22, 0.12), Vector3(lx, 2.62, 0.74), Color(1.0, 0.98, 0.85), 2.6)
-	# taillights (red, on the tailgate) + rear plate
-	for sx in [-0.8, 0.8]:
-		_emit_panel(hull, Vector3(0.24, 0.28, 0.1), Vector3(sx, 1.25, 2.12), Color(0.95, 0.06, 0.05), 2.0)
-	_plate(hull, 0, 0.95, 2.13)
-
-	# --- chunky bumpers / nerf bars --------------------------------------------
-	_chrome_cyl(hull, 0.11, 2.1, Vector3(0, 0.9, -2.95), Vector3(0, 0, 90))          # front bar
-	_chrome_cyl(hull, 0.11, 2.1, Vector3(0, 0.95, 2.25), Vector3(0, 0, 90))          # rear bar
-	# tow hook, hung off the front bar
-	_chrome_cyl(hull, 0.045, 0.22, Vector3(0, 0.65, -2.98), Vector3(90, 0, 0), 0.2)
-	# exhaust stacks up the back of the cab
-	for sx in [-1.0, 1.0]:
-		_chrome_cyl(hull, 0.1, 0.9, Vector3(0.8 * sx, 1.4, 0.25), Vector3(0, 0, 0))   # shorter + lower so they sit below the chase camera
-	# chunky chrome suspension links, hull frame down toward each wheel corner
-	for sx in [-1.0, 1.0]:
-		for sz in [-1.55, 1.55]:
-			_chrome_cyl(hull, 0.055, 0.65, Vector3(0.95 * sx, 0.22, sz), Vector3(0, 0, 18.0 * sx), 0.25)
-	# rubber mud flaps trailing each wheel arch
-	for sx in [-1.0, 1.0]:
-		for sz in [-1.55, 1.55]:
-			_panel(hull, Vector3(0.05, 0.5, 0.34), Vector3(1.05 * sx, -0.15, sz + 0.35), rubber, 0.95)
-	# mirrors, chrome stalks off the cab A-pillars
-	for sx in [-1.0, 1.0]:
-		_chrome_cyl(hull, 0.03, 0.3, Vector3(1.1 * sx, 1.75, -1.35), Vector3(0, 0, 65 * sx))
-		_panel(hull, Vector3(0.05, 0.2, 0.26), Vector3(1.26 * sx, 1.86, -1.35), dark, 0.3, 0.4)
-
-# --- underglow (cosmetic) ----------------------------------------------------
-## Emissive strips under the body + a tinted light that spills onto the road.
-func _build_underglow() -> void:
-	_underglow = Node3D.new()
-	add_child(_underglow)
-	var hx: float = float(_vs.fx) + 0.05
-	var hz: float = float(_vs.fz) + 0.3
-	var y := 0.12
-	var strips := [
-		[Vector3(0, y, -hz), Vector3(hx * 2.0, 0.05, 0.14)],   # front
-		[Vector3(0, y, hz), Vector3(hx * 2.0, 0.05, 0.14)],    # rear
-		[Vector3(-hx, y, 0), Vector3(0.14, 0.05, hz * 2.0)],   # left
-		[Vector3(hx, y, 0), Vector3(0.14, 0.05, hz * 2.0)],    # right
-	]
-	for st in strips:
-		var mi := MeshInstance3D.new()
-		var bm := BoxMesh.new()
-		bm.size = st[1]
-		mi.mesh = bm
-		mi.position = st[0]
-		var m := StandardMaterial3D.new()
-		m.emission_enabled = true
-		m.emission_energy_multiplier = 3.0
-		mi.material_override = m
-		_underglow.add_child(mi)
-		_ug_strips.append(mi)
-	_ug_light = OmniLight3D.new()
-	_ug_light.position = Vector3(0, 0.05, 0)
-	_ug_light.omni_range = 4.5
-	_ug_light.light_energy = 2.2
-	_underglow.add_child(_ug_light)
-	_underglow.visible = false
-
-## Toggle underglow on/off and set its colour (bought + picked in the garage).
-func apply_underglow(on: bool, color: Color) -> void:
-	if _underglow == null:
-		return
-	_underglow.visible = on
-	if not on:
-		return
-	for mi in _ug_strips:
-		var m := mi.material_override as StandardMaterial3D
-		m.albedo_color = color
-		m.emission = color
-	if _ug_light:
-		_ug_light.light_color = color
-
-# --- cosmetic tints (bought + picked in the garage) --------------------------
-## Rebuild a particle system's colour ramp: opaque `core` fading to clear `edge`.
-func _retint(p: GPUParticles3D, core: Color, edge: Color) -> void:
-	if p == null:
-		return
-	var pm := p.process_material as ParticleProcessMaterial
-	if pm == null:
-		return
-	var grad := Gradient.new()
-	grad.set_color(0, core)
-	grad.set_color(1, edge)
-	var gt := GradientTexture1D.new(); gt.gradient = grad
-	pm.color_ramp = gt
-
-## Tire-smoke colour (the puffs kicked up while drifting).
-func apply_smoke_color(color: Color) -> void:
-	var core := Color(color.r, color.g, color.b, 0.55)
-	var edge := Color(color.r, color.g, color.b, 0.0)
-	for ts in _tire_smoke:
-		_retint(ts, core, edge)
-
-## Drift skid-streak colour (the marks laid under the rear wheels). Alpha is still
-## animated per-mark in _update_skids; we only set the RGB here.
-func apply_streak_color(color: Color) -> void:
-	for mi in _skid_marks:
-		var m := mi.material_override as StandardMaterial3D
-		if m:
-			m.albedo_color = Color(color.r, color.g, color.b, m.albedo_color.a)
-
-## Boost flame colour (the rocket jets). Core is pushed toward white so it still
-## reads as hot; the tint shows through the body and trailing edge of the jet.
-func apply_flame_color(color: Color) -> void:
-	var core := color.lerp(Color(1, 1, 1, 1), 0.55); core.a = 1.0
-	var edge := Color(color.r, color.g, color.b, 0.0)
-	for f in _rocket_flames:
-		_retint(f, core, edge)
-
-# --- extra vehicle bodies ----------------------------------------------------
-
-## Boxy faded minivan — the deliberately-uncool $0 starter, rode hard and never
-## washed: mismatched door, rust, a dent, duct tape holding a roof rack together.
-## Faces -Z.
-func _build_minivan_body() -> void:
-	var body := Color(0.62, 0.6, 0.5)      # faded beige
-	var body_dk := Color(0.42, 0.4, 0.34)
-	var dark := Color(0.1, 0.1, 0.12)
-	var glass := _glass(0.3)
-	_panel(_body, Vector3(1.9, 0.28, 4.0), Vector3(0, 0.42, 0), dark, 0.85)                 # rocker/floor
-	_panel(_body, Vector3(1.9, 1.05, 3.5), Vector3(0, 1.05, 0.15), body, 0.7, 0.05)         # boxy cabin
-	_panel(_body, Vector3(1.86, 0.62, 0.7), Vector3(0, 0.72, -1.95), body, 0.7)             # stubby flat front
-	_panel(_body, Vector3(1.82, 0.14, 3.3), Vector3(0, 1.64, 0.15), body_dk, 0.6)           # roof cap
-	var wt := _panel(_body, Vector3(1.7, 0.5, 0.06), Vector3(0, 1.3, -1.62), Color(1, 1, 1), 0.05); wt.material_override = glass
-	var rw := _panel(_body, Vector3(1.6, 0.45, 0.06), Vector3(0, 1.3, 1.86), Color(1, 1, 1), 0.05); rw.material_override = glass
-	for sx in [-1.0, 1.0]:
-		var sw := _panel(_body, Vector3(0.06, 0.48, 2.6), Vector3(0.95 * sx, 1.32, 0.2), Color(1, 1, 1), 0.05); sw.material_override = glass
-		_emit_panel(_body, Vector3(0.3, 0.22, 0.1), Vector3(0.7 * sx, 0.8, -2.3), Color(1, 0.95, 0.8), 1.6)
-		# taillights, door seam + handle
-		_emit_panel(_body, Vector3(0.24, 0.24, 0.08), Vector3(0.85 * sx, 0.9, 2.28), Color(0.95, 0.06, 0.05), 1.8)
-		_seam_v(_body, 0.96 * sx, 1.1, 0.35, 1.0)
-		_door_handle(_body, 0.96 * sx, 1.15, -0.1)
-	_panel(_body, Vector3(1.4, 0.28, 0.1), Vector3(0, 0.6, -2.3), dark, 0.5)                # grille
-	_chrome_cyl(_body, 0.08, 1.9, Vector3(0, 0.42, -2.3), Vector3(0, 0, 90))                # front bumper
-	_chrome_cyl(_body, 0.08, 1.9, Vector3(0, 0.42, 2.2), Vector3(0, 0, 90))                 # rear bumper
-	_add_headlights(_body, 0.7, 0.8, -2.32)
-	_plate(_body, 0, 0.5, -2.32)
-	_plate(_body, 0, 0.5, 2.22)
-	# mirrors on stubby stalks
-	for sx in [-1.0, 1.0]:
-		_chrome_cyl(_body, 0.02, 0.14, Vector3(0.96 * sx, 1.4, -1.5), Vector3(0, 0, 40 * sx))
-		_panel(_body, Vector3(0.04, 0.12, 0.16), Vector3(1.04 * sx, 1.45, -1.5), dark, 0.4)
-	# mismatched-color replacement door panel — a junkyard swap that never got painted
-	_panel(_body, Vector3(0.02, 0.68, 1.35), Vector3(0.96, 1.0, 0.6), Color(0.3, 0.36, 0.32), 0.8)
-	# a dent: a slightly recessed offset panel low on the rear quarter
-	_panel(_body, Vector3(0.03, 0.3, 0.32), Vector3(-0.955, 0.75, 1.35), body_dk, 0.75)
-	# duct-tape stripe patching a crack across the rear door
-	_panel(_body, Vector3(0.015, 0.05, 0.9), Vector3(0.965, 1.15, 0.7), Color(0.78, 0.76, 0.7), 0.9)
-	_panel(_body, Vector3(0.5, 0.3, 0.03), Vector3(0.96, 0.9, -0.5), Color(0.4, 0.28, 0.16), 0.95)  # rust patch
-	_panel(_body, Vector3(0.3, 0.2, 0.03), Vector3(-0.96, 0.55, -1.4), Color(0.36, 0.24, 0.14), 0.95) # second rust patch, lower
-	# roof rack rails + two strapped boxes
-	for sx in [-1.0, 1.0]:
-		_panel(_body, Vector3(0.06, 0.06, 2.6), Vector3(0.7 * sx, 1.76, 0.1), dark, 0.5, 0.3)
-	for rz in [-0.8, 0.55]:
-		_panel(_body, Vector3(1.1, 0.34, 0.6), Vector3(0, 1.95, rz), Color(0.5, 0.42, 0.28), 0.8)     # cardboard-brown box
-		for sx2 in [-1.0, 1.0]:
-			_panel(_body, Vector3(1.16, 0.03, 0.05), Vector3(0, 1.95, rz + 0.28 * sx2), Color(0.85, 0.8, 0.2), 0.7)  # tie-down strap
-	# steering wheel glimpsed through the windshield
-	var wheel := MeshInstance3D.new()
-	var tm := TorusMesh.new(); tm.inner_radius = 0.1; tm.outer_radius = 0.14
-	wheel.mesh = tm
-	var wmat := StandardMaterial3D.new(); wmat.albedo_color = Color(0.1, 0.1, 0.11); wmat.roughness = 0.6
-	wheel.material_override = wmat
-	wheel.position = Vector3(0.35, 1.15, -1.35)
-	wheel.rotation_degrees = Vector3(70, 0, 0)
-	_body.add_child(wheel)
-	_panel(_body, Vector3(0.5, 0.14, 0.42), Vector3(0.35, 0.85, -1.3), dark, 0.7)    # driver seat back, in silhouette
-
-## Low, wide, grippy sports car — the corner carver. Faces -Z.
-func _build_sports_body() -> void:
-	var body := Color(0.93, 0.72, 0.06)    # racing yellow
-	var body_dk := Color(0.6, 0.47, 0.05)
-	var dark := Color(0.08, 0.08, 0.1)
-	var glass := _glass(0.26)
-	_panel(_body, Vector3(2.0, 0.22, 4.0), Vector3(0, 0.32, 0), dark, 0.8)                  # low floor
-	_panel(_body, Vector3(1.94, 0.42, 3.9), Vector3(0, 0.58, 0), body, 0.28, 0.7)           # sleek body
-	var nose := _panel(_body, Vector3(1.72, 0.3, 1.5), Vector3(0, 0.55, -1.75), body, 0.28, 0.7); nose.rotation_degrees = Vector3(-7, 0, 0)
-	_panel(_body, Vector3(1.5, 0.34, 1.6), Vector3(0, 0.92, 0.2), body, 0.3, 0.6)           # low cabin
-	var ws := _panel(_body, Vector3(1.4, 0.3, 0.05), Vector3(0, 1.0, -0.62), Color(1, 1, 1), 0.05); ws.material_override = glass
-	var roof := _panel(_body, Vector3(1.42, 0.26, 1.1), Vector3(0, 1.12, 0.32), Color(1, 1, 1), 0.05); roof.material_override = glass
-	for sx in [-1.0, 1.0]:
-		_panel(_body, Vector3(0.14, 0.24, 3.4), Vector3(0.98 * sx, 0.48, 0), body_dk, 0.4)  # side skirt
-		_emit_panel(_body, Vector3(0.32, 0.14, 0.1), Vector3(0.6 * sx, 0.66, -2.32), Color(1, 0.97, 0.85), 2.0)
-		_emit_panel(_body, Vector3(0.32, 0.12, 0.08), Vector3(0.6 * sx, 0.74, 1.98), Color(1, 0.2, 0.1), 2.2)
-		# pop-up-style headlight cover panel, proud of the nose, half-raised look
-		_panel(_body, Vector3(0.34, 0.06, 0.16), Vector3(0.6 * sx, 0.76, -2.28), body, 0.3, 0.6)
-		# door seam + handle over the low cabin
-		_seam_v(_body, 0.97 * sx, 0.85, -0.05, 0.55)
-		_door_handle(_body, 0.97 * sx, 0.95, -0.3)
-		# rear diffuser fins under the rear deck
-		_panel(_body, Vector3(0.06, 0.1, 0.6), Vector3(0.5 * sx, 0.28, 1.9), dark, 0.5, 0.3)
-	_panel(_body, Vector3(1.9, 0.2, 0.9), Vector3(0, 0.8, 1.6), body, 0.3, 0.6)             # rear deck
-	_panel(_body, Vector3(1.7, 0.1, 0.26), Vector3(0, 0.92, 2.02), body_dk, 0.3, 0.6)       # small ducktail lip
-	for sx in [-0.75, 0.75]:
-		_panel(_body, Vector3(0.08, 0.3, 0.1), Vector3(sx, 0.98, 1.9), dark, 0.5)           # spoiler struts
-	_panel(_body, Vector3(1.94, 0.08, 0.42), Vector3(0, 1.15, 1.92), dark, 0.4)             # spoiler wing
-	_panel(_body, Vector3(0.9, 0.16, 0.08), Vector3(0, 0.52, -2.32), dark, 0.5)             # grille
-	# twin center exhausts (not corner pipes — the sports-car signature)
-	for ex in [-0.14, 0.14]:
-		_chrome_cyl(_body, 0.055, 0.2, Vector3(ex, 0.34, 2.02), Vector3(90, 0, 0), 0.08)
-	_add_headlights(_body, 0.6, 0.7, -2.3)
-	_plate(_body, 0, 0.5, -2.34)
-	_plate(_body, 0, 0.55, 2.03)
-	# mirrors, low and swept
-	for sx in [-1.0, 1.0]:
-		_chrome_cyl(_body, 0.02, 0.12, Vector3(0.98 * sx, 0.98, -0.5), Vector3(0, 0, 50 * sx))
-		_panel(_body, Vector3(0.05, 0.1, 0.18), Vector3(1.06 * sx, 1.03, -0.5), dark, 0.3, 0.5)
-	# racing stripe over the cabin/deck
-	_panel(_body, Vector3(0.3, 0.02, 3.6), Vector3(0, 0.99, 0.0), Color(0.06, 0.06, 0.08), 0.4)
-	# a small driver seat glimpsed through the glass roof
-	_panel(_body, Vector3(0.44, 0.4, 0.12), Vector3(0.25, 0.98, 0.75), Color(0.08, 0.08, 0.09), 0.6)
-
-## Open-wheel F1 — narrow tub, long nose, front & rear wings, airbox, halo, and
-## sponsor-block wing endplates. Faces -Z.
-func _build_f1_body() -> void:
-	var body := Color(0.1, 0.3, 0.86)      # team blue
-	var body_dk := Color(0.06, 0.16, 0.5)
-	var dark := Color(0.06, 0.06, 0.08)
-	var sponsor := Color(0.95, 0.78, 0.05)  # gold sponsor-block accent, high contrast on team blue
-	_panel(_body, Vector3(0.72, 0.34, 3.2), Vector3(0, 0.5, 0.35), body, 0.3, 0.5)          # monocoque tub
-	_panel(_body, Vector3(0.4, 0.22, 1.0), Vector3(0, 0.5, -1.6), body, 0.3, 0.5)           # nose base
-	_panel(_body, Vector3(0.28, 0.16, 1.0), Vector3(0, 0.48, -2.4), body, 0.3, 0.5)         # thin nose tip
-	for sx in [-1.0, 1.0]:
-		_panel(_body, Vector3(0.5, 0.3, 1.7), Vector3(0.62 * sx, 0.48, 0.5), body_dk, 0.4)  # side pod
-		# bargeboards — small vertical vanes ahead of the sidepods (aero furniture)
-		_panel(_body, Vector3(0.04, 0.24, 0.4), Vector3(0.65 * sx, 0.44, -0.65), dark, 0.4)
-		_panel(_body, Vector3(0.04, 0.16, 0.22), Vector3(0.5 * sx, 0.4, -0.85), dark, 0.4)
-	_panel(_body, Vector3(0.42, 0.5, 0.7), Vector3(0, 0.98, 1.1), body_dk, 0.35)            # airbox / intake above the driver
-	_panel(_body, Vector3(0.3, 0.14, 0.14), Vector3(0, 1.24, 0.78), dark, 0.5)              # airbox intake mouth
-	_panel(_body, Vector3(0.5, 0.16, 0.9), Vector3(0, 0.7, 0.15), dark, 0.7)                # open cockpit
-	# halo bar — the curved head-protection loop, approximated with straight struts
-	_panel(_body, Vector3(0.05, 0.4, 0.05), Vector3(0, 0.9, -0.45), dark, 0.25, 0.6)
-	_panel(_body, Vector3(0.05, 0.22, 0.05), Vector3(-0.22, 1.0, 0.0), dark, 0.25, 0.6)
-	_panel(_body, Vector3(0.05, 0.22, 0.05), Vector3(0.22, 1.0, 0.0), dark, 0.25, 0.6)
-	_panel(_body, Vector3(0.5, 0.04, 0.55), Vector3(0, 1.1, -0.2), dark, 0.25, 0.6)          # halo top ring, foreshortened
-	# a race number roundel on the airbox flank
-	_panel(_body, Vector3(0.02, 0.24, 0.24), Vector3(0.22, 0.98, 1.1), Color(0.95, 0.95, 0.92), 0.4)
-	_panel(_body, Vector3(0.02, 0.24, 0.24), Vector3(-0.22, 0.98, 1.1), Color(0.95, 0.95, 0.92), 0.4)
-	# rear wing + sponsor-color endplates
-	for sx in [-0.5, 0.5]:
-		_panel(_body, Vector3(0.05, 0.44, 0.5), Vector3(sx, 0.98, 2.05), dark, 0.4)
-		_panel(_body, Vector3(0.02, 0.4, 0.46), Vector3(sx * 1.08, 0.98, 2.05), sponsor, 0.4)   # endplate sponsor block
-	_panel(_body, Vector3(1.25, 0.09, 0.5), Vector3(0, 1.22, 2.05), body_dk, 0.4)
-	_emit_panel(_body, Vector3(1.1, 0.05, 0.06), Vector3(0, 0.78, 2.28), Color(0.95, 0.06, 0.05), 1.6)  # rear crash-structure brake strip
-	# front wing + sponsor-color endplates
-	_panel(_body, Vector3(1.5, 0.08, 0.42), Vector3(0, 0.32, -2.5), body_dk, 0.4)
-	for sx in [-0.72, 0.72]:
-		_panel(_body, Vector3(0.05, 0.28, 0.42), Vector3(sx, 0.4, -2.5), dark, 0.4)
-		_panel(_body, Vector3(0.02, 0.24, 0.38), Vector3(sx * 1.06, 0.4, -2.5), sponsor, 0.4)    # endplate sponsor block
-	for sx in [-1.0, 1.0]:
-		_emit_panel(_body, Vector3(0.18, 0.1, 0.06), Vector3(0.55 * sx, 0.62, 1.9), Color(1, 0.2, 0.1), 2.2)
-	# small forward marker lights (F1 cars run rain-light style lamps, not headlamps)
-	for sx in [-1.0, 1.0]:
-		_emit_panel(_body, Vector3(0.08, 0.06, 0.04), Vector3(0.3 * sx, 0.5, -2.56), Color(1.0, 0.97, 0.85), 1.4)
-	_add_headlights(_body, 0.3, 0.5, -2.55)
-	_plate(_body, 0, 0.42, 2.35)   # scrutineering plaque low on the tail, stands in for a plate
-	# wheel-hub cones at each corner (static — reads fine at these low-poly proportions
-	# even though the wheel itself spins independently)
-	var hub_x: float = float(_vs.fx) + 0.03
-	var hub_z: float = float(_vs.fz)
-	for sx in [-1.0, 1.0]:
-		for sz in [-hub_z, hub_z]:
-			var hub := MeshInstance3D.new()
-			var cm := CylinderMesh.new()
-			cm.top_radius = 0.02; cm.bottom_radius = 0.13; cm.height = 0.14
-			hub.mesh = cm
-			hub.material_override = _chrome(0.15)
-			hub.position = Vector3(hub_x * sx, 0.5, sz)
-			hub.rotation_degrees = Vector3(0, 0, 90 * sx)
-			_body.add_child(hub)
-
-# --- body-detail helpers -----------------------------------------------------
-
-## A PrismMesh panel (triangular cross-section) for bevels / wedges / scoops.
-func _prism(parent: Node3D, size: Vector3, pos: Vector3, col: Color, rough := 0.5, metal := 0.0) -> MeshInstance3D:
-	var mi := MeshInstance3D.new()
-	var pm := PrismMesh.new()
-	pm.size = size
-	mi.mesh = pm
-	var m := StandardMaterial3D.new()
-	m.albedo_color = col
-	m.roughness = rough
-	m.metallic = metal
-	mi.material_override = m
-	mi.position = pos
-	parent.add_child(mi)
-	return mi
-
-## Polished chrome material (mirror-like): metallic 1.0, very low roughness.
-func _chrome(rough := 0.1) -> StandardMaterial3D:
-	var m := StandardMaterial3D.new()
-	m.albedo_color = Color(0.92, 0.93, 0.96)
-	m.metallic = 1.0
-	m.roughness = rough
-	m.metallic_specular = 0.9
-	return m
-
-## Bluish semi-transparent glass.
-func _glass(alpha := 0.28) -> StandardMaterial3D:
-	var m := StandardMaterial3D.new()
-	m.albedo_color = Color(0.55, 0.72, 0.85, alpha)
-	m.metallic = 0.2
-	m.roughness = 0.05
-	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	return m
-
-## A glowing/emissive panel (headlights, taillights).
-func _emit_panel(parent: Node3D, size: Vector3, pos: Vector3, col: Color, energy := 1.6) -> MeshInstance3D:
-	var mi := MeshInstance3D.new()
-	var bm := BoxMesh.new()
-	bm.size = size
-	mi.mesh = bm
-	var m := StandardMaterial3D.new()
-	m.albedo_color = col
-	m.roughness = 0.2
-	m.emission_enabled = true
-	m.emission = col
-	m.emission_energy_multiplier = energy
-	mi.material_override = m
-	mi.position = pos
-	parent.add_child(mi)
-	return mi
-
-## A chrome cylinder helper (bumper bars, exhaust tips, mirror stalks).
-func _chrome_cyl(parent: Node3D, radius: float, height: float, pos: Vector3, rot: Vector3, rough := 0.1) -> MeshInstance3D:
-	var mi := MeshInstance3D.new()
-	var cm := CylinderMesh.new()
-	cm.top_radius = radius
-	cm.bottom_radius = radius
-	cm.height = height
-	mi.mesh = cm
-	mi.material_override = _chrome(rough)
-	mi.position = pos
-	mi.rotation_degrees = rot
-	parent.add_child(mi)
-	return mi
-
-## Forward-facing spotlight headlight pair (real SpotLight3D, not just an emissive
-## panel) parented under `parent`, aimed along local -Z — the body's forward axis,
-## so no rotation is needed. OFF by default; a night map (HCMain, built concurrently)
-## flips them on via set_headlights(). Shadows off and a modest range/angle keep
-## these cheap even with five headlight pairs live if every ride were night-lit.
-func _add_headlights(parent: Node3D, x: float, y: float, z: float) -> void:
-	for sx in [-1.0, 1.0]:
-		var sl := SpotLight3D.new()
-		sl.position = Vector3(x * sx, y, z)
-		sl.light_color = Color(1.0, 0.93, 0.78)
-		sl.spot_range = 35.0
-		sl.spot_angle = 35.0
-		sl.light_energy = 2.5
-		sl.shadow_enabled = false
-		sl.visible = false
-		parent.add_child(sl)
-		_headlights.append(sl)
-
-## Toggle every headlight spotlight this body owns (called by HCMain on the night map).
-func set_headlights(on: bool) -> void:
-	for sl in _headlights:
-		sl.visible = on
-
-## Thin dark vertical seam — reads as a door shut-line without cutting real geometry
-## (flat-shaded low-poly trick: a proud dark sliver, not a boolean cut).
-func _seam_v(parent: Node3D, x: float, y: float, z: float, h: float) -> void:
-	_panel(parent, Vector3(0.025, h, 0.025), Vector3(x, y, z), Color(0.04, 0.04, 0.05), 0.9)
-
-## Thin dark horizontal seam — hood/trunk shut-lines, beltline breaks.
-func _seam_h(parent: Node3D, x: float, y: float, z: float, w: float) -> void:
-	_panel(parent, Vector3(w, 0.02, 0.025), Vector3(x, y, z), Color(0.04, 0.04, 0.05), 0.9)
-
-## A small proud door handle.
-func _door_handle(parent: Node3D, x: float, y: float, z: float) -> void:
-	_panel(parent, Vector3(0.03, 0.045, 0.16), Vector3(x, y, z), Color(0.15, 0.15, 0.17), 0.3, 0.5)
-
-## A license plate plaque (front or rear).
-func _plate(parent: Node3D, x: float, y: float, z: float) -> void:
-	_panel(parent, Vector3(0.32, 0.15, 0.02), Vector3(x, y, z), Color(0.86, 0.84, 0.72), 0.6)
-
-## Rounded fenders / arches sitting above each of the four wheels (x≈±0.9, z≈±1.4).
-func _build_fenders(paint: Color, rubber: Color) -> void:
-	for sx in [-1.0, 1.0]:
-		for sz in [-1.4, 1.4]:
-			# arch top (flatter box) + a forward and rear wedge to round the arch
-			var fx: float = 0.92 * sx
-			_panel(_body, Vector3(0.34, 0.26, 1.1), Vector3(fx, 0.78, sz), paint, 0.35, 0.6)
-			for ez in [-0.5, 0.5]:
-				var w := _prism(_body, Vector3(0.34, 0.34, 0.4), Vector3(fx, 0.66, sz + ez), paint, 0.35, 0.6)
-				w.rotation_degrees = Vector3(90 if ez > 0.0 else -90, 0, 0)
-			# black inner arch liner so the wheel reads as tucked under the fender
-			_panel(_body, Vector3(0.22, 0.16, 0.9), Vector3(fx, 0.62, sz), rubber, 0.9)
-
-## Chrome trim strips along the bodyside spear + a beltline molding.
-func _build_chrome_trim() -> void:
-	for sx in [-1.0, 1.0]:
-		var strip := MeshInstance3D.new()
-		var bm := BoxMesh.new()
-		bm.size = Vector3(0.05, 0.08, 3.3)
-		strip.mesh = bm
-		strip.material_override = _chrome(0.12)
-		strip.position = Vector3(0.93 * sx, 0.66, 0.0)
-		_body.add_child(strip)
-	# beltline molding around the cockpit opening top edge
-	for sx2 in [-1.0, 1.0]:
-		var belt := MeshInstance3D.new()
-		var bbm := BoxMesh.new()
-		bbm.size = Vector3(0.06, 0.06, 1.7)
-		belt.mesh = bbm
-		belt.material_override = _chrome(0.12)
-		belt.position = Vector3(0.8 * sx2, 1.22, 0.2)
-		_body.add_child(belt)
-
-## Chrome front & rear bumpers (a bar + over-riders).
-func _build_bumpers() -> void:
-	# front bumper (-Z)
-	_chrome_cyl(_body, 0.09, 1.7, Vector3(0, 0.6, -1.92), Vector3(0, 0, 90))
-	for sx in [-0.55, 0.55]:
-		_panel(_body, Vector3(0.12, 0.32, 0.12), Vector3(sx, 0.62, -1.92), Color(0.92, 0.93, 0.96), 0.1, 1.0)
-	# rear bumper (+Z)
-	_chrome_cyl(_body, 0.09, 1.7, Vector3(0, 0.66, 1.92), Vector3(0, 0, 90))
-	for sx2 in [-0.55, 0.55]:
-		_panel(_body, Vector3(0.12, 0.32, 0.12), Vector3(sx2, 0.68, 1.92), Color(0.92, 0.93, 0.96), 0.1, 1.0)
-
-## A chrome-framed front grille with vertical slats.
-func _build_grille() -> void:
-	# grille surround
-	_panel(_body, Vector3(1.05, 0.5, 0.08), Vector3(0, 0.86, -1.86), Color(0.92, 0.93, 0.96), 0.12, 1.0)
-	# dark recess
-	_panel(_body, Vector3(0.92, 0.4, 0.06), Vector3(0, 0.86, -1.84), Color(0.04, 0.04, 0.05), 0.6)
-	# vertical chrome slats
-	for i in range(7):
-		var x := -0.4 + i * 0.133
-		var slat := MeshInstance3D.new()
-		var bm := BoxMesh.new()
-		bm.size = Vector3(0.04, 0.38, 0.05)
-		slat.mesh = bm
-		slat.material_override = _chrome(0.15)
-		slat.position = Vector3(x, 0.86, -1.86)
-		_body.add_child(slat)
-
-## Emissive warm headlights (front) + emissive red taillights (rear).
-func _build_car_lights() -> void:
-	# headlights with chrome bezels
-	for sx in [-0.66, 0.66]:
-		_chrome_cyl(_body, 0.17, 0.1, Vector3(sx, 0.9, -1.86), Vector3(90, 0, 0), 0.15)
-		var hl := _emit_panel(_body, Vector3(0.24, 0.24, 0.06), Vector3(sx, 0.9, -1.9), Color(1.0, 0.95, 0.72), 1.8)
-		var hm: StandardMaterial3D = hl.material_override
-		hm.albedo_color = Color(1.0, 0.97, 0.85)
-	# taillights
-	for sx2 in [-0.66, 0.66]:
-		_emit_panel(_body, Vector3(0.26, 0.16, 0.06), Vector3(sx2, 0.92, 1.9), Color(0.95, 0.06, 0.05), 1.7)
-
-## Two side mirrors on chrome stalks.
-func _build_mirrors() -> void:
-	for sx in [-1.0, 1.0]:
-		var stalk := _chrome_cyl(_body, 0.025, 0.26, Vector3(0.95 * sx, 1.18, -0.45), Vector3(0, 0, 55 * sx))
-		var head := MeshInstance3D.new()
-		var bm := BoxMesh.new()
-		bm.size = Vector3(0.04, 0.16, 0.22)
-		head.mesh = bm
-		head.material_override = _chrome(0.12)
-		head.position = Vector3(1.08 * sx, 1.26, -0.45)
-		_body.add_child(head)
-		# the mirror glass face
-		_panel(_body, Vector3(0.02, 0.12, 0.18), Vector3(1.06 * sx, 1.26, -0.45), Color(0.6, 0.7, 0.8), 0.05, 0.9)
-
-## Twin chrome exhaust tips out the back (+Z).
-func _build_exhausts() -> void:
-	for sx in [-0.45, 0.45]:
-		# pipe running under the rocker
-		_chrome_cyl(_body, 0.07, 1.0, Vector3(sx, 0.4, 1.4), Vector3(90, 0, 0))
-		# flared tip poking past the bumper
-		var tip := MeshInstance3D.new()
-		var cm := CylinderMesh.new()
-		cm.top_radius = 0.11
-		cm.bottom_radius = 0.08
-		cm.height = 0.3
-		tip.mesh = cm
-		tip.material_override = _chrome(0.08)
-		tip.rotation_degrees = Vector3(90, 0, 0)
-		tip.position = Vector3(sx, 0.4, 2.0)
-		_body.add_child(tip)
-
-## Windshield: chrome frame + angled posts + a semi-transparent glass pane.
-func _build_windshield() -> void:
-	var dark := Color(0.08, 0.08, 0.1)
-	# glass pane
-	var ws := MeshInstance3D.new()
-	var bm := BoxMesh.new()
-	bm.size = Vector3(1.3, 0.52, 0.04)
-	ws.mesh = bm
-	ws.material_override = _glass(0.26)
-	ws.position = Vector3(0, 1.36, -0.55)
-	ws.rotation_degrees = Vector3(-24, 0, 0)
-	_body.add_child(ws)
-	# chrome top frame
-	var topf := MeshInstance3D.new()
-	var tbm := BoxMesh.new()
-	tbm.size = Vector3(1.34, 0.06, 0.06)
-	topf.mesh = tbm
-	topf.material_override = _chrome(0.12)
-	topf.position = Vector3(0, 1.58, -0.65)
-	topf.rotation_degrees = Vector3(-24, 0, 0)
-	_body.add_child(topf)
-	# angled posts
-	for sx in [-0.64, 0.64]:
-		var post := _panel(_body, Vector3(0.06, 0.6, 0.06), Vector3(sx, 1.34, -0.55), dark, 0.2, 0.6)
-		post.rotation_degrees = Vector3(-24, 0, 0)
-
-## A simple dashboard, steering wheel and bucket seat in the open cockpit.
-func _build_cockpit() -> void:
-	var dark := Color(0.08, 0.08, 0.1)
-	var leather := Color(0.14, 0.1, 0.09)
-	# dashboard
-	_panel(_body, Vector3(1.35, 0.2, 0.3), Vector3(0, 1.14, -0.32), dark, 0.5)
-	# two round gauges (emissive faint)
-	for sx in [-0.25, 0.25]:
-		var g := MeshInstance3D.new()
-		var cm := CylinderMesh.new()
-		cm.top_radius = 0.08
-		cm.bottom_radius = 0.08
-		cm.height = 0.04
-		g.mesh = cm
-		var gm := StandardMaterial3D.new()
-		gm.albedo_color = Color(0.6, 0.75, 0.85)
-		gm.emission_enabled = true
-		gm.emission = Color(0.3, 0.5, 0.6)
-		gm.emission_energy_multiplier = 0.6
-		g.material_override = gm
-		g.position = Vector3(sx, 1.2, -0.18)
-		g.rotation_degrees = Vector3(70, 0, 0)
-		_body.add_child(g)
-	# steering column + wheel
-	var col := _chrome_cyl(_body, 0.025, 0.4, Vector3(0, 1.08, 0.0), Vector3(70, 0, 0))
-	var wheel := MeshInstance3D.new()
-	var tm := TorusMesh.new()
-	tm.inner_radius = 0.13
-	tm.outer_radius = 0.19
-	wheel.mesh = tm
-	var wmat := StandardMaterial3D.new()
-	wmat.albedo_color = leather
-	wmat.roughness = 0.6
-	wheel.material_override = wmat
-	wheel.position = Vector3(0, 1.18, 0.12)
-	wheel.rotation_degrees = Vector3(70, 0, 0)
-	_body.add_child(wheel)
-	# bucket seat: cushion + seat back
-	_panel(_body, Vector3(0.5, 0.12, 0.5), Vector3(0, 0.88, 0.45), leather, 0.7)
-	_panel(_body, Vector3(0.55, 0.55, 0.14), Vector3(0, 1.1, 0.66), leather, 0.7)
-	_panel(_body, Vector3(0.5, 0.14, 0.46), Vector3(0, 0.86, 0.45), Color(0.05, 0.05, 0.06), 0.85)  # seat base shadow
 
 ## Stretch (length) + Wide (track) — resize collision, wheel layout, and body together.
 func apply_chassis(stretch: int, wide: int) -> void:
@@ -1991,80 +1295,6 @@ func apply_cans(level: int) -> void:
 ## A one-shot ground-puff burst. Shared by the small/big landing dust variants —
 ## amount can't cheaply change on a live GPUParticles3D, so _on_land picks WHICH
 ## pre-built emitter to restart() based on impact severity instead.
-func _make_dust(amount: int, life: float, vmin: float, vmax: float, spread: float, smin: float, smax: float, alpha: float) -> GPUParticles3D:
-	var g := GPUParticles3D.new()
-	g.amount = amount
-	g.lifetime = life
-	g.one_shot = true
-	g.emitting = false
-	g.explosiveness = 0.85
-	g.local_coords = false
-	var pm := ParticleProcessMaterial.new()
-	pm.direction = Vector3(0, 1, 0)
-	pm.spread = spread
-	pm.gravity = Vector3(0, -3, 0)
-	pm.initial_velocity_min = vmin
-	pm.initial_velocity_max = vmax
-	pm.scale_min = smin
-	pm.scale_max = smax
-	g.process_material = pm
-	var qm := QuadMesh.new()
-	qm.size = Vector2(0.5, 0.5)
-	var dm := StandardMaterial3D.new()
-	dm.albedo_color = Color(0.62, 0.57, 0.47, alpha)
-	dm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	dm.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
-	dm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	qm.material = dm
-	g.draw_pass_1 = qm
-	add_child(g)
-	return g
-
-func _build_dust() -> void:
-	_dust = _make_dust(24, 0.6, 1.5, 3.5, 65.0, 0.4, 1.0, 0.6)          # soft touchdown
-	_dust_big = _make_dust(46, 0.95, 3.0, 6.0, 72.0, 0.75, 1.7, 0.72)   # hard impact
-	_build_ring_puff()
-	# small, subtle pop at a panel's spot the instant it detaches — reuses the same
-	# dust-puff shape/material as landings, just tiny, so it doesn't need its own asset.
-	_panel_pop = _make_dust(10, 0.4, 1.0, 2.4, 55.0, 0.12, 0.3, 0.5)
-
-## A brief expanding ring of dust that hugs the ground — only fires on the really
-## hard landings. Uses an emission RING (flat, at ground level) with radial
-## acceleration so it visibly blasts outward from the touchdown point.
-func _build_ring_puff() -> void:
-	_ring_puff = GPUParticles3D.new()
-	_ring_puff.amount = 22
-	_ring_puff.lifetime = 0.4
-	_ring_puff.one_shot = true
-	_ring_puff.emitting = false
-	_ring_puff.explosiveness = 1.0
-	_ring_puff.local_coords = false
-	var pm := ParticleProcessMaterial.new()
-	pm.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_RING
-	pm.emission_ring_axis = Vector3.UP
-	pm.emission_ring_radius = 0.35
-	pm.emission_ring_inner_radius = 0.15
-	pm.emission_ring_height = 0.05
-	pm.direction = Vector3(0, 0.1, 0)
-	pm.spread = 6.0
-	pm.initial_velocity_min = 0.5
-	pm.initial_velocity_max = 1.3
-	pm.radial_accel_min = 7.0
-	pm.radial_accel_max = 10.0
-	pm.gravity = Vector3(0, -2.0, 0)
-	pm.scale_min = 0.8
-	pm.scale_max = 1.4
-	_ring_puff.process_material = pm
-	var qm := QuadMesh.new()
-	qm.size = Vector2(0.4, 0.4)
-	var dm := StandardMaterial3D.new()
-	dm.albedo_color = Color(0.66, 0.6, 0.5, 0.5)
-	dm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	dm.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
-	dm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	qm.material = dm
-	_ring_puff.draw_pass_1 = qm
-	add_child(_ring_puff)
 
 # --- damage panel-shedding ----------------------------------------------------
 ## Health-threshold panel pops: 2 panels fly off crossing below 70% HP, 3 more
@@ -2196,161 +1426,9 @@ func _get_shed_clone_script() -> GDScript:
 		_shed_clone_script = gs
 	return _shed_clone_script
 
-# --- tire + exhaust smoke ----------------------------------------------------
-## A reusable billowing-smoke emitter (starts off; toggled each frame).
-func _make_smoke(col: Color, smin: float, smax: float, vmin: float, vmax: float, dir: Vector3, amount: int, life: float, grav: float, growth_end: float = 1.0) -> GPUParticles3D:
-	var g := GPUParticles3D.new()
-	g.amount = amount
-	g.lifetime = life
-	g.emitting = false
-	g.local_coords = false
-	var pm := ParticleProcessMaterial.new()
-	pm.direction = dir
-	pm.spread = 35.0
-	pm.initial_velocity_min = vmin
-	pm.initial_velocity_max = vmax
-	pm.gravity = Vector3(0, grav, 0)
-	pm.scale_min = smin
-	pm.scale_max = smax
-	var grad := Gradient.new()
-	grad.set_color(0, Color(col.r, col.g, col.b, col.a))
-	grad.set_color(1, Color(col.r, col.g, col.b, 0.0))   # fade to clear
-	var gt := GradientTexture1D.new(); gt.gradient = grad
-	pm.color_ramp = gt
-	# growth_end > 1.0 lets a puff keep billowing bigger over its life (tire smoke),
-	# instead of just holding its spawn size (exhaust/damage/backfire default).
-	var curve := Curve.new(); curve.add_point(Vector2(0, 0.35)); curve.add_point(Vector2(1, growth_end))
-	var ct := CurveTexture.new(); ct.curve = curve
-	pm.scale_curve = ct
-	g.process_material = pm
-	var qm := QuadMesh.new(); qm.size = Vector2(1, 1)
-	var m := StandardMaterial3D.new()
-	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	m.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
-	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	m.vertex_color_use_as_albedo = true
-	m.albedo_color = Color(1, 1, 1)
-	qm.material = m
-	g.draw_pass_1 = qm
-	return g
 
-func _build_smoke() -> void:
-	# tire smoke off the two rear wheels (shown while drifting) — warm grey, dense,
-	# billows bigger the longer it lives (growth_end 1.6), and its initial velocity
-	# gets re-tuned live by current speed in _physics_process.
-	for i in [2, 3]:
-		if i >= _wheel_positions.size():
-			continue
-		var p: Vector3 = _wheel_positions[i]
-		var sm := _make_smoke(Color(0.72, 0.68, 0.62, 0.6), 0.6, 1.8, 1.0, 2.6, Vector3(0, 1, 0), 46, 1.15, 0.55, 1.6)
-		sm.position = Vector3(p.x, 0.12, p.z)
-		add_child(sm)
-		_tire_smoke.append(sm)
-	# exhaust smoke — dark diesel stacks for the monster, light puffs for the hot-rod
-	if vehicle_type == "monster":
-		for sx in [-1.16, 1.16]:
-			var e := _make_smoke(Color(0.13, 0.13, 0.14, 0.75), 0.45, 1.1, 0.8, 1.8, Vector3(0, 1, 0), 26, 0.7, 2.2)
-			e.position = Vector3(sx, 2.8, 0.3)
-			add_child(e)
-			_exhaust_smoke.append(e)
-	else:
-		for sx in [-0.45, 0.45]:
-			var e := _make_smoke(Color(0.42, 0.42, 0.45, 0.5), 0.22, 0.7, 1.2, 2.8, Vector3(0, 0.4, 1), 18, 0.7, 0.4)
-			e.position = Vector3(sx, 0.42, 2.15)
-			add_child(e)
-			_exhaust_smoke.append(e)
-	# engine damage smoke (dark, from the hood) — shown while health is low
-	var mono := vehicle_type == "monster"
-	_damage_smoke = _make_smoke(Color(0.09, 0.09, 0.1, 0.85), 0.35, 1.1, 1.0, 2.6, Vector3(0, 1, 0.2), 22, 0.95, 1.4)
-	_damage_smoke.position = Vector3(0, (1.6 if mono else 1.0), (-1.6 if mono else -1.0))
-	add_child(_damage_smoke)
-	# backfire flame pops at the exhaust
-	var bx: Array = [-1.16, 1.16] if mono else [-0.45, 0.45]
-	for sx in bx:
-		var bf := _make_backfire()
-		if mono:
-			(bf.process_material as ParticleProcessMaterial).direction = Vector3(0, 1, 0.2)
-		bf.position = Vector3(sx, (2.8 if mono else 0.42), (0.3 if mono else 2.2))
-		add_child(bf)
-		_backfire.append(bf)
 
-# --- speed wind streaks ------------------------------------------------------
-## Thin white streaks that stream off the car above ~60% of max_speed — a subtle
-## sense-of-speed cue with no HUD trickery. Particles spawn in a box around the
-## body and are aligned to their travel direction (BILLBOARD_PARTICLES) so they
-## read as short motion streaks rather than blobs; additive + low alpha keeps it
-## tasteful rather than clownish.
-func _build_wind() -> void:
-	_wind_streaks = GPUParticles3D.new()
-	_wind_streaks.amount = 26
-	_wind_streaks.lifetime = 0.3
-	_wind_streaks.emitting = false
-	_wind_streaks.local_coords = false
-	_wind_streaks.position = Vector3(0, 0.6, 0)
-	var pm := ParticleProcessMaterial.new()
-	pm.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_BOX
-	pm.emission_box_extents = Vector3(1.5, 0.8, 2.2)
-	pm.direction = Vector3(0, 0, 1)   # local rearward (car faces -Z)
-	pm.spread = 5.0
-	pm.initial_velocity_min = 16.0
-	pm.initial_velocity_max = 24.0
-	pm.gravity = Vector3.ZERO
-	pm.scale_min = 0.18
-	pm.scale_max = 0.32
-	pm.particle_flag_align_y = true   # stretch streaks along their travel direction
-	var grad := Gradient.new()
-	grad.set_color(0, Color(1, 1, 1, 0.28))
-	grad.set_color(1, Color(1, 1, 1, 0.0))
-	var gt := GradientTexture1D.new(); gt.gradient = grad
-	pm.color_ramp = gt
-	_wind_streaks.process_material = pm
-	var qm := QuadMesh.new()
-	qm.size = Vector2(0.05, 1.3)   # thin, long streak
-	var m := StandardMaterial3D.new()
-	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	m.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
-	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	m.billboard_mode = BaseMaterial3D.BILLBOARD_PARTICLES
-	m.vertex_color_use_as_albedo = true
-	m.albedo_color = Color(1, 1, 1)
-	qm.material = m
-	_wind_streaks.draw_pass_1 = qm
-	add_child(_wind_streaks)
 
-## A one-shot orange flame burst (exhaust backfire).
-func _make_backfire() -> GPUParticles3D:
-	var g := GPUParticles3D.new()
-	g.amount = 12
-	g.lifetime = 0.22
-	g.one_shot = true
-	g.explosiveness = 0.95
-	g.emitting = false
-	g.local_coords = false
-	var pm := ParticleProcessMaterial.new()
-	pm.direction = Vector3(0, 0.35, 1)   # out the back
-	pm.spread = 28.0
-	pm.initial_velocity_min = 4.0
-	pm.initial_velocity_max = 9.0
-	pm.gravity = Vector3.ZERO
-	pm.scale_min = 0.3
-	pm.scale_max = 0.75
-	var grad := Gradient.new()
-	grad.set_color(0, Color(1.0, 0.92, 0.55, 1.0))
-	grad.set_color(1, Color(1.0, 0.3, 0.05, 0.0))
-	var gt := GradientTexture1D.new(); gt.gradient = grad
-	pm.color_ramp = gt
-	g.process_material = pm
-	var qm := QuadMesh.new(); qm.size = Vector2(0.5, 0.5)
-	var m := StandardMaterial3D.new()
-	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	m.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
-	m.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
-	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	m.vertex_color_use_as_albedo = true
-	m.albedo_color = Color(1, 1, 1)
-	qm.material = m
-	g.draw_pass_1 = qm
-	return g
 
 # --- skid marks --------------------------------------------------------------
 func _build_skids() -> void:
@@ -2547,22 +1625,6 @@ func apply_rockets(level: int) -> void:
 	# small air nudge (gravity force is ~14450, so even maxed this barely lifts)
 	boost_force = 0.0 if level == 0 else (3500.0 + float(level) * 1800.0)
 
-## Toggle the flame jets (+ hot core) with the boost input, and flicker the boost
-## light while lit — cheap: one OmniLight3D, energy driven by a sine wobble plus a
-## little jitter each frame so it reads like a live flame instead of a steady glow.
-func _update_flames(on: bool, delta: float) -> void:
-	for f in _rocket_flames:
-		f.emitting = on
-	for c in _rocket_cores:
-		c.emitting = on
-	if _boost_light == null:
-		return
-	if on:
-		_boost_flicker_t += delta * 26.0
-		var flick: float = 0.75 + 0.25 * sin(_boost_flicker_t) + randf_range(-0.12, 0.12)
-		_boost_light.light_energy = 3.2 * clampf(flick, 0.35, 1.25)
-	else:
-		_boost_light.light_energy = 0.0
 
 ## A normal tapered wing (trapezoid): wide root chord, narrower swept tip, slight dihedral.
 func _wing_mesh(side: float) -> ArrayMesh:
