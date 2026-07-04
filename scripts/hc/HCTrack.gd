@@ -76,6 +76,9 @@ const PK_BEHIND := 60.0          # free pickups once this far behind the car
 const PK_COIN_VALUE := 20.0      # cash per coin
 const PK_FUEL_VALUE := 14.0      # fuel units per can (deliberately small — a sip, not a fill)
 const PK_FUEL_SLOT := 8          # a fuel can every Nth slot (~128 m); the rest are coins
+const PK_MILK_VALUE := 0.3       # milk refills this FRACTION of the tank (handler scales it)
+const PK_MILK_SLOT := 29         # rare milk carton every Nth slot (~464 m; prime, so it
+                                 # rarely collides with the fuel cadence — fuel wins ties)
 const PK_ARC_COINS := 6          # coins arced over each gap jump
 const PK_ARC_PEAK := 7.0         # arc apex above the launch level
 var _pk_root: Node3D
@@ -583,6 +586,9 @@ func _spawn_pickup_at_s(s: float) -> void:
 	if slot % PK_FUEL_SLOT == 0:
 		kind = "fuel"
 		value = PK_FUEL_VALUE
+	elif slot > 0 and slot % PK_MILK_SLOT == 0:
+		kind = "milk"
+		value = PK_MILK_VALUE
 	# lateral weave for coins so the line isn't a dead-straight rail (perp = road right)
 	var off := 0.0
 	if kind == "coin":

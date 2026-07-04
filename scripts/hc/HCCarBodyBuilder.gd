@@ -438,6 +438,16 @@ func _door_handle(parent: Node3D, x: float, y: float, z: float) -> void:
 ## A license plate plaque (front or rear).
 func _plate(parent: Node3D, x: float, y: float, z: float) -> void:
 	car._panel(parent, Vector3(0.32, 0.15, 0.02), Vector3(x, y, z), Color(0.86, 0.84, 0.72), 0.6)
+	# Every ride is registered to the owner. (His Rocket League handle — ask him.)
+	var tag := Label3D.new()
+	tag.text = "MILKY"
+	tag.font_size = 44
+	tag.pixel_size = 0.0022
+	tag.modulate = Color(0.16, 0.2, 0.38)
+	tag.outline_size = 0
+	tag.position = Vector3(x, y, z + signf(z) * 0.015)
+	tag.rotation.y = 0.0 if z > 0.0 else PI
+	parent.add_child(tag)
 
 ## Rounded fenders / arches sitting above each of the four wheels (x≈±0.9, z≈±1.4).
 func _build_fenders(paint: Color, rubber: Color) -> void:

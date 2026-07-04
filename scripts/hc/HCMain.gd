@@ -1019,6 +1019,14 @@ func _on_pickup_collected(kind: String, value: float) -> void:
 				_car.apply_central_impulse(-_car.global_transform.basis.z * value * 120.0)
 			if _audio:
 				_audio.call("play_coin")
+		"milk":
+			# the rare carton: value is a FRACTION of the tank (see HCTrack.PK_MILK_VALUE)
+			var mfm: float = _car.get("max_fuel")
+			_car.set("fuel", minf(float(_car.get("fuel")) + mfm * value, mfm))
+			_car.set("trick_text", "GOT MILK?   +%d%% TANK" % int(round(value * 100.0)))
+			_car.set("_trick_timer", 1.8)
+			if _audio:
+				_audio.call("play_coin")
 
 # --- upgrade shop ------------------------------------------------------------
 
