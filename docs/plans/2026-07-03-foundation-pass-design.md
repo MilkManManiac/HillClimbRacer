@@ -190,6 +190,12 @@ cleanup, export configuration — all logged in DEFERRED.md, untouched here.
   HCMain-owned terrain calls (terrain constructed unconditionally) may be direct.
 - **Rejected:** the verdict's "consider cutting W3 from the pass" — the owner
   explicitly commissioned the god-file splits; A1–A3 remove the identified risk.
+- **Waiver (post-W3a):** the helper field is `_shop_ui: HCShopScript`, not `_shop` —
+  `_shop` remains the panel Control so every pre-existing `_shop.visible` call site
+  stays untouched (the more behavior-preserving choice; W3a review finding 3).
+- **Waiver (post-W3b):** HCCar↔helper preload cycle is deliberate and verified on
+  4.6.3; untyped hosts break `:=` inference (coordinator reproduced the failure).
+  HCShop's `main` stays untyped because its internals don't lean on inference.
 
 ## Wave plan / lanes
 
