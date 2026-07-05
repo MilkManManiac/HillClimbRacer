@@ -147,11 +147,25 @@ var _trial_time := 0.0
 var _trial_finished := false
 var _trial_splits_hit := {}       # split index (int) -> true, cleared every run
 var _trial_result := ""           # last finish summary line, folded into the wreck screen
-var _ghost: Node3D                # HCGhostScript instance; duck-typed via .call() like _terrain/_audio
+var _ghost: Node3D                # HCGhostScript instance (your personal best); duck-typed .call()
 var _best_time := {}              # "<map>|<vehicle>" -> seconds, persisted
 var _ghost_data := {}             # "<map>|<vehicle>" -> Array[float] (HCGhostScript sample dump), persisted
 var _trial_lbl: Label             # HUD: big live/finish timer (top-center)
 var _trial_sub_lbl: Label         # HUD: "to go / best / medal ladder" readout under the timer
+
+# --- Stage 1 async multiplayer: shareable ghost files ("send a friend your ghost") --
+# A rival ghost is keyed by MAP ONLY (not map|vehicle) — the file's own vehicle rides
+# along as metadata for the label/status line, but you can race a friend's F1 lap in
+# your van; only the recorded transforms matter for playback. One rival slot per map,
+# imported/replaced/cleared from the title screen; persisted in the save (same
+# ghost_version gate as `_ghost_data`, since it's the same sample format).
+const GHOST_DIR_DEFAULT := "user://ghosts"
+var ghost_dir_override := ""      # test hook (GhostShareProbe): redirect exports away from the
+                                   # real folder so headless runs stay hermetic; "" = use the default
+var _rival_ghost: Node3D          # HCGhostScript instance (imported rival); tinted red + name-tagged
+var _rival_data := {}             # map_key -> {"vehicle":String,"time":float,"data":Array,"name":String}
+var _ghost_status_lbl: Label      # title-screen GHOSTS row status line
+var _ghost_file_dialog: FileDialog
 
 # HUD
 var _fuel_bar: ColorRect
@@ -336,7 +350,10 @@ var _speed_lines_size := Vector2.ZERO  # viewport size the streaks were laid out
 # ("<map>|<vehicle>" -> seconds), "ghosts" ("<map>|<vehicle>" -> Array[float] sample
 # dump, HCGhostScript.recorded_data() format), "ghost_version" (HCGhostScript.VERSION at save
 # time — a mismatch drops ALL saved ghosts on load rather than risk feeding a stale
-# sample layout into HCGhostScript.load_data(); best_time survives regardless).
+# sample layout into HCGhostScript.load_data(); best_time survives regardless), "rivals"
+# (map_key -> {vehicle, time, data, name} — an imported .hcghost file's payload, one
+# per map; gated by the SAME ghost_version check as "ghosts" since it's the same
+# sample format).
 # _collect_save() / _apply_save() are the single choke point for the schema — adding
 # a field later is "write it in one, read it with .get(key, fallback) in the other."
 const SAVE_PATH := "user://hc_save.json"
@@ -375,6 +392,15 @@ func _collect_save() -> Dictionary:
 	var ghosts_out := {}
 	for k in _ghost_data:
 		ghosts_out[k] = _ghost_data[k]
+	var rivals_out := {}
+	for mk in _rival_data:
+		var rd: Dictionary = _rival_data[mk]
+		rivals_out[mk] = {
+			"vehicle": str(rd.get("vehicle", "")),
+			"time": float(rd.get("time", 0.0)),
+			"data": rd.get("data", []),
+			"name": str(rd.get("name", "")),
+		}
 	return {
 		"version": 1,
 		"money": money,
@@ -390,6 +416,7 @@ func _collect_save() -> Dictionary:
 		"best_time": best_time_out,
 		"ghosts": ghosts_out,
 		"ghost_version": HCGhostScript.VERSION,
+		"rivals": rivals_out,
 		"volume": master_volume,
 	}
 
@@ -446,6 +473,17 @@ func _apply_save(d: Dictionary) -> void:
 		for k in ghosts_in:
 			if ghosts_in[k] is Array:
 				_ghost_data[k] = ghosts_in[k]
+		var rivals_in: Dictionary = d.get("rivals", {})
+		for mk in rivals_in:
+			if MAPS.has(mk) and rivals_in[mk] is Dictionary:
+				var rd: Dictionary = rivals_in[mk]
+				if rd.get("data") is Array:
+					_rival_data[mk] = {
+						"vehicle": str(rd.get("vehicle", "")),
+						"time": float(rd.get("time", 0.0)),
+						"data": rd["data"],
+						"name": str(rd.get("name", "")),
+					}
 	master_volume = clampf(float(d.get("volume", master_volume)), 0.0, 1.0)
 
 ## Write the full save snapshot to disk. Cheap enough to call on every purchase/switch/
@@ -489,6 +527,9 @@ func _ready() -> void:
 	               # below reads them — terrain (_map) and car (_vehicle) are built next
 	_ghost = HCGhostScript.new()
 	add_child(_ghost)   # one persistent record+playback node; must exist before _setup_terrain_and_car
+	_rival_ghost = HCGhostScript.new()
+	_rival_ghost.call("configure", Color(1.0, 0.25, 0.22, 0.4))   # red, distinct from your blue ghost
+	add_child(_rival_ghost)   # playback-only — never records; loaded from imported files
 	_setup_sky()
 	_setup_terrain_and_car()
 	_setup_scenery()
@@ -975,6 +1016,23 @@ func _refresh_map_buttons() -> void:
 		elif MAPS[mk].mode == "sprint":
 			line += "   (sprint mode)"
 		stat.text = line
+	_refresh_ghost_row()
+
+## Update the title-screen GHOSTS status line for the CURRENTLY SELECTED map (rivals
+## are keyed by map, not map|vehicle — see _rival_data). Called from every place that
+## already calls _refresh_map_buttons() (map/mode/vehicle picks), plus directly after
+## an export/import/clear action. No-ops before the row is built (_ghost_status_lbl
+## null) and after the title screen is torn down (_begin_game frees it).
+func _refresh_ghost_row() -> void:
+	if _ghost_status_lbl == null or not is_instance_valid(_ghost_status_lbl):
+		return
+	var rd: Dictionary = _rival_data.get(_map, {})
+	if rd.has("data"):
+		var veh_in := str(rd.get("vehicle", ""))
+		var veh_note := "" if veh_in == _vehicle or not VEHICLES.has(veh_in) else "  ·  recorded in %s" % str(VEHICLES[veh_in].name)
+		_ghost_status_lbl.text = "Rival: %s  (%s)%s" % [str(rd.get("name", "?")), HCTimeTrialScript.format_time(float(rd.get("time", 0.0))), veh_note]
+	else:
+		_ghost_status_lbl.text = "Rival: none imported for %s yet." % str(MAPS[_map].name)
 
 ## Cycle to the next map from the shop/death-screen "MAP" row.
 func _cycle_map() -> void:
@@ -1195,15 +1253,24 @@ func _trial_key(map_key: String, vehicle_key: String) -> String:
 
 ## Load the saved ghost (if any) for the active map+vehicle into the shared HCGhostScript
 ## node so it plays back this run. Cleared (no ghost shown) outside trial mode or
-## when there's no saved best yet.
+## when there's no saved best yet. Also (re)loads the imported RIVAL ghost for the
+## active map, if any — rivals are keyed by map only (see _rival_data), so a rival
+## races alongside your personal-best ghost regardless of which vehicle recorded it;
+## either, both, or neither can be present and each shows independently.
 func _load_ghost_for_current() -> void:
-	if _ghost == null:
-		return
-	var key := _trial_key(_map, _vehicle)
-	if _trial_active and _ghost_data.has(key):
-		_ghost.call("load_data", _ghost_data[key])
-	else:
-		_ghost.call("clear_data")
+	if _ghost:
+		var key := _trial_key(_map, _vehicle)
+		if _trial_active and _ghost_data.has(key):
+			_ghost.call("load_data", _ghost_data[key])
+		else:
+			_ghost.call("clear_data")
+	if _rival_ghost:
+		var rd: Dictionary = _rival_data.get(_map, {})
+		if _trial_active and rd.has("data"):
+			_rival_ghost.call("configure", Color(1.0, 0.25, 0.22, 0.4), str(rd.get("name", "RIVAL")))
+			_rival_ghost.call("load_data", rd["data"])
+		else:
+			_rival_ghost.call("clear_data")
 
 ## Tick the countdown while a sprint run is live; award +time every checkpoint
 ## distance and end the run (via the car's normal death flow) at zero.
@@ -1255,6 +1322,8 @@ func _update_trial(delta: float) -> void:
 			_finish_trial()
 	if _ghost:
 		_ghost.call("show_at", _trial_time)
+	if _rival_ghost:
+		_rival_ghost.call("show_at", _trial_time)   # never records — just plays back the imported file
 
 ## Bank a finished trial run: compare against the saved best, persist a new record +
 ## ghost if this run is faster (or the first clean finish on this map+vehicle), and
@@ -1521,6 +1590,9 @@ func _build_start_menu() -> void:
 	_refresh_map_buttons()
 
 	scb.add_child(HSeparator.new())
+	_build_ghost_row(scb)
+
+	scb.add_child(HSeparator.new())
 	_build_title_vehicle_row(scb)
 
 	scb.add_child(HSeparator.new())
@@ -1653,6 +1725,189 @@ func _build_map_card(parent: Node, mk: String) -> void:
 	_map_btns[mk] = card
 	_map_card_stat_lbl[mk] = stat_lbl
 
+## Compact title-screen row for Stage 1 async multiplayer ("send a friend your
+## ghost"): export the personal-best ghost for the currently-selected map+vehicle to
+## a standalone file, reveal the folder it landed in (so it can be attached/AirDropped/
+## etc. to a friend), import a friend's file as this map's RIVAL ghost, or clear it.
+## Deliberately terse — one row + one status line — so it never threatens the 720px
+## window budget (CLAUDE.md invariant 4); all four actions no-op gracefully with a
+## message in the status line rather than erroring.
+func _build_ghost_row(parent: Node) -> void:
+	_shop_label(parent, "GHOSTS — share your best run", 13, Color(0.6, 0.64, 0.72))
+	var row := HBoxContainer.new()
+	row.alignment = BoxContainer.ALIGNMENT_CENTER
+	row.add_theme_constant_override("separation", 8)
+	parent.add_child(row)
+	var export_btn := Button.new()
+	export_btn.text = "⬆ Export Best"
+	export_btn.custom_minimum_size = Vector2(132, 32)
+	export_btn.add_theme_font_size_override("font_size", 12)
+	export_btn.pressed.connect(_export_best_ghost)
+	row.add_child(export_btn)
+	var folder_btn := Button.new()
+	folder_btn.text = "📂 Folder"
+	folder_btn.custom_minimum_size = Vector2(84, 32)
+	folder_btn.add_theme_font_size_override("font_size", 12)
+	folder_btn.pressed.connect(_reveal_ghosts_folder)
+	row.add_child(folder_btn)
+	var import_btn := Button.new()
+	import_btn.text = "⬇ Import Rival"
+	import_btn.custom_minimum_size = Vector2(132, 32)
+	import_btn.add_theme_font_size_override("font_size", 12)
+	import_btn.pressed.connect(_open_import_dialog)
+	row.add_child(import_btn)
+	var clear_btn := Button.new()
+	clear_btn.text = "✕ Clear Rival"
+	clear_btn.custom_minimum_size = Vector2(112, 32)
+	clear_btn.add_theme_font_size_override("font_size", 12)
+	clear_btn.pressed.connect(_clear_rival_ghost)
+	row.add_child(clear_btn)
+	_ghost_status_lbl = _shop_label(parent, "", 12, Color(0.72, 0.76, 0.84))
+	_ghost_status_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_ghost_status_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_refresh_ghost_row()
+
+## Write the personal-best ghost for the CURRENTLY SELECTED map+vehicle to a standalone
+## .hcghost file under GHOST_DIR. No-ops (with a status message, not an error) if
+## there's no best ghost yet for this exact map+vehicle pairing.
+func _export_best_ghost() -> void:
+	if _audio:
+		_audio.call("play_click")
+	var key := _trial_key(_map, _vehicle)
+	if not _ghost_data.has(key):
+		_show_ghost_status("No best ghost yet for %s / %s — finish a time trial there first." % [str(MAPS[_map].name), str(VEHICLES[_vehicle].name)])
+		return
+	var data: Array = _ghost_data[key]
+	var time: float = float(_best_time.get(key, 0.0))
+	var dir := _ghost_dir()
+	if DirAccess.make_dir_recursive_absolute(dir) not in [OK, ERR_ALREADY_EXISTS]:
+		_show_ghost_status("Export failed — couldn't create the ghosts folder.")
+		return
+	var fname := "%s_%s_%ss.hcghost" % [_map, _vehicle, "%.2f" % time]
+	var payload := {
+		"hcghost_version": HCGhostScript.VERSION,
+		"map": _map,
+		"vehicle": _vehicle,
+		"time": time,
+		"sample_hz": HCGhostScript.SAMPLE_HZ,
+		"samples": data,
+		"checksum": HCGhostScript.checksum(data, time),
+	}
+	var f := FileAccess.open(dir + "/" + fname, FileAccess.WRITE)
+	if f == null:
+		_show_ghost_status("Export failed — couldn't write the file.")
+		return
+	f.store_string(JSON.stringify(payload))
+	f.close()
+	_show_ghost_status("Exported %s — hit 📂 Folder to grab it." % fname)
+
+## Open the (globalized) ghosts folder in the OS file browser so the owner can attach
+## an exported .hcghost to an email/chat. Never called automatically from export —
+## kept as its own explicit action so headless probes never trigger a real OS window.
+func _reveal_ghosts_folder() -> void:
+	if _audio:
+		_audio.call("play_click")
+	var dir := _ghost_dir()
+	DirAccess.make_dir_recursive_absolute(dir)
+	OS.shell_open(ProjectSettings.globalize_path(dir))
+
+## Native "open file" dialog scoped to *.hcghost, filesystem-rooted at the ghosts
+## folder. Built lazily (once) and reused; Godot's FileDialog is a Window, so it can
+## be added directly under the root and popped up on demand.
+func _open_import_dialog() -> void:
+	if _audio:
+		_audio.call("play_click")
+	if _ghost_file_dialog == null and _start_layer:
+		_ghost_file_dialog = FileDialog.new()
+		_ghost_file_dialog.title = "Import a friend's ghost"
+		_ghost_file_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+		_ghost_file_dialog.access = FileDialog.ACCESS_FILESYSTEM
+		_ghost_file_dialog.add_filter("*.hcghost", "Hill Climb ghost file")
+		_ghost_file_dialog.size = Vector2i(640, 460)
+		_ghost_file_dialog.file_selected.connect(_on_ghost_file_selected)
+		# parented under the title screen's ALWAYS-processing layer (see _build_start_menu)
+		# so it works while get_tree().paused is true, and is cleaned up automatically
+		# when _begin_game() frees _start_layer
+		_start_layer.add_child(_ghost_file_dialog)
+	if _ghost_file_dialog == null:
+		return
+	DirAccess.make_dir_recursive_absolute(_ghost_dir())
+	_ghost_file_dialog.current_dir = ProjectSettings.globalize_path(_ghost_dir())
+	_ghost_file_dialog.popup_centered()
+
+func _on_ghost_file_selected(path: String) -> void:
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		_show_ghost_status("Couldn't open that file.")
+		return
+	var txt := f.get_as_text()
+	f.close()
+	var res := import_rival_ghost_text(txt, path.get_file().get_basename())
+	_show_ghost_status(str(res.get("msg", "")))
+
+## Core import validator + applier — deliberately takes raw JSON TEXT (not a path) so
+## it works identically from the real FileDialog and from a headless probe that never
+## touches a native dialog. Validates version, map key, sample shape, and the
+## checksum (in that order, cheapest/most-decisive checks first) before storing the
+## rival under its OWN map key (see _rival_data doc comment — NOT the currently
+## selected title-screen map, so importing a canyon ghost while alpine is selected
+## still lands correctly). Returns {"ok": bool, "msg": String}.
+func import_rival_ghost_text(json_text: String, source_name: String) -> Dictionary:
+	var json := JSON.new()
+	if json.parse(json_text) != OK or typeof(json.data) != TYPE_DICTIONARY:
+		return {"ok": false, "msg": "Not a valid ghost file."}
+	var d: Dictionary = json.data
+	if int(d.get("hcghost_version", -1)) != HCGhostScript.VERSION:
+		return {"ok": false, "msg": "Ghost file is from an incompatible version."}
+	var map_in := str(d.get("map", ""))
+	if not MAPS.has(map_in):
+		return {"ok": false, "msg": "Ghost file is for an unknown map (\"%s\")." % map_in}
+	var samples: Array = d.get("samples", [])
+	var time_in := float(d.get("time", -1.0))
+	if samples.is_empty() or samples.size() % int(HCGhostScript.FLOATS_PER_SAMPLE) != 0 or time_in <= 0.0:
+		return {"ok": false, "msg": "Ghost file is malformed."}
+	var expect_cs := int(d.get("checksum", 0))
+	if expect_cs != HCGhostScript.checksum(samples, time_in):
+		return {"ok": false, "msg": "Ghost file failed its integrity check (corrupted?)."}
+	var vehicle_in := str(d.get("vehicle", ""))
+	_rival_data[map_in] = {
+		"vehicle": vehicle_in,
+		"time": time_in,
+		"data": samples,
+		"name": source_name,
+	}
+	if map_in == _map:
+		_load_ghost_for_current()   # already on this map — swap the live rival in immediately
+	_refresh_ghost_row()
+	_refresh_map_buttons()
+	_save_game()
+	var veh_note := "" if not VEHICLES.has(vehicle_in) or vehicle_in == "" else "  (recorded in %s)" % str(VEHICLES[vehicle_in].name)
+	return {"ok": true, "msg": "Rival loaded for %s: %s — %s%s" % [str(MAPS[map_in].name), source_name, HCTimeTrialScript.format_time(time_in), veh_note]}
+
+## Drop the rival ghost for the CURRENTLY SELECTED map only (rivals are per-map — see
+## _rival_data). No-ops with a status message if there isn't one.
+func _clear_rival_ghost() -> void:
+	if _audio:
+		_audio.call("play_click")
+	if not _rival_data.has(_map):
+		_show_ghost_status("No rival set for %s." % str(MAPS[_map].name))
+		return
+	_rival_data.erase(_map)
+	if _rival_ghost:
+		_rival_ghost.call("clear_data")
+	_save_game()
+	_show_ghost_status("Rival cleared for %s." % str(MAPS[_map].name))
+	_refresh_ghost_row()
+
+func _show_ghost_status(msg: String) -> void:
+	if _ghost_status_lbl and is_instance_valid(_ghost_status_lbl):
+		_ghost_status_lbl.text = msg
+
+## GHOST_DIR_DEFAULT, unless a probe has redirected exports via ghost_dir_override
+## (see its doc comment) — keeps headless tests from ever touching the real folder.
+func _ghost_dir() -> String:
+	return ghost_dir_override if ghost_dir_override != "" else GHOST_DIR_DEFAULT
+
 ## Title-screen vehicle strip: pick the STARTING ride without opening the Garage.
 ## Owned rides are selectable; locked ones show a price/lock and just tooltip-hint
 ## "unlock in the Garage" rather than letting you buy from the title screen (buying
@@ -1707,6 +1962,8 @@ func _begin_game() -> void:
 	if _start_layer:
 		_start_layer.queue_free()
 		_start_layer = null
+	_ghost_file_dialog = null   # was a child of _start_layer — freed with it above
+	_ghost_status_lbl = null
 
 # --- pause menu: ESC during a live run (not the title, not the garage) -------------
 
@@ -2394,6 +2651,7 @@ func _fresh_start() -> void:
 	_run_mode = "classic"
 	_best_time = {}
 	_ghost_data = {}
+	_rival_data = {}
 	if save_enabled and FileAccess.file_exists(SAVE_PATH):
 		DirAccess.remove_absolute(SAVE_PATH)   # wipe the on-disk save, not just memory
 	_swap_vehicle("minivan")                          # rebuild the car clean + re-apply zeros

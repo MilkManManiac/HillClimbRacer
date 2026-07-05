@@ -10,6 +10,13 @@ extends Node3D
 ## friend's ghost" feature — a clever/compact format now just means a painful
 ## migration later.
 ##
+## Stage 1 async multiplayer ("send a friend your ghost") landed: `configure()` sets
+## a tint + optional floating name label so HCMain can run two of these nodes at once
+## (your own best in blue, an imported rival in red with its filename as a tag), and
+## the static `checksum()` backs the shareable .hcghost file format (see HCMain's
+## export/import functions) — both live here because they're properties of the
+## sample format itself, not of any one HCMain feature.
+##
 ## Sample layout, 8 floats each: [t, x, y, z, qx, qy, qz, qw]. `t` is seconds since
 ## the recording (or, on playback, the trial run) started — both are the same clock
 ## (HCMain's trial timer), so show_at(elapsed_trial_time) lines the ghost up directly.
@@ -29,6 +36,62 @@ var _play_samples: PackedFloat32Array = PackedFloat32Array()
 var _play_count := 0
 
 var _mesh_root: Node3D   # built lazily on first load_data() with real samples
+
+# --- appearance (used to tell "your best" apart from an imported rival) --------
+var _tint := Color(0.35, 0.75, 1.0, 0.38)   # default: your-ghost blue
+var _label_text := ""                        # non-empty shows a floating Label3D (rival name)
+var _label3d: Label3D
+
+## Set the mesh tint (and an optional floating name tag) BEFORE or after load_data —
+## safe either way: applied immediately if the mesh already exists, else remembered
+## for the lazy _build_mesh() on the next load_data() with real samples. HCMain uses
+## this to give the personal-best ghost and an imported rival distinct looks.
+func configure(tint: Color, label_text: String = "") -> void:
+	_tint = tint
+	_label_text = label_text
+	if _mesh_root:
+		_apply_tint()
+		_apply_label()
+
+func _apply_tint() -> void:
+	for c in _mesh_root.get_children():
+		if c is MeshInstance3D and c.material_override is StandardMaterial3D:
+			(c.material_override as StandardMaterial3D).albedo_color = _tint
+
+func _apply_label() -> void:
+	if _label_text == "":
+		if _label3d:
+			_label3d.visible = false
+		return
+	if _label3d == null:
+		_label3d = Label3D.new()
+		_label3d.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		_label3d.font_size = 40
+		_label3d.outline_size = 10
+		_label3d.no_depth_test = true
+		_label3d.position = Vector3(0, 1.9, 0)
+		_mesh_root.add_child(_label3d)
+	_label3d.text = _label_text
+	_label3d.modulate = Color(_tint.r, _tint.g, _tint.b, 1.0)
+	_label3d.visible = _mesh_root.visible
+
+# --- shareable ghost-file format (Stage 1 async multiplayer) --------------------
+## A cheap, dependency-free integrity check for exported .hcghost files: samples are
+## rounded to the millisecond-equivalent (x1000) before folding into a 32-bit FNV-1a
+## so the check is exact for JSON round-tripped floats (JSON text -> float -> this
+## hash reproduces byte-identically, unlike hashing raw float bit patterns which can
+## drift a ULP through text round-tripping). Kept in the low 32 bits throughout so
+## there is no dependence on GDScript's int overflow behaviour.
+static func checksum(samples: Array, time: float) -> int:
+	var h: int = 2166136261
+	for v in samples:
+		var iv: int = int(round(float(v) * 1000.0))
+		h = (h ^ (iv & 0xFFFFFFFF)) & 0xFFFFFFFF
+		h = (h * 16777619) & 0xFFFFFFFF
+	var it: int = int(round(time * 1000.0))
+	h = (h ^ it) & 0xFFFFFFFF
+	h = (h * 16777619) & 0xFFFFFFFF
+	return h
 
 # --- recording -----------------------------------------------------------------
 
@@ -121,10 +184,14 @@ func show_at(t: float) -> void:
 	_mesh_root.visible = true
 	_mesh_root.global_position = _sample_pos(lo).lerp(_sample_pos(hi), f)
 	_mesh_root.global_transform.basis = Basis(_sample_rot(lo).slerp(_sample_rot(hi), f))
+	if _label3d:
+		_label3d.visible = true
 
 func hide_ghost() -> void:
 	if _mesh_root:
 		_mesh_root.visible = false
+	if _label3d:
+		_label3d.visible = false
 
 func _sample_pos(i: int) -> Vector3:
 	var b := i * FLOATS_PER_SAMPLE
@@ -141,7 +208,7 @@ func _build_mesh() -> void:
 	_mesh_root = Node3D.new()
 	add_child(_mesh_root)
 	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.35, 0.75, 1.0, 0.38)
+	mat.albedo_color = _tint
 	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
@@ -161,3 +228,4 @@ func _build_mesh() -> void:
 	cabin.material_override = mat
 	_mesh_root.add_child(cabin)
 	_mesh_root.visible = false
+	_apply_label()
