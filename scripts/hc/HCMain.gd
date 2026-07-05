@@ -8,6 +8,7 @@ const HCTerrainScript := preload("res://scripts/hc/HCTerrain.gd")
 const HCTrackScript := preload("res://scripts/hc/HCTrack.gd")
 const HCCarScript := preload("res://scripts/hc/HCCar.gd")
 const HCAudioScript := preload("res://scripts/hc/HCAudio.gd")
+const HCSceneryScript := preload("res://scripts/hc/HCScenery.gd")
 const HCTimeTrialScript := preload("res://scripts/hc/HCTimeTrial.gd")   # static rules only, never instanced
 const HCGhostScript := preload("res://scripts/hc/HCGhost.gd")
 const USE_TRACK := true   # true = new 2-D winding road (HCTrack); false = classic corridor
@@ -15,6 +16,7 @@ const USE_TRACK := true   # true = new 2-D winding road (HCTrack); false = class
 var _car: RigidBody3D
 var _audio: Node
 var _terrain: Node3D
+var _scenery: Node3D   # distant background ridgelines/skyline (HCScenery.gd) — see _setup_scenery
 var _cam: Camera3D
 var _cam_heading := Vector3(0, 0, -1)
 var _start := Vector3(0, 6, 0)
@@ -489,6 +491,7 @@ func _ready() -> void:
 	add_child(_ghost)   # one persistent record+playback node; must exist before _setup_terrain_and_car
 	_setup_sky()
 	_setup_terrain_and_car()
+	_setup_scenery()
 	_setup_camera()
 	_setup_hud()
 	_setup_speed_lines()
@@ -716,6 +719,83 @@ func _tune_arcade_environment(sky: Node3D) -> void:
 			sun.directional_shadow_max_distance = 150.0   # cheaper than Sky.gd's default 320m
 			sun.shadow_bias = 0.05
 			sun.shadow_blur = 1.5   # soft-edged shadows, not razor-hard arcade shadows
+	# per-map atmosphere seasoning, layered on TOP of the day/night base above so every
+	# map keeps its own mood without a second copy of the whole tonemap/ambient setup.
+	_apply_map_atmosphere(env, sun)
+	# sun disc glow + star density live in Sky.gd's shader material — reached the same
+	# duck-typed way as _env/_sun above (Sky.gd itself stays untouched/owned elsewhere).
+	var sky_mat: ShaderMaterial = sky.get("_sky_mat")
+	if sky_mat:
+		_apply_map_sky_shader(sky_mat)
+
+## Per-map fog color/density + sun-color seasoning: canyon's dusty warm haze, alpine's
+## crisp cold thin air, hills' soft pastoral haze, gravity's industrial overcast-warm
+## grey, midnight's deeper neon-tinged blacks. Only touches fog + sun light — tonemap/
+## ambient/glow stay owned by the day/night branch above so the night-readability
+## invariant is never disturbed by a per-map tweak.
+func _apply_map_atmosphere(env: Environment, sun: DirectionalLight3D) -> void:
+	if env == null:
+		return
+	match _map:
+		"hills":
+			# soft pastoral — a light, barely-there departure from the base warm haze
+			env.fog_light_color = Color(0.93, 0.87, 0.74)
+			env.fog_density = 0.009
+		"canyon":
+			# dusty warm haze, closer-in and thicker than the base — red-sandstone dust
+			env.fog_light_color = Color(0.88, 0.56, 0.32)
+			env.fog_depth_begin = 90.0
+			env.fog_density = 0.017
+			env.fog_aerial_perspective = 0.5
+			env.adjustment_saturation = 1.22
+			env.adjustment_contrast = 1.08
+			if sun:
+				sun.light_color = Color(1.0, 0.78, 0.52)
+				sun.light_energy = 2.05
+		"alpine":
+			# crisp thin cold air — long clean sightlines with a slight blue distance haze
+			env.fog_light_color = Color(0.80, 0.87, 0.98)
+			env.fog_depth_begin = 180.0
+			env.fog_depth_end = 1300.0
+			env.fog_density = 0.007
+			if sun:
+				sun.light_color = Color(0.97, 0.97, 1.0)
+				sun.light_energy = 2.05
+		"midnight":
+			# deeper blacks + a neon-tinged haze instead of a plain night-blue fog
+			env.fog_light_color = Color(0.06, 0.05, 0.13)
+			env.fog_depth_end = 900.0   # a touch further than the night base so the skyline reads
+			env.fog_density = 0.017
+			env.glow_intensity = 0.65
+		"gravity":
+			# industrial, slightly overcast-warm — hazier and flatter than the other day maps
+			env.fog_light_color = Color(0.66, 0.60, 0.50)
+			env.fog_depth_begin = 110.0
+			env.fog_density = 0.013
+			env.adjustment_saturation = 0.96
+			env.adjustment_contrast = 1.02
+			if sun:
+				sun.light_energy = 1.65
+
+## Sun-disc glow + star density: cheap, high-read per-map touches living in Sky.gd's
+## own shader (see shaders/sky.gdshader — sun_glow/sun_glow_color/star_amount uniforms),
+## reached the same way _env/_sun are rather than editing Sky.gd itself.
+func _apply_map_sky_shader(sky_mat: ShaderMaterial) -> void:
+	match _map:
+		"canyon":
+			# a big warm glare around a low sunset sun sells the "sunset canyon" name
+			sky_mat.set_shader_parameter("sun_glow", 1.0)
+			sky_mat.set_shader_parameter("sun_glow_color", Color(1.0, 0.5, 0.2))
+		"alpine":
+			# crisp thin air = a tight, cold disc rather than a hazy glow
+			sky_mat.set_shader_parameter("sun_glow", 0.3)
+			sky_mat.set_shader_parameter("sun_glow_color", Color(0.95, 0.97, 1.0))
+		"gravity":
+			# overcast industrial haze — a duller, hazier disc
+			sky_mat.set_shader_parameter("sun_glow", 0.28)
+		"midnight":
+			# denser stars than the stock night value reads as a clearer, more dramatic sky
+			sky_mat.set_shader_parameter("star_amount", 1.0)
 
 func _setup_terrain_and_car() -> void:
 	_terrain = Node3D.new()
@@ -750,6 +830,26 @@ func _setup_terrain_and_car() -> void:
 	add_child(_audio)
 	_audio.call("setup", _car)
 	_apply_volume()
+
+## Build the distant-scenery rig once at boot. Independent of the terrain node's
+## identity (unlike _terrain/_car, it's never freed/rebuilt on a map switch — see
+## _apply_map, which just calls configure() again on this same node).
+func _setup_scenery() -> void:
+	_scenery = Node3D.new()
+	_scenery.set_script(HCSceneryScript)
+	add_child(_scenery)
+	_scenery.call("configure", _scenery_config())
+
+## Small config dict for HCScenery, sourced from the active map's MAPS entry: which
+## silhouette style to build (style keys match MAPS keys 1:1) plus the accent color/
+## night flag so the background stays visually tied to the map's own palette choices.
+func _scenery_config() -> Dictionary:
+	var m: Dictionary = MAPS[_map]
+	return {
+		"style": _map,
+		"accent": m.get("accent", Color(0.7, 0.75, 0.7)),
+		"night": bool(m.get("night", false)),
+	}
 
 ## Switch the car's headlights on for the active map's "night" flag, if the car
 ## supports it. Guarded by has_method so this works whether or not the concurrent
@@ -815,6 +915,8 @@ func _apply_map() -> void:
 		if _sky.has_method("_apply"):
 			_sky.call("_apply", MAPS[_map].sky_time)
 		_tune_arcade_environment(_sky)   # night/day env retune — must re-run on every map switch
+	if _scenery:
+		_scenery.call("configure", _scenery_config())   # new silhouette style/palette for this map
 	if _car:
 		_car.call("reset_run", _start)
 	_apply_headlights()
@@ -911,6 +1013,8 @@ func _process(delta: float) -> void:
 	_update_sprint(delta)
 	_update_trial(delta)
 	_update_audio(delta)
+	if _scenery:
+		_scenery.call("update_follow", _car.global_position, delta)
 	# on death, bank money earned from how far down the track you got, open the shop
 	var d: bool = _car.get("dead")
 	if d and not _was_dead:
