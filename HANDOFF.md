@@ -45,6 +45,27 @@ Design pillars (in priority order):
   "loop zone" in HCCar; the branch-candidate machinery is the foundation. Design sketch
   in the 2026-07-04 loop-agent report (session transcript).
 
+## Update (2026-07-05, sixth pass — "HC v7.1-7.3")
+
+- **FULL VERTICAL LOOP shipped** (`loop:S[:R]` stunt token; on Gravity Works at s=2450).
+  The ribbon is an analytic vertical circle with a 13 m corkscrew shift — NOT a
+  heightfield surface; the flat road continues underneath. HCCar rides it via a
+  loop-zone state machine (mount at the mouth, per-wheel radial springs + rail
+  constraint, feed-forward spin) and detaches ballistically below adhesion speed —
+  slow cars stall past ~100° and fall back inside the ring. "LOOP-DE-LOOP! +500" on
+  completion. `tests/LoopProbe.tscn` guards both paths; `tests/LoopScan.tscn` sweeps
+  stunt-string placements against generator collisions (`creep_xing` tripwire — fires
+  7x on canyon past ~6 km, pre-existing, detect-only, future pass).
+- **Upgrade bolt-on visuals REMOVED per owner** (stats stay): engine block, roll cage,
+  wheel widening (tyre width frozen; Bigger Wheels grows radius only). Round-2 body
+  detail on all 5 rides: per-vehicle exhausts, brake rotors/calipers, interiors,
+  antennas, winch/hitch/tow hooks. Shop copy updated.
+- **Distant scenery on all 5 maps** (HCScenery.gd): fog-tinted silhouette rings that
+  re-centre on the car — ridges/mesas/snow peaks/night skyline with window dots/
+  industrial cranes+stacks with beacons. Per-map fog/sun tuning.
+- Known cosmetic: a mid-loop detach can clip ramp meshes on the way down; sub-3 m/s
+  crawlers can nose through the loop mouth (no collision by design, mask 2).
+
 ## Update (2026-07-04, fourth pass — "HC v6")
 
 - **Owner playtested the maps (finally!)**: Sunset Canyon APPROVED — favorite by far,

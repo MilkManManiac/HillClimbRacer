@@ -23,9 +23,11 @@ const CANYON := {
 	"gap_start": 9.9e8, "path_seed": 424242, "noise_seed": 99,
 }
 
-# the Gravity Works map's overrides (must match the HCMain.MAPS snippet in the report)
+# the Gravity Works map's overrides (must match the HCMain.MAPS snippet in the report).
+# loop:2450 lands right after corkscrew 1's exit (~s 2980) — earlier anchors reshuffle
+# this seed into an at-grade self-crossing (see the creep_xing tripwire + LoopProbe).
 const GRAVITY := {
-	"stunts": "overpass:650,corkscrew:1500:2,overpass:2900,corkscrew:3900:1",
+	"stunts": "loop:2450,overpass:650,corkscrew:1500:2,overpass:2900,corkscrew:3900:1",
 	"straight_bias": 0.6, "turn_radius_min": 40.0, "turn_radius_max": 80.0,
 	"road_half": 18.0, "road_half_turn": 26.0,
 	"hill_amp": 5.0, "noise_frequency": 0.0024,
@@ -83,14 +85,21 @@ func _phase_b_static() -> Node3D:
 	var trk := _make_track(GRAVITY)
 	var rep: Dictionary = trk.call("stunt_report")
 	var feats: Array = rep.features
-	print("[stunt] B gravity: placed=%d/%d partner_tiles=%d patches=%d" % [rep.placed, rep.planned, rep.partner_tiles, rep.patches])
-	_check(int(rep.placed) == int(rep.planned) and int(rep.planned) == 4, "all 4 planned stunts placed")
+	print("[stunt] B gravity: placed=%d/%d partner_tiles=%d patches=%d creep_xing=%d" % [rep.placed, rep.planned, rep.partner_tiles, rep.patches, rep.creep_xing])
+	_check(int(rep.placed) == int(rep.planned) and int(rep.planned) == 5, "all 5 planned stunts placed")
 	_check(int(rep.partner_tiles) > 0, "crossing tiles are partner-linked for streaming")
+	_check(int(rep.creep_xing) == 0, "no boxed-in creep ever tunnelled toward distant road")
 	for f in feats:
 		var fd: Dictionary = f
 		print("[stunt]   %s s=[%.0f..%.0f] H=%.1f crossings=%d minclear=%.1fm" % [fd.kind, fd.s0, fd.s1, fd.h, fd.crossings, fd.minclear])
 		_check(int(fd.crossings) > 0, "%s@%.0f actually crosses itself" % [fd.kind, float(fd.s0)])
 		_check(float(fd.minclear) >= 6.0, "%s@%.0f clearance %.1fm >= 6m" % [fd.kind, float(fd.s0), float(fd.minclear)])
+		if bool(fd.get("loop", false)):
+			# the loop ribbon is a ridden FRAME, not a heightfield deck — there is
+			# no under/over hint column to resolve; instead the wrap clearance
+			# (entry vs exit ramp daylight) must hold. LoopProbe drives the ride.
+			_check(float(fd.wrapclear) >= 2.0 * float(fd.lp_half) + 1.0, "loop@%.0f wrap clearance %.1fm" % [float(fd.s0), float(fd.wrapclear)])
+			continue
 		# under/over: at a mid-feature crossing column, a low hint and a high hint
 		# must resolve to two surfaces separated by the promised clearance
 		if int(fd.crossings) > 0:
@@ -169,8 +178,15 @@ func _phase_c_drive(trk: Node3D) -> void:
 	car.global_position = start
 	trk.call("set_target", car)
 	var rep: Dictionary = trk.call("stunt_report")
-	var cork: Dictionary = rep.features[1]   # first corkscrew
-	var target_s: float = float(cork.s1) + 120.0
+	var cork: Dictionary = {}
+	for f in rep.features:
+		if str((f as Dictionary).kind) == "corkscrew":
+			cork = f
+			break
+	# stop short of the loop mouth (~120 m past this corkscrew's exit) — the wrap
+	# ride has its own dedicated probe (LoopProbe) with its own metrics; this
+	# phase gates the SMOOTHNESS of bridge/corkscrew surfaces
+	var target_s: float = float(cork.s1) + 60.0
 	print("[stunt] C driving to s=%.0f (under+over bridge, down corkscrew 1)..." % target_s)
 
 	var acc_sq := 0.0

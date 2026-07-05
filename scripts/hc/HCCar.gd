@@ -104,6 +104,16 @@ var _last_up: Vector3 = Vector3.UP
 var _ter_hint: bool = false     # terrain supports height-hinted (multi-surface) ground queries
 var tunnel_lifts: int = 0       # anti-tunnel floor activations (probes assert 0 mid-drive)
 
+# --- loop-de-loop ride (scripted vertical-circle stunt zones on HCTrack) -------
+# While _loop is non-empty the wheels ride the loop FRAME (loop_state) instead of
+# the heightfield: springs fire against the ribbon, a rail constraint trims the
+# millimetric outward drift the springs can't hold at v²/R, and the attitude glue
+# gets a feed-forward spin so the body tracks the rotating frame without lag.
+# Dropping the dict is the whole dismount — forces stop, velocity carries (C1).
+var _loop: Dictionary = {}      # cached loop frame while riding ({} = normal ground physics)
+var _loop_th := 0.0             # unwrapped wrap angle across the current ride (0 -> TAU)
+var _loop_cd := 0.0             # re-mount cooldown after any dismount (s)
+
 # --- gap / checkpoint state --------------------------------------------------
 signal gap_cleared(idx: int)
 signal gap_failed(can_respawn: bool)
@@ -246,9 +256,23 @@ func _physics_process(delta: float) -> void:
 	# own height to resolve WHICH surface is under it — and to blend overlapping
 	# surfaces continuously instead of snapping (the random-pop bug).
 	_ter_hint = analytic and terrain.has_method("ground_info_y")
+	# --- loop-de-loop stunt zones: mount / track / dismount the circle frame ----
+	# gspin is the frame's own rotation rate (feed-forward for the attitude glue —
+	# without it the glue lags ~50° chasing a normal that turns at v/R rad/s).
+	# _loop_update may also trim the radial velocity, so re-read vel after.
+	var gspin := Vector3.ZERO
+	if _ter_hint and terrain.has_method("loop_state"):
+		gspin = _loop_update(delta, was_grounded, up)
+		vel = linear_velocity
 	for i in range(_rays.size()):
 		var d := -1.0   # contact distance from the wheel-ray origin (-1 = in the air)
-		if analytic:
+		if not _loop.is_empty():
+			var c := _suspend_loop(i, up, vel)
+			if not c.is_empty():
+				_grounded = true
+				gnormal += c.n
+				d = c.d
+		elif analytic:
 			var c := _suspend_analytic(i, up, vel)
 			if not c.is_empty():
 				_grounded = true
@@ -276,18 +300,26 @@ func _physics_process(delta: float) -> void:
 		var lvl_axis := up.cross(gn)                        # rotate body-up toward ground normal (pitch+roll, no yaw)
 		var yaw_rate: float = angular_velocity.dot(up)
 		var tilt_rate := angular_velocity - up * yaw_rate   # pitch+roll part of the spin
-		apply_torque((lvl_axis * 32.0 - tilt_rate * 9.0) * mass)
-		# hard cap the grounded pitch/roll rate so a hard landing can't spike a tumble
-		var pr: float = clampf(angular_velocity.dot(right), -3.5, 3.5)
-		var rr: float = clampf(angular_velocity.dot(fwd), -3.5, 3.5)
+		# damp toward gspin (the loop frame's own spin; ZERO on plain ground, where
+		# this line is bit-identical to damping toward rest)
+		apply_torque((lvl_axis * 32.0 - (tilt_rate - gspin) * 9.0) * mass)
+		# hard cap the grounded pitch/roll rate so a hard landing can't spike a tumble.
+		# Riding a loop the frame ITSELF rotates at |gspin| = vt/R (4.5+ rad/s at
+		# speed) — capping at 3.5 made the body physically unable to keep up, so it
+		# exited the wrap ~30° nose-down. The cap tracks the frame's rate there;
+		# gspin is ZERO on plain ground, where this stays exactly 3.5.
+		var tilt_cap: float = maxf(3.5, gspin.length() + 1.5)
+		var pr: float = clampf(angular_velocity.dot(right), -tilt_cap, tilt_cap)
+		var rr: float = clampf(angular_velocity.dot(fwd), -tilt_cap, tilt_cap)
 		angular_velocity = up * yaw_rate + right * pr + fwd * rr
 
 	# --- gravity ------------------------------------------------------------
 	apply_central_force(Vector3.DOWN * gravity_force * mass)
 
 	# --- downforce upgrade: press the car into the road at speed so it plants and
-	# corners flatter. Grounded-only so it never kills your jumps.
-	if downforce > 0.0 and _grounded:
+	# corners flatter. Grounded-only so it never kills your jumps. Suspended while
+	# riding a loop — world-down is sideways/inward there and would drag the ride.
+	if downforce > 0.0 and _grounded and _loop.is_empty():
 		apply_central_force(Vector3.DOWN * downforce * speed * mass * 0.12)
 
 	# --- dive (hold Space / LB): drop faster, burns fuel --------------------
@@ -535,8 +567,11 @@ func _physics_process(delta: float) -> void:
 	# tiles build), lift it back onto the surface and kill only DOWNWARD speed. It adds NO
 	# ground-follow velocity, so it never flings the car off rises the way the old clamp did,
 	# and it leaves upward (launch) velocity from the springs intact. Suspended while falling
-	# into a gap — that fall should play out.
-	if terrain and not dead and not _falling_out and _col_box and _col_shape:
+	# into a gap — that fall should play out. Also suspended while riding a loop ribbon:
+	# the ribbon is NOT in the heightfield, so a mount/exit car pitched along the circle
+	# legitimately hangs a corner below the flat road under it — the loop rail owns the
+	# car's position there, and a detach reinstates this floor the same tick.
+	if terrain and not dead and not _falling_out and _loop.is_empty() and _col_box and _col_shape:
 		# PER-CORNER ground comparison. The old check compared every corner against the
 		# ground height at the car's CENTRE — on a crest or a landing downslope the nose
 		# corners legitimately hang below the centre's ground level, so the car randomly
@@ -570,8 +605,10 @@ func _physics_process(delta: float) -> void:
 			reset_physics_interpolation()
 
 	# --- fuel/health bookkeeping -------------------------------------------
-	# crash if you land/roll off the road (past the rails) — road may curve & widen
-	if _grounded and _road_off() > _road_half_here() + 1.5:
+	# crash if you land/roll off the road (past the rails) — road may curve & widen.
+	# Not while riding a loop: the wrap legitimately swings the car's (x,z) up to
+	# ~R+shift off the centre-line; the loop has its own off-the-ribbon dismount.
+	if _grounded and _loop.is_empty() and _road_off() > _road_half_here() + 1.5:
 		health = 0.0
 	fuel = maxf(fuel, 0.0)
 	if terrain and terrain.has_method("progress"):
@@ -588,7 +625,11 @@ func _on_land(vel: Vector3) -> void:
 	# even at high speed, so riding the slope down is free while pancaking onto
 	# flat ground from the same height still hurts.
 	var n := Vector3.UP
-	if terrain and terrain.has_method("ground_info"):
+	if not _loop.is_empty():
+		# a one-tick contact flicker mid-loop must be measured against the RIBBON's
+		# normal — against world-up, a fast wall ride would read as a huge impact
+		n = -(_loop.fwd as Vector3) * sin(_loop_th) + Vector3.UP * cos(_loop_th)
+	elif terrain and terrain.has_method("ground_info"):
 		var gp := global_position
 		var gi: Dictionary = (terrain.call("ground_info_y", gp.x, gp.z, gp.y) if terrain.has_method("ground_info_y")
 				else terrain.call("ground_info", gp.x, gp.z))
@@ -672,6 +713,8 @@ func reset_run(start: Vector3) -> void:
 	_gap_armed = false
 	_falling_out = false
 	tunnel_lifts = 0
+	_loop = {}
+	_loop_cd = 0.0
 	linear_velocity = Vector3.ZERO
 	angular_velocity = Vector3.ZERO
 	global_transform = Transform3D(Basis(), start)
@@ -776,6 +819,8 @@ func respawn_at(z: float) -> void:
 	fuel = maxf(fuel - max_fuel * 0.1, 0.0)   # small penalty for the wipeout
 	_gap_armed = false
 	_falling_out = false
+	_loop = {}
+	_loop_cd = 0.0
 	_air_time = 0.0
 	_flip_accum = 0.0
 	reset_physics_interpolation()
@@ -937,6 +982,117 @@ func _suspend_analytic(idx: int, up: Vector3, vel: Vector3) -> Dictionary:
 	force = clampf(force, -mass * 2.5, suspension_max_force)
 	apply_force(up * force, origin - global_position)
 	return {"d": d, "n": n}
+
+# how much "stickier than gravity" loop tyres are (m/s² of adhesion margin): the
+# ride holds on while v_t²/R >= the outward gravity component minus this — below
+# it, the frame releases and the car falls away ballistically (the fun failure)
+const LOOP_STICK := 2.5
+
+## Loop-de-loop ride state machine. Mounts when the car rolls over a loop's ground
+## tangent (loop_state "mouth") fast enough to matter; while riding, the car is
+## CONSTRAINED to the ribbon radius — springs alone can't supply v²/R of centripetal
+## force at speed, so outward drift is trimmed millimetres per tick and outward
+## radial velocity is absorbed (that trim IS the normal force; it's perpendicular
+## to travel, so it does no work and speed stays honest). Gravity keeps running:
+## it bleeds speed on the climb, pays it back on the drop, and when the adhesion
+## condition fails the ride simply RELEASES — no impulses, velocity carries, free
+## ballistics (C1 in feel at mount, dismount and detach alike).
+## Returns the frame's own spin (feed-forward for the grounded attitude glue).
+func _loop_update(delta: float, was_grounded: bool, up: Vector3) -> Vector3:
+	if _loop.is_empty():
+		_loop_cd = maxf(_loop_cd - delta, 0.0)
+		if dead or _falling_out or not was_grounded or _loop_cd > 0.0:
+			return Vector3.ZERO
+		var st: Dictionary = terrain.call("loop_state", global_position)
+		if not bool(st.get("active", false)) or not bool(st.get("mouth", false)):
+			return Vector3.ZERO
+		# mount gate: aimed at the ribbon, upright, and actually rolling forward
+		if absf(float(st.lat)) > float(st.half) - 0.2 or up.dot(Vector3.UP) < 0.5:
+			return Vector3.ZERO
+		if linear_velocity.dot(st.fwd) < 3.0:
+			return Vector3.ZERO
+		_loop = {"e": st.e, "fwd": st.fwd, "right": st.right,
+				"R": float(st.R), "half": float(st.half), "shift": float(st.shift)}
+		_loop_th = float(st.th)
+	# --- riding: track the unwrapped wrap angle from our actual position --------
+	var f: Vector3 = _loop.fwd
+	var rt: Vector3 = _loop.right
+	var lR: float = _loop.R
+	var c: Vector3 = (_loop.e as Vector3) + Vector3.UP * lR
+	var q := global_position - c
+	var qf := q.dot(f)
+	var th := atan2(qf, -q.y)
+	th += TAU * round((_loop_th - th) / TAU)   # unwrap to the nearest turn of the running angle
+	_loop_th = th
+	var r := sqrt(qf * qf + q.y * q.y)
+	var sh: float = float(_loop.shift) * smoothstep(0.0, 1.0, clampf(th / TAU, 0.0, 1.0))
+	var lat := q.dot(rt) - sh
+	var nin := -f * sin(th) + Vector3.UP * cos(th)   # surface normal, toward the centre
+	var tang := f * cos(th) + Vector3.UP * sin(th)   # travel tangent
+	var vel := linear_velocity
+	var vt := vel.dot(tang)
+	# --- dismounts (all of them are just "stop constraining"; velocity carries) --
+	var done: bool = th >= TAU - 0.05                      # full wrap: exit onto the road
+	var fell: bool = vt * vt / lR < -gravity_force * cos(th) - LOOP_STICK   # too slow up high
+	if done or th <= -0.02 or absf(lat) > float(_loop.half) + 1.2 or fell:
+		if done:
+			score += 500.0
+			trick_text = "LOOP-DE-LOOP!   +500"
+			_trick_timer = 2.4
+		if done or th <= -0.02:
+			# a tangent exit ends the wrap ON the road: the frame-tracking pitch
+			# spin (vt/R, ~4 rad/s at speed) must end with it — carried onto flat
+			# ground it digs the nose in before the attitude glue can catch it
+			# (that fired the anti-tunnel floor). Detaches KEEP their spin: a
+			# falling car should tumble.
+			angular_velocity -= rt * angular_velocity.dot(rt)
+		_loop = {}
+		_loop_cd = 0.6
+		return Vector3.ZERO
+	# --- rail: trim outward drift back onto the ride radius ---------------------
+	var r_max := lR - 0.06
+	if r > r_max:
+		global_position += nin * minf(r - r_max, 0.3)
+	var vout := -vel.dot(nin)
+	if vout > 0.0 and r > r_max - 0.2:
+		linear_velocity = vel + nin * vout   # the frame absorbs outward radial speed
+	# --- groove: track the ribbon's (laterally drifting) centre-line ------------
+	# The wrap's corkscrew shift moves the centre-line sideways at d(sh)/dt =
+	# shift·σ'(th/TAU)·(vt/R)/TAU, whose DERIVATIVE peaks near 6·shift·(vt/R)²/TAU²
+	# — 35..45 m/s² at speed. No bounded lateral force chases that (force groove
+	# versions dismounted the fast car off the ribbon's edge), so the groove is a
+	# VELOCITY rail like the radial constraint: converge the lateral velocity to
+	# the frame's drift (+ a centring term) at up to 0.5 m/s per tick. It's
+	# perpendicular to travel, so it does no work on the ride speed; eased in past
+	# the mouth so mounting off-centre never snaps.
+	var tt := clampf(th / TAU, 0.0, 1.0)
+	var drift: float = float(_loop.shift) * 6.0 * tt * (1.0 - tt) * (vt / lR) / TAU
+	var vlat := linear_velocity.dot(rt)
+	var ease_in: float = smoothstep(0.05, 0.5, th)
+	linear_velocity += rt * (clampf(drift - lat * 3.0 - vlat, -0.5, 0.5) * ease_in)
+	return rt * (vt / lR)   # the frame's spin (about the loop plane's axis)
+
+## Loop-ribbon suspension: the same spring as _suspend_analytic, but the "ground"
+## is the vertical-circle ribbon — the gap is measured along the wheel's own
+## radial line, converted to a body-up distance exactly like the ground plane is.
+func _suspend_loop(idx: int, up: Vector3, vel: Vector3) -> Dictionary:
+	var f: Vector3 = _loop.fwd
+	var lR: float = _loop.R
+	var c: Vector3 = (_loop.e as Vector3) + Vector3.UP * lR
+	var origin := to_global(_wheel_positions[idx])
+	var q := origin - c
+	var qf := q.dot(f)
+	var rw := sqrt(qf * qf + q.y * q.y)
+	var nin := (-f * qf - Vector3.UP * q.y) / maxf(rw, 0.001)   # inward at THIS wheel
+	var d := (lR - rw) / maxf(up.dot(nin), 0.25)
+	if d > suspension_rest + wheel_radius + 0.35:   # beyond the old ray's reach = airborne
+		return {}
+	var compression: float = clamp((suspension_rest - d) / suspension_rest, -0.3, 1.0)
+	var vdot := up.dot(vel)
+	var force: float = (compression * suspension_stiff - vdot * suspension_damp) * mass * 0.25
+	force = clampf(force, -mass * 2.5, suspension_max_force)
+	apply_force(up * force, origin - global_position)
+	return {"d": d, "n": nin}
 
 func _build_collision() -> void:
 	_col_shape = CollisionShape3D.new()

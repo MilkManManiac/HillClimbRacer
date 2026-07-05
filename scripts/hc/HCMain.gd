@@ -92,7 +92,7 @@ const MAPS := {
 		"name": "Gravity Works", "desc": "Overpasses and banked corkscrews — the road crosses OVER itself. Look up.",
 		"mode": "classic", "sky_time": 0.33, "accent": Color(0.95, 0.75, 0.2),
 		"overrides": {
-			"stunts": "overpass:650,corkscrew:1500:2,overpass:2900,corkscrew:3900:1",
+			"stunts": "loop:2450,overpass:650,corkscrew:1500:2,overpass:2900,corkscrew:3900:1",
 			"straight_bias": 0.6, "turn_radius_min": 40.0, "turn_radius_max": 80.0,
 			"road_half": 18.0, "road_half_turn": 26.0,
 			"hill_amp": 5.0, "noise_frequency": 0.0024,
@@ -1073,6 +1073,14 @@ func _update_camera(delta: float) -> void:
 	var want := target - _cam_heading * 12.0 + Vector3(0, 6.0, 0)
 	# gentle "cut the corner": nudge the chase position a small fraction of the aim bias
 	want += _cam_lead * 0.3
+	# loop-de-loop zones: trail-behind hides the car behind the ribbon up top —
+	# swing to a ring-side vantage at hub height; the position lerp below eases
+	# the camera out and back in, and the occlusion ray still protects the view.
+	if _terrain != null and _terrain.has_method("loop_state"):
+		var lst: Dictionary = _terrain.call("loop_state", target)
+		if bool(lst.get("active", false)):
+			want = (lst.e as Vector3) + Vector3.UP * float(lst.R) \
+					+ (lst.right as Vector3) * (float(lst.shift) * 0.5 + 26.0)
 	# don't let terrain block the view of the car: raycast from the car toward the camera
 	# and pull the camera in front of any hill in the way
 	var ss := _car.get_world_3d().direct_space_state

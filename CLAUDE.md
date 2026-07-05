@@ -31,7 +31,10 @@ first so you can checkpoint and diff your own work.
 <console> --headless --path . tests/TrialProbe.tscn     # time-trial: timer/record/ghost/medals
 <console> --headless --path . tests/AudioProbe.tscn     # synth buffers non-silent, non-clipping
 <console> --headless --path . tests/StuntProbe.tscn     # overpass/corkscrew surfaces + canyon pop regression
+<console> --headless --path . tests/LoopProbe.tscn      # vertical loop: fast car inverts, slow car detaches
 ```
+When editing a map's `stunts` string, run `tests/LoopScan.tscn` first — it sweeps
+anchor placements against generator collisions (the `creep_xing` tripwire).
 
 Baseline SmoothProbe numbers (HC v5): `vert_accel rms=2.70` (worst ~26), `pitch_jerk
 rms=0.51` — both dominated by the one-time spawn drop; healthy mid-run windows print

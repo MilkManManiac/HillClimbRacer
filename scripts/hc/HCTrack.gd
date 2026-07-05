@@ -72,6 +72,14 @@ var _gsamp := PackedInt32Array()       # per sample: index into _gaps, or -1
 #                                 approach straight at arc-length ~S
 #   corkscrew:S[:COILS[:RADIUS]]  climb a ramp, then spiral DOWN a banked helix
 #                                 whose coils stack vertically over each other
+#   loop:S[:RADIUS]               full VERTICAL loop-de-loop: a straight ground
+#                                 stretch carrying a vertical-circle ribbon
+#                                 tangent to the road, exiting laterally shifted
+#                                 (corkscrew-style) so the wrap clears its own
+#                                 entry ramp. The ribbon is NOT a heightfield
+#                                 surface — HCCar rides it via loop_state() (an
+#                                 opt-in frame-adherence zone); too slow = detach
+#                                 and fall back to the flat road below.
 # Features are emitted as SCRIPTED path segments (bypassing the random generator,
 # with a fit check against earlier road) and carry ANALYTIC elevation + bank
 # profiles in s — pure C1 smoothstep compositions, never per-sample interpolation,
@@ -81,6 +89,13 @@ var _gsamp := PackedInt32Array()       # per sample: index into _gaps, or -1
 @export var stunts := ""
 @export var stunt_clearance := 9.5     # vertical deck-to-road gap at crossings (m)
 @export var stunt_bank_deg := 13.0     # corkscrew banking (outer edge raised)
+const LOOP_HALF := 4.5                 # loop ribbon half-width (m) — a narrow stunt deck
+const LOOP_GAP := 4.0                  # lateral daylight between the wrap's entry & exit ramps
+var _has_loop := false                 # fast-path gate for loop_state()
+var _creep_xing := 0                   # boxed-in creeps that ran inside branch-gather
+                                       # range of DISTANT road (detect-only tripwire —
+                                       # such a layout has an at-grade self-crossing and
+                                       # must be rejected by moving the stunt plan)
 var _plan: Array = []                  # parsed plan tokens, sorted by s
 var _plan_idx := 0
 var _plan_placed := 0
@@ -212,7 +227,51 @@ func _next_segment(rng: RandomNumberGenerator, x: float, z: float, th: float, i:
 	for o in opts:
 		if not _seg_overlaps(x, z, th, o.kappa, int(o.len), i):
 			return o
-	return {"len": 14, "kappa": 0.0, "widen": 0.0}   # boxed in — creep straight, re-decide next
+	# Boxed in — creep straight, re-decide next boundary (CLASSIC behavior, kept
+	# bit-identical: every legacy map's layout depends on these unchecked creeps).
+	# Detect-only tripwire: a creep whose samples run inside branch-gather range
+	# (55 m) of DISTANT road (index gap > 120) is chain-tunnelling toward an
+	# at-grade crossing that no reconcile/blend can disambiguate — the with-loop
+	# gravity seed produced exactly that (s~1840 crossing s~144 at 1.8 m). The
+	# counter feeds stunt_report so probes and stunt-placement sweeps can REJECT
+	# such a layout and move the stunt instead of shipping a broken road.
+	if _seg_min_clear(x, z, th, 0.0, 14, i - 75, 0) <= 55.0:
+		_creep_xing += 1
+	return {"len": 14, "kappa": 0.0, "widen": 0.0}
+
+## Minimum distance from a simulated segment (+pad lookahead samples) to any
+## earlier sample with index <= i - 45, capped at the overlap clearance (cap
+## returned when nothing is near). Pass a reduced i to widen the exempt gap
+## (the creep gate ignores everything within ~one hairpin of itself). Escape
+## scoring only — never on the generation hot path.
+func _seg_min_clear(x: float, z: float, th: float, kappa: float, seglen: int, i: int, pad := 12) -> float:
+	var cap := 2.0 * (road_half_turn + mesh_verge) + 8.0
+	var best := cap
+	var sx := x; var sz := z; var sth := th
+	for k in range(seglen + pad):
+		sth += kappa
+		sx += sin(sth) * STEP
+		sz += -cos(sth) * STEP
+		best = minf(best, _grid_min_dist(sx, sz, i - 45, cap))
+	return best
+
+## Distance from (x,z) to the nearest sample with index <= max_i, capped at cap.
+func _grid_min_dist(x: float, z: float, max_i: int, cap: float) -> float:
+	var c := _cell(x, z)
+	var r := int(ceil(cap / CELL)) + 1
+	var best2 := cap * cap
+	for dx in range(-r, r + 1):
+		for dz in range(-r, r + 1):
+			var key := Vector2i(c.x + dx, c.y + dz)
+			if not _grid.has(key):
+				continue
+			for j in _grid[key]:
+				if j > max_i:
+					continue
+				var ddx: float = _px[j] - x
+				var ddz: float = _pz[j] - z
+				best2 = minf(best2, ddx * ddx + ddz * ddz)
+	return sqrt(best2)
 
 func _mk_straight(rng: RandomNumberGenerator) -> Dictionary:
 	return {"len": rng.randi_range(24, 70), "kappa": 0.0, "widen": 0.0}
@@ -367,6 +426,18 @@ func _stunt_pieces(st: Dictionary, rng: RandomNumberGenerator) -> Array:
 				{"len": coil_n, "kappa": dir * (STEP / r2), "widen": 0.55},
 				{"len": 60, "kappa": 0.0, "widen": 0.0},
 			]
+		"loop":
+			# straight ground all the way through: a flat approach, a widened stretch
+			# under the vertical-circle ribbon's footprint (±R around the tangent
+			# point — the failed-detach car lands here), and a flat exit runout. The
+			# ribbon itself is registered analytically (_register_feature) and meshed
+			# by its anchor tile; the path/heightfield never leaves the ground.
+			var rl: float = clampf(float(st.get("p1", 11.0)), 8.0, 16.0)
+			return [
+				{"len": 26, "kappa": 0.0, "widen": 0.5},
+				{"len": int(ceil((2.0 * rl + 28.0) / STEP)), "kappa": 0.0, "widen": 1.0},
+				{"len": 40, "kappa": 0.0, "widen": 0.5},
+			]
 	return [{"len": 20, "kappa": 0.0, "widen": 0.0}]   # unknown token: harmless straight
 
 ## Simulate the pieces exactly as the emission loop will step them. Sim sample k
@@ -451,6 +522,32 @@ func _register_feature(st: Dictionary, pieces: Array, sim: Dictionary, s0: float
 			f.b0 = f.d0 + 100.0
 			f.b1 = f.d1 - 60.0
 			f.bslope = -signf(float(pieces[1].kappa)) * tan(deg_to_rad(stunt_bank_deg))
+		"loop":
+			# GROUND elevation profile stays zero (h=0 defaults): the loop only
+			# flattens the hills to lvl via _stunt_w. The vertical circle itself is
+			# an analytic frame anchored at the tangent point: entry at ent (lat 0),
+			# circle in the road's vertical plane, ribbon centre-line drifting
+			# lp_shift metres sideways across the wrap so the exit ramp lands next
+			# to (never inside) the entry ramp. All of it lives in lp_* keys read by
+			# loop_state()/_loop_point(); the heightfield never sees the ribbon.
+			var rl: float = clampf(float(st.get("p1", 11.0)), 8.0, 16.0)
+			var len0m: float = float(len0) * STEP
+			var m := int(round((len0m + rl + 8.0) / STEP)) - 1   # sim index of the tangent point
+			var pxs2: PackedFloat32Array = sim.px
+			var pzs2: PackedFloat32Array = sim.pz
+			m = clampi(m, 1, pxs2.size() - 2)
+			var fv := Vector3(pxs2[m + 1] - pxs2[m], 0.0, pzs2[m + 1] - pzs2[m]).normalized()
+			f.loop = true
+			f.lp_R = rl
+			f.lp_half = LOOP_HALF
+			f.lp_shift = 2.0 * LOOP_HALF + LOOP_GAP   # exit ramp daylight past the entry ramp
+			f.lp_ent = s0 + float(m + 1) * STEP        # arc-length of the tangent point
+			f.lp_e = Vector3(pxs2[m], float(f.lvl), pzs2[m])   # ground there is exactly lvl (w=1)
+			f.lp_f = fv
+			f.lp_r = Vector3(-fv.z, 0.0, fv.x)         # road right (heading frame convention)
+			f.lp_i = int(round(s0 / STEP)) + m + 1     # global path sample at the tangent point
+			f.lp_tile = int(f.lp_i) / TILE_SAMPLES     # tile that builds the ribbon mesh
+			_has_loop = true
 	_features.append(f)
 	_verify_feature(f, sim, s0)
 
@@ -458,6 +555,9 @@ func _register_feature(st: Dictionary, pieces: Array, sim: Dictionary, s0: float
 ## tile pairs that overlap in (x,z) so streaming keeps a bridge deck alive while
 ## the car drives the road underneath it (and vice versa).
 func _verify_feature(f: Dictionary, sim: Dictionary, s0: float) -> void:
+	if bool(f.get("loop", false)):
+		_verify_loop(f)
+		return
 	var pxs: PackedFloat32Array = sim.px
 	var pzs: PackedFloat32Array = sim.pz
 	var i0 := int(round(s0 / STEP))
@@ -492,6 +592,92 @@ func _link_tiles(ia: int, ib: int) -> void:
 		_tile_partners[tb] = {}
 	_tile_partners[ta][tb] = true
 	_tile_partners[tb][ta] = true
+
+# --- loop-de-loop analytic frame -------------------------------------------------
+
+## Ribbon centre-line point of loop feature f at wrap angle th (0 = ground tangent,
+## PI = inverted apex, TAU = shifted exit tangent), lateral offset lat off-centre.
+## The lateral drift is smoothstep(th/TAU) — zero SLOPE at both tangents, so the
+## ribbon leaves and rejoins the road pointing dead ahead (C1 in every component).
+func _loop_point(f: Dictionary, th: float, lat: float) -> Vector3:
+	var e: Vector3 = f.lp_e
+	var fv: Vector3 = f.lp_f
+	var rv: Vector3 = f.lp_r
+	var rl: float = f.lp_R
+	var sh: float = float(f.lp_shift) * smoothstep(0.0, 1.0, clampf(th / TAU, 0.0, 1.0))
+	return e + fv * (rl * sin(th)) + Vector3.UP * (rl * (1.0 - cos(th))) + rv * (sh + lat)
+
+## Build-time numeric verification of the loop ribbon (the corkscrew's discipline):
+##  · wrap clearance — the entry and exit ramps share the same forward positions
+##    near the ground, so centre-line points far apart ALONG the ribbon must stay
+##    at least a full deck width apart in 3-D (the lateral shift is what buys it);
+##  · over-road clearance — everywhere the ribbon hangs over the flat road below
+##    (past its own merge ramps), record the drive-under headroom;
+##  · partner-link the anchor tile with every tile under the footprint so the
+##    ribbon streams with the ground it shadows.
+func _verify_loop(f: Dictionary) -> void:
+	var steps := 128
+	var rl: float = f.lp_R
+	var pts: Array[Vector3] = []
+	for k in range(steps + 1):
+		pts.append(_loop_point(f, TAU * float(k) / float(steps), 0.0))
+	var wrap := INF
+	for a in range(steps + 1):
+		for b in range(a + 1, steps + 1):
+			if b - a < steps / 4:
+				continue   # under a quarter-wrap apart the circle's own chord governs
+				           # (2R·sin(sep/2) >= R√2 — never a clash); the risk pairs are
+				           # entry vs exit ramp, nearly a full wrap apart
+			wrap = minf(wrap, pts[a].distance_to(pts[b]))
+	var need := 2.0 * float(f.lp_half) + 1.0
+	f.wrapclear = wrap
+	if wrap < need:
+		push_warning("HCTrack: loop wrap clearance %.1fm < %.1fm" % [wrap, need])
+	var mc := INF
+	var cross := 0
+	for k in range(steps + 1):
+		var hh: float = pts[k].y - float(f.lvl)
+		if hh >= 6.0:   # past the merge ramps: this is deck hanging over drivable road
+			cross += 1
+			mc = minf(mc, hh)
+	f.crossings = cross
+	f.minclear = mc
+	var span := int(ceil(rl / STEP)) + 3
+	for j in range(int(f.lp_i) - span, int(f.lp_i) + span + 1):
+		_link_tiles(int(f.lp_i), j)
+
+## Loop-ride query for HCCar (duck-typed): is pos inside a loop stunt's zone, and
+## where on the wrap is it? th is the RAW angle (-PI..PI] — the car unwraps it
+## against its own running angle, so entry (th~0) vs exit (th~TAU) is the CAR's
+## state, not a property of space. "mouth" flags the mount window: just past the
+## ground tangency, at the ribbon's radius, where ribbon and road agree to a few
+## centimetres — mounting there is seamless by construction.
+func loop_state(pos: Vector3) -> Dictionary:
+	if not _has_loop:
+		return {"active": false}
+	for f in _features:
+		if not bool(f.get("loop", false)):
+			continue
+		var rl: float = f.lp_R
+		var e: Vector3 = f.lp_e
+		var q: Vector3 = pos - e - Vector3.UP * rl   # relative to the circle centre
+		var qf: float = q.dot(f.lp_f)
+		var ql: float = q.dot(f.lp_r)
+		var shf: float = float(f.lp_shift)
+		if absf(qf) > rl + 9.0 or q.y > rl + 7.0 or q.y < -rl - 9.0:
+			continue
+		if ql < minf(0.0, shf) - float(f.lp_half) - 9.0 or ql > maxf(0.0, shf) + float(f.lp_half) + 9.0:
+			continue
+		var th := atan2(qf, -q.y)
+		var r := sqrt(qf * qf + q.y * q.y)
+		var sh: float = shf * smoothstep(0.0, 1.0, clampf(th / TAU, 0.0, 1.0))
+		return {
+			"active": true, "th": th, "r": r, "lat": ql - sh,
+			"R": rl, "half": float(f.lp_half), "shift": shf,
+			"e": e, "fwd": f.lp_f, "right": f.lp_r,
+			"mouth": th > -0.02 and th < 0.5 and absf(r - rl) < 0.9,
+		}
+	return {"active": false}
 
 # --- stunt analytic profiles (pure functions of s — nothing sampled/interpolated) --
 
@@ -681,6 +867,7 @@ func stunt_report() -> Dictionary:
 		"patches": _ovl.size(),
 		"overlap_residual": _ovl_resid,
 		"partner_tiles": _tile_partners.size(),
+		"creep_xing": _creep_xing,
 	}
 
 ## Debug/probe: world centre-line point at arc-length s (top of the drivable deck).
@@ -1437,6 +1624,11 @@ func _build_tile(t: int) -> void:
 	_scatter_tile(t, rows, container)
 	# chevron turn-warning boards — purely visual, outside edge of bends only
 	_build_chevrons(t, container)
+	# loop-de-loop ribbon: the anchor tile owns the whole circle (deck + underside +
+	# curbs + camera-ray collision quads appended into this tile's trimesh)
+	for f in _features:
+		if bool(f.get("loop", false)) and int(f.lp_tile) == t:
+			container.add_child(_build_loop_ribbon(f, col))
 	# collision
 	var body := StaticBody3D.new()
 	var cs := CollisionShape3D.new()
@@ -1450,6 +1642,68 @@ func _build_tile(t: int) -> void:
 
 func _height_lat(d: float, lat: float, rh: float) -> float:
 	return _carved_height(d, lat, rh)
+
+# lateral cross-section fractions for the loop ribbon (narrower than the road)
+const LOOP_FR := [-1.0, -0.86, -0.45, 0.0, 0.45, 0.86, 1.0]
+
+## The loop-de-loop's visible ribbon: a vertical-circle deck (asphalt top with
+## painted edges and hazard-striped mouths), an underside slab 0.55 m outward, side
+## skirts, and glowing curb lips along both edges so the ribbon reads at speed.
+## Top-surface quads also go into `col` — the tile's camera-occlusion trimesh (the
+## car never collides with tiles; it rides the analytic frame via loop_state).
+## Double-sided rail material so winding/normals never matter on a surface that is
+## seen from every direction including upside-down.
+func _build_loop_ribbon(f: Dictionary, col: SurfaceTool) -> MeshInstance3D:
+	_mats()
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var rows := 110
+	var half: float = f.lp_half
+	var fv: Vector3 = f.lp_f
+	var curb := Color(rail_band_color.r, rail_band_color.g, rail_band_color.b)
+	var under := Color(0.30, 0.29, 0.28)
+	var prev: Array = []
+	var prev_out := Vector3.ZERO
+	var prev_haz := Color.WHITE
+	for k in range(rows + 1):
+		var th := TAU * float(k) / float(rows)
+		var n_out := fv * sin(th) - Vector3.UP * cos(th)   # away from the circle centre
+		var lift := -n_out * 0.04   # float the ribbon a hair off the road at the tangents
+		var pts: Array = []
+		for fr in LOOP_FR:
+			pts.append(_loop_point(f, th, float(fr) * half) + lift)
+		# mouth zones get hazard stripes; the rest is asphalt with painted edges
+		var mouth: bool = th < 0.55 or th > TAU - 0.55
+		var vh := _noise.get_noise_1d(th * 40.0)
+		var haz: Color = (Color(0.92, 0.78, 0.12) if (k / 3) % 2 == 0 else Color(0.1, 0.1, 0.11)) if mouth else _varied_asphalt(vh)
+		if not prev.is_empty():
+			for c2 in range(LOOP_FR.size() - 1):
+				var edge_a: bool = absf(float(LOOP_FR[c2])) >= 0.86 and absf(float(LOOP_FR[c2 + 1])) >= 0.86
+				var top_col: Color = edge_line_color if (edge_a and not mouth) else haz
+				var top_col_p: Color = edge_line_color if (edge_a and not mouth) else prev_haz
+				# deck top
+				_quad(st, prev[c2], prev[c2 + 1], pts[c2], pts[c2 + 1], top_col_p, top_col_p, top_col, top_col)
+				# camera-ray collision follows the top surface
+				_quad(col, prev[c2], prev[c2 + 1], pts[c2], pts[c2 + 1], Color.WHITE, Color.WHITE, Color.WHITE, Color.WHITE)
+				# underside slab
+				var oa: Vector3 = prev_out * 0.55
+				var ob: Vector3 = n_out * 0.55
+				_quad(st, prev[c2] + oa, prev[c2 + 1] + oa, pts[c2] + ob, pts[c2 + 1] + ob, under, under, under, under)
+			var last := LOOP_FR.size() - 1
+			# side skirts closing top -> underside
+			_quad(st, prev[0], prev[0] + prev_out * 0.55, pts[0], pts[0] + n_out * 0.55, under, under, under, under)
+			_quad(st, prev[last], prev[last] + prev_out * 0.55, pts[last], pts[last] + n_out * 0.55, under, under, under, under)
+			# curb lips: a bright rail rising toward the centre along both edges
+			_quad(st, prev[0], prev[0] - prev_out * 0.45, pts[0], pts[0] - n_out * 0.45, curb, curb, curb, curb)
+			_quad(st, prev[last], prev[last] - prev_out * 0.45, pts[last], pts[last] - n_out * 0.45, curb, curb, curb, curb)
+		prev = pts
+		prev_out = n_out
+		prev_haz = haz
+	st.generate_normals()
+	var mi := MeshInstance3D.new()
+	mi.mesh = st.commit()
+	mi.material_override = _rail_mat   # vertex-coloured, sRGB, double-sided
+	return mi
 
 ## Is distance s inside a jump's void (the hole itself)?
 func _in_void_s(s: float) -> bool:
