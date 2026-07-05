@@ -77,6 +77,18 @@ var drifting: bool = false          # rear traction broken (hard turn / handbrak
 var _grip_break: float = 0.0        # 0 = full grip, 1 = fully sliding; ramps in fast, out slow
 var _drift_yaw_cur: float = 0.0     # smoothed drift yaw (drift_snap controls how fast it chases target)
 const DRIFT_YAW_EXP := 1.9          # >1 = gentle at small steer, ramps up the harder you turn
+# --- airborne landing-zone guidance (fair jumps at any legal speed) ----------------
+# HCTrack now reserves fair, flat road past every gap (see HCTrack._try_gap), but a
+# car that leaves the ramp already sliding sideways can still miss that reserved lane
+# sideways. This is a HARD-CAPPED lateral accel nudge toward the road's own
+# centerline (never world X — the road winds), applied only while airborne and only
+# while genuinely above the drivable width. It is deliberately tiny — over a full
+# ~2.8s worst-case flight it can move the car a few metres at most, nowhere near
+# "autopilot" — and it fades to nothing the moment the player fights it with A/D, or
+# the moment they're clearly bailing off the side on purpose.
+const AIR_GUIDE_MAX := 1.5          # hard cap on the guidance accel (m/s^2)
+const AIR_GUIDE_POS_GAIN := 0.045   # accel per metre of lateral offset
+const AIR_GUIDE_VEL_GAIN := 0.12    # accel per (m/s) of lateral velocity (damping)
 var wing_lift: float = 0.0          # lift from Wings upgrade (air time)
 var _tire_smoke: Array[GPUParticles3D] = []
 var _wind_streaks: GPUParticles3D   # thin speed-line streaks once you're moving fast
@@ -425,8 +437,13 @@ func _physics_process(delta: float) -> void:
 		# --- airborne: full manual 3-axis (no assist) ----------------------
 		var pitch := pitch_in                      # W/left-stick nose down, S nose up
 		var qe := Input.get_action_strength("roll_right") - Input.get_action_strength("roll_left")  # Q/E / right stick
+		# modest high-speed air-steer authority bump: the same torque turns a fast,
+		# heavier-feeling nose less, so give a little more yaw punch at speed to help
+		# correct a trajectory before landing (pitch/roll are untouched — this is
+		# steering authority, not a general air-control buff)
+		var air_yaw_k: float = air_yaw_torque * (1.0 + 0.25 * clampf(speed / maxf(max_speed, 1.0), 0.0, 1.0))
 		apply_torque(right * pitch * air_pitch_torque * mass)   # W/S = pitch
-		apply_torque(up * steer_in * air_yaw_torque * mass)     # A/D = yaw (rotate)
+		apply_torque(up * steer_in * air_yaw_k * mass)          # A/D = yaw (rotate)
 		apply_torque(fwd * qe * air_roll_torque * mass)         # Q/E = roll
 		# arrest rotation quickly once the controls are released
 		var rot_input: float = absf(pitch) + absf(steer_in) + absf(qe)
@@ -439,6 +456,26 @@ func _physics_process(delta: float) -> void:
 		if center_assist > 0.001:
 			var corr: float = clampf(-global_position.x * 0.18, -0.6, 0.6) * center_assist
 			apply_central_force(Vector3((corr - linear_velocity.x * center_assist * 0.22) * mass, 0.0, 0.0))
+		# --- landing-zone guidance: hard-capped lateral nudge toward the road's OWN
+		# centerline (road-relative, via the terrain — the road winds, world X isn't
+		# it). HCTrack now reserves fair straight road past every gap; this catches
+		# the case where a car leaves the ramp already sliding sideways. Faded to zero
+		# by two independent gates so it can never fight the player or "catch" someone
+		# bailing off the track on purpose: (1) on_road_fade collapses once you're
+		# already well outside the drivable width, (2) steer_fade collapses the moment
+		# A/D is actively held.
+		if terrain and terrain.has_method("lateral_vec"):
+			var lv: Dictionary = terrain.call("lateral_vec", global_position)
+			var lat: float = lv.lat
+			var rvec: Vector3 = lv.right
+			var rh: float = _road_half_here()
+			var on_road_fade: float = 1.0 - smoothstep(rh, rh + 8.0, absf(lat))
+			var steer_fade: float = 1.0 - smoothstep(0.08, 0.45, absf(steer_in))
+			var guide: float = on_road_fade * steer_fade
+			if guide > 0.001:
+				var lat_speed: float = vel.dot(rvec)
+				var pull: float = clampf(-lat * AIR_GUIDE_POS_GAIN - lat_speed * AIR_GUIDE_VEL_GAIN, -AIR_GUIDE_MAX, AIR_GUIDE_MAX) * guide
+				apply_central_force(rvec * pull * mass)
 
 	# The car self-levels on its four suspension springs, so it stays upright on its own —
 	# there is NO tip/lean/roll-over mechanic. Cars differ in the corners purely by turn

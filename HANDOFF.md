@@ -45,6 +45,25 @@ Design pillars (in priority order):
   "loop zone" in HCCar; the branch-candidate machinery is the foundation. Design sketch
   in the 2026-07-04 loop-agent report (session transcript).
 
+## Update (2026-07-05, seventh pass — "HC v7.4-7.5")
+
+- **Ghost sharing (multiplayer stage 1)**: export best trial ghost to a checksummed
+  `.hcghost` file, import a friend's as a red RIVAL ghost (name label, races alongside
+  your blue PB simultaneously, persisted). GHOSTS row on the title screen.
+- **Fast-car jump fairness (owner's playtest ask)**: gaps are now scheduled INSIDE path
+  generation — each claims a dead-straight window covering ramp + void + speed-aware
+  landing catch + worst-case-overshoot reserve (~282 m for a capped F1), so the road
+  can never bend away under a max-speed flight. Airborne lateral guidance nudges toward
+  the centerline (hard-capped 1.5 m/s², fades under active steering — imperceptible).
+  Fixed a latent landing-platform bug: unclamped `_ground_from` gradient at void edges
+  faked "grounded" for cars 6 m in the air; land rises now physically capped.
+  JumpProbe: maxed F1 at 95 m/s, 7/7 gaps on-road on hills AND alpine, zero wrecks.
+- **Hills opener softened** (rise 5 / width 15 / grow 8): the new scheduling surfaced
+  the first jump inside a stock tank's range and a stock van couldn't clear 34 m; bot
+  now reaches 804 m (fuel death, hp 95) vs the old 712 m baseline.
+- SmoothProbe fixed (quit condition could be skipped inside gap zones; landings from
+  real jumps now excluded like the launches that cause them) — new baseline 2.78/0.17.
+
 ## Update (2026-07-05, sixth pass — "HC v7.1-7.3")
 
 - **FULL VERTICAL LOOP shipped** (`loop:S[:R]` stunt token; on Gravity Works at s=2450).

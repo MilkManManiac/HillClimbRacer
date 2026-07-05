@@ -51,6 +51,13 @@ const CELL := 24.0           # spatial-hash cell size for projection + overlap t
 ]
 
 # --- jumps (gaps) on the winding road ---------------------------------------
+# Gaps are scheduled DURING path generation now (_try_gap, called from _build_path
+# alongside _try_stunt), not found afterward in whatever straights happened to land —
+# placing a gap RESERVES its own footprint (ramp + void + landing catch + a worst-
+# case-overshoot safety straight) as one dead-straight segment that no later turn
+# decision can ever bend. That's the fix for "you fly over the bend past the
+# landing": the bend can no longer exist inside the window a max-speed launch needs.
+# See _try_gap / _landing_catch_len / _max_jump_flight for the mechanics.
 @export var gap_start := 320.0         # no jumps before this distance-along-road
 @export var gap_spacing := 300.0       # base distance between jumps
 @export var gap_spacing_grow := 90.0   # +distance to each next jump (rarer further out)
@@ -59,11 +66,39 @@ const CELL := 24.0           # spatial-hash cell size for projection + overlap t
 @export var gap_max_width := 130.0
 @export var gap_ramp_len := 24.0       # launch ramp run-up
 @export var gap_ramp_rise := 7.0       # how high the lip kicks
-@export var gap_land_len := 55.0       # landing DOWNSLOPE past the void (long = smooth)
+@export var gap_land_len := 55.0       # landing DOWNSLOPE past the void (long = smooth);
+                                        # floored per-gap by _landing_catch_len (speed-aware)
 @export var gap_land_rise := 8.0       # landing lip height — you touch down and ride it down
 @export var gap_pit := -45.0           # void floor
 var _gaps: Array = []                  # {cs, vw, lvl, idx}
 var _gsamp := PackedInt32Array()       # per sample: index into _gaps, or -1
+
+# --- speed-aware jump safety (fair landings at any legal speed) ---------------
+# A maxed engine can hit a gap at its vehicle's speed_cap (95 m/s for the F1 — see
+# HCMain.VEHICLES) plus a little downhill headroom before HCCar's SOFT speed cap
+# (max_speed * 1.3) reels it back in, while HCCar's ramp-launch code hard-clamps the
+# vertical kick to 24 m/s (`minf(ramp_vy, 24.0)`) for every vehicle. Treat that pair as
+# the worst case, with a floaty vehicle's gravity (17, the slowest fall on the roster)
+# for a generous (over-, not under-, estimate) hang time: the result is the horizontal
+# distance a maxed car can cover between a ramp's lip and touching back down near
+# launch height (_max_jump_flight). Every gap reserves at least that much fair, flat
+# road past its lip — see _try_gap.
+const JUMP_VMAX_H := 100.0        # generous global worst-case horizontal launch speed (m/s)
+const JUMP_VMAX_V := 24.0         # HCCar's hard cap on ramp-launch vertical speed (m/s)
+const JUMP_GRAVITY_MIN := 17.0    # floatiest vehicle's gravity_force (m/s^2)
+const JUMP_RESERVE_MARGIN := 20.0 # extra safety past the ballistic estimate (m)
+# The landing PLATFORM's leading edge (gap_land_rise above table level) is a real
+# discontinuity in the height field — the void returns a flat gap_pit right up to
+# `far`, where the landing curve starts at land_top. A car is only safe there if it's
+# already AT OR ABOVE land_top by the time it arrives — and counter-intuitively, MORE
+# speed means LESS climb: crossing a fixed-width void faster leaves less TIME for the
+# capped 24 m/s vertical launch to lift the car, so a narrow gap taken at speed_cap
+# can slam into the platform's face instead of flying over it. JUMP_LAND_CLEARANCE is
+# the safety margin (chassis-to-wheel offset + suspension travel + buffer) below the
+# worst-case climb estimate that _safe_land_rise clamps land_top's rise to.
+const JUMP_LAND_CLEARANCE := 6.0
+var _gap_next_s := 0.0    # arc-length the NEXT scheduled gap is due at (see _try_gap)
+var _gap_idx := 0         # gaps placed so far this generation
 
 # --- stunts: the road crossing OVER itself (overpasses + banked corkscrews) ----
 # A plan string (set per-map BEFORE add_child, like every other export) of comma-
@@ -158,9 +193,8 @@ const CHEVRON_HEIGHT := 1.1          # board centre height above ground
 
 func _ready() -> void:
 	_parse_stunts()
-	_build_path()
+	_build_path()   # gaps are now scheduled INSIDE _build_path (see _try_gap)
 	_reconcile_overlaps()
-	_build_gaps()
 
 # --- deterministic 2-D path generation with hard no-overlap -------------------
 func _build_path() -> void:
@@ -171,6 +205,11 @@ func _build_path() -> void:
 	_noise.fractal_octaves = 1     # ONE octave = smooth long rolls, no small bumps
 	_noise.frequency = noise_frequency   # long wavelength so hills are gentle sweeps
 	_px.resize(N_MAX); _pz.resize(N_MAX); _ph.resize(N_MAX); _pw.resize(N_MAX)
+	_gsamp.resize(N_MAX)
+	for k in range(N_MAX):
+		_gsamp[k] = -1
+	_gap_next_s = gap_start
+	_gap_idx = 0
 	var rng := RandomNumberGenerator.new()
 	rng.seed = path_seed
 	var x := 0.0
@@ -196,10 +235,12 @@ func _build_path() -> void:
 					th -= TAU * round(th / TAU)
 					_scripted = false
 				seg = _try_stunt(rng, x, z, th, i)
-				if seg.is_empty():
-					seg = _next_segment(rng, x, z, th, i)
-				else:
+				if not seg.is_empty():
 					_scripted = true
+				else:
+					seg = _try_gap(x, z, th, seg_kappa, seg_widen, i)
+					if seg.is_empty():
+						seg = _next_segment(rng, x, z, th, i)
 			seg_left = int(seg.len); seg_kappa = seg.kappa; seg_widen = seg.widen
 		th += seg_kappa
 		x += sin(th) * STEP
@@ -1009,6 +1050,13 @@ func lateral_off(pos: Vector3) -> float:
 func road_half_here(pos: Vector3) -> float:
 	return lerpf(road_half, road_half_turn, _project(pos.x, pos.z).w)
 
+## Signed lateral offset PLUS the road's own right-vector at pos — for callers that
+## need a DIRECTION to correct toward (not just the absolute distance lateral_off
+## gives), e.g. HCCar's airborne landing-zone guidance nudge.
+func lateral_vec(pos: Vector3) -> Dictionary:
+	var p := _project(pos.x, pos.z)
+	return {"lat": p.lat, "right": Vector3(cos(p.h), 0.0, sin(p.h))}
+
 ## Ground height at an arbitrary world (x,z) — rolling hills + carved jumps.
 ## Continuous everywhere (segment-projected s/lat), so finite-difference
 ## gradients over it are smooth — safe for suspension and ramp launches.
@@ -1110,8 +1158,18 @@ func _ground_from(p: Dictionary) -> Dictionary:
 	var rh: float = lerpf(road_half, road_half_turn, p.w)
 	var h := _carved_height(s, lat, rh)
 	var e := 0.9
-	var dh_ds := (_carved_height(s + e, lat, rh) - _carved_height(s - e, lat, rh)) / (2.0 * e)
-	var dh_dl := (_carved_height(s, lat + e, rh) - _carved_height(s, lat - e, rh)) / (2.0 * e)
+	# Clamped the same way ground_info_y's multi-surface blend already does (that path
+	# never had this bug — only the single-surface path was missing the clamp). A gap's
+	# void/landing edges are DELIBERATE near-vertical cliffs in the height field (a car
+	# is meant to be flying well clear of them, never actually touching down there); an
+	# unclamped finite-difference straddling one spikes to a huge slope, which collapses
+	# the normal's n.y toward zero. HCCar._suspend_analytic's compression distance
+	# divides by (roughly) n.y, so a tiny n.y makes a car several METRES clear of the
+	# ground read as merely grazing it — a maxed-speed launch over a narrow void (fast
+	# = LESS time to climb, see HCTrack._safe_land_rise) lands squarely in that few-
+	# metre band and takes catastrophic "landing" damage while still plainly airborne.
+	var dh_ds := clampf((_carved_height(s + e, lat, rh) - _carved_height(s - e, lat, rh)) / (2.0 * e), -4.0, 4.0)
+	var dh_dl := clampf((_carved_height(s, lat + e, rh) - _carved_height(s, lat - e, rh)) / (2.0 * e), -4.0, 4.0)
 	var hd: float = p.h                             # continuous heading (no 4 m steps)
 	var fx := sin(hd); var fz := -cos(hd)           # world forward
 	var rx := cos(hd); var rz := sin(hd)            # world right
@@ -1302,47 +1360,79 @@ func _gap_profile(g: Dictionary, s: float) -> float:
 		# HCCar measuring landing damage against the surface NORMAL, which is what makes
 		# "ride the downslope" free at any speed.
 		var t2: float = clampf((s - far) / ll, 0.0, 1.0)
-		var land_top: float = lvl + gap_land_rise
+		var land_top: float = lvl + float(g.get("lr", gap_land_rise))   # speed-safe rise (_safe_land_rise)
 		var f: float = 1.0 - pow(1.0 - t2, 2.6)
 		return lerpf(land_top, _base_hill(land1, 0.0, road_half), f)
 
 # --- jump scheduling ---------------------------------------------------------
-## Place jumps on STRAIGHT stretches (progressive spacing), marking the samples they
-## cover so height/collision/gap-state can find them fast.
-func _build_gaps() -> void:
-	_gsamp.resize(_n)
-	for i in range(_n):
-		_gsamp[i] = -1
-	var idx := 0
-	var s := gap_start
-	var limit := float(N_MAX) * STEP - gap_land_len - 60.0
-	while s < limit and idx < 400:
-		var vw := minf(gap_base_width + float(idx) * gap_grow, gap_max_width)
-		var ll := gap_land_len + vw * 0.5   # wider void = faster jump = longer landing catch
-		var span := gap_ramp_len + vw + ll + 24.0
-		# never carve a jump inside (or hugging) a stunt feature — the gap's void and
-		# the stunt's flattened-deck profile would fight over the same ground
-		if _is_straight(s - span * 0.5, s + span * 0.5) and not _in_stunt_span(s, span * 0.5 + 60.0):
-			_gaps.append({"cs": s, "vw": vw, "ll": ll, "lvl": _base_hill(s, 0.0, road_half), "idx": idx})
-			var i0 := clampi(int((s - vw * 0.5 - gap_ramp_len) / STEP), 0, _n - 1)
-			var i1 := clampi(int((s + vw * 0.5 + ll) / STEP), 0, _n - 1)
-			for i in range(i0, i1 + 1):
-				_gsamp[i] = idx
-			idx += 1
-			s += gap_spacing + float(idx) * gap_spacing_grow
-		else:
-			s += 60.0   # turn here; nudge forward and look again
+## Worst-case horizontal distance a maxed vehicle can cover between a ramp's launch
+## lip and touching back down near launch height (see the const block above the gap
+## exports) — a generous ballistic estimate (2*Vy/g hang time × Vx), not exact
+## per-vehicle physics; that's the point, it has to cover EVERY vehicle.
+func _max_jump_flight() -> float:
+	return JUMP_VMAX_H * (2.0 * JUMP_VMAX_V / JUMP_GRAVITY_MIN)
 
-## Is the road dead-straight across [s0,s1] (no turn), so a jump is fair?
-func _is_straight(s0: float, s1: float) -> bool:
-	var i0 := clampi(int(s0 / STEP), 0, _n - 1)
-	var i1 := clampi(int(s1 / STEP), 0, _n - 1)
-	if absf(_ph[i1] - _ph[i0]) > deg_to_rad(7.0):
-		return false
-	for i in range(i0, i1 + 1):
-		if _pw[i] > 0.12:
-			return false   # inside a turn's widened zone
-	return true
+## Landing-catch length for a void of width `vw`. The old wider-gap-grows-the-landing
+## rule is kept (a wider void implies a faster, later-game jump) — NEW is the floor at
+## a healthy fraction of the worst-case ballistic flight, so even the very first,
+## narrowest gap gives a maxed-out car's worst-case launch a real downslope to settle
+## onto, instead of skipping clean past a short landing onto the plain reserved
+## straight beyond it.
+func _landing_catch_len(vw: float) -> float:
+	return maxf(gap_land_len + vw * 0.5, _max_jump_flight() * 0.4)
+
+## Safe per-gap landing-PLATFORM rise for a void of width `vw`: land_top (lvl + this)
+## must sit no higher than a worst-case-speed car is guaranteed to have climbed to by
+## the time it reaches the void's far edge, or it slams into the platform's leading
+## face (see the const block above). Ballistic estimate: time to cross the void at
+## the worst-case horizontal speed, times the capped vertical launch speed, minus the
+## usual quadratic sag and a flat safety clearance. Only ever REDUCES gap_land_rise
+## (clampf's upper bound), never raises it — narrow early gaps get capped, wide late
+## gaps (which give the climb far more time) keep the full tuned rise unchanged.
+func _safe_land_rise(vw: float) -> float:
+	var t_cross: float = vw / JUMP_VMAX_H
+	var climb: float = JUMP_VMAX_V * t_cross - 0.5 * JUMP_GRAVITY_MIN * t_cross * t_cross
+	return clampf(gap_ramp_rise + climb - JUMP_LAND_CLEARANCE, 0.0, gap_land_rise)
+
+## At a segment boundary: if the next scheduled gap is due AND the segment that just
+## finished was a plain straight (a fair, aligned run-up), reserve the gap's ENTIRE
+## footprint — ramp, void, the speed-aware landing catch, and a worst-case-overshoot
+## safety straight beyond it — as ONE dead-straight segment emitted right now.
+## Claiming the frontier here (exactly like _try_stunt) is what makes the reservation
+## real: no LATER turn decision can ever bend the road inside a window a max-speed
+## launch needs — the actual fix for "you fly over the bend past the landing." Falls
+## through (returns {}, no state change, no RNG use) whenever a gap isn't due yet —
+## canyon (gap_start far past the whole track) takes this branch on every boundary and
+## stays bit-identical to before this feature existed.
+func _try_gap(x: float, z: float, th: float, prev_kappa: float, prev_widen: float, i: int) -> Dictionary:
+	if _gap_idx >= 400:
+		return {}
+	var s0 := float(i) * STEP
+	if s0 < _gap_next_s:
+		return {}
+	if prev_kappa != 0.0 or prev_widen > 0.12:
+		return {}   # mid-turn (or its widen hasn't eased out yet) — wait for a real straight
+	var vw: float = minf(gap_base_width + float(_gap_idx) * gap_grow, gap_max_width)
+	var ll: float = _landing_catch_len(vw)
+	var lr: float = _safe_land_rise(vw)
+	var lip := s0 + gap_ramp_len
+	var cs := lip + vw * 0.5
+	var far := lip + vw
+	var land1 := far + ll
+	var reserve_end := maxf(land1, s0 + _max_jump_flight() + JUMP_RESERVE_MARGIN)
+	var total_samp := maxi(int(round((reserve_end - s0) / STEP)), 1)
+	if i + total_samp > N_MAX - 150:
+		return {}   # too close to the track end — stop scheduling jumps
+	if _seg_overlaps(x, z, th, 0.0, total_samp, i):
+		_gap_next_s = s0 + 60.0   # boxed in by earlier road — try again a bit further on
+		return {}
+	_gaps.append({"cs": cs, "vw": vw, "ll": ll, "lr": lr, "lvl": _base_hill(cs, 0.0, road_half), "idx": _gap_idx})
+	var i1 := clampi(int(round(land1 / STEP)), 0, N_MAX - 1)
+	for k in range(i, i1 + 1):
+		_gsamp[k] = _gap_idx
+	_gap_idx += 1
+	_gap_next_s = cs + gap_spacing + float(_gap_idx) * gap_spacing_grow
+	return {"len": total_samp, "kappa": 0.0, "widen": 0.0}
 
 ## Jump state at a world position, for the car's _check_gap (mirrors the z-terrain).
 func gap_state(pos: Vector3) -> Dictionary:

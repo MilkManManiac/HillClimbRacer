@@ -19,6 +19,8 @@ var _air_ticks := 0
 var _win_jerk0 := 0.0
 var _win_acc0 := 0.0
 var _win_n0 := 0
+var _air_episode := 0      # consecutive airborne ticks in the current air episode
+var _settle_left := 0      # grounded ticks still excluded after a real-jump touchdown
 
 func _ready() -> void:
 	# the title screen pauses the whole tree at boot — dismiss it or nothing ticks
@@ -54,7 +56,19 @@ func _physics_process(delta: float) -> void:
 			return
 		if bool(_car.get("airborne")):
 			_air_ticks += 1
+			_air_episode += 1
 		else:
+			# landing transient from a REAL jump (not a pebble hop) is intentional
+			# impact, same as the launch that caused it — exclude a short settle
+			# window after touchdown so the metric keeps measuring ROAD roughness
+			if _air_episode >= 15:
+				_settle_left = 30
+			_air_episode = 0
+			if _settle_left > 0:
+				_settle_left -= 1
+				_prev_vy = vy
+				_prev_pitch_rate = pitch_rate
+				return
 			var acc := absf(vy - _prev_vy) / delta
 			var jerk := absf(pitch_rate - _prev_pitch_rate) / delta
 			_acc_sq += acc * acc
@@ -71,7 +85,7 @@ func _physics_process(delta: float) -> void:
 			_win_jerk0 = _jerk_sq
 			_win_acc0 = _acc_sq
 			_win_n0 = _samples
-	if _f == 2400 or (_f > 240 and bool(_car.get("dead"))):
+	if _f >= 2400 or (_f > 240 and bool(_car.get("dead"))):
 		var n := maxi(_samples, 1)
 		print("[smooth] dist=%.0fm grounded_ticks=%d air_ticks=%d" % [float(_car.get("distance")), _samples, _air_ticks])
 		print("[smooth] vert_accel  rms=%.2f m/s^2   worst=%.2f m/s^2" % [sqrt(_acc_sq / n), _worst_acc])

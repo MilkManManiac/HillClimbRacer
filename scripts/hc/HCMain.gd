@@ -29,7 +29,10 @@ var _start := Vector3(0, 6, 0)
 const MAPS := {
 	"hills": {
 		"name": "Rolling Hills", "desc": "The classic ride — gentle sweepers, occasional jumps.",
-		"mode": "classic", "sky_time": 0.37, "accent": Color(0.55, 0.78, 0.35), "overrides": {},
+		"mode": "classic", "sky_time": 0.37, "accent": Color(0.55, 0.78, 0.35),
+		# starter map: gap-in-generation scheduling (v7.5) surfaced the first jump
+		# within a stock tank's range — soften it so a zero-upgrade van can clear it
+		"overrides": {"gap_ramp_rise": 5.0, "gap_base_width": 15.0, "gap_grow": 8.0},
 	},
 	"canyon": {
 		"name": "Sunset Canyon", "desc": "All-drifting speedrun through red sandstone — no jumps, beat the clock.",
