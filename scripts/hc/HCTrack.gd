@@ -65,6 +65,32 @@ const CELL := 24.0           # spatial-hash cell size for projection + overlap t
 var _gaps: Array = []                  # {cs, vw, lvl, idx}
 var _gsamp := PackedInt32Array()       # per sample: index into _gaps, or -1
 
+# --- stunts: the road crossing OVER itself (overpasses + banked corkscrews) ----
+# A plan string (set per-map BEFORE add_child, like every other export) of comma-
+# separated tokens:
+#   overpass:S[:RADIUS]           teardrop loop-back that bridges OVER its own
+#                                 approach straight at arc-length ~S
+#   corkscrew:S[:COILS[:RADIUS]]  climb a ramp, then spiral DOWN a banked helix
+#                                 whose coils stack vertically over each other
+# Features are emitted as SCRIPTED path segments (bypassing the random generator,
+# with a fit check against earlier road) and carry ANALYTIC elevation + bank
+# profiles in s — pure C1 smoothstep compositions, never per-sample interpolation,
+# so the no-staircase invariant holds. Where two stretches of road overlap in
+# (x,z), ground queries blend the candidate surfaces continuously (_surface_blend)
+# instead of snapping between them.
+@export var stunts := ""
+@export var stunt_clearance := 9.5     # vertical deck-to-road gap at crossings (m)
+@export var stunt_bank_deg := 13.0     # corkscrew banking (outer edge raised)
+var _plan: Array = []                  # parsed plan tokens, sorted by s
+var _plan_idx := 0
+var _plan_placed := 0
+var _script: Array = []                # queued scripted pieces mid-feature
+var _scripted := false                 # emitting a feature (unwind heading after)
+var _features: Array = []              # placed features (analytic elev/bank profiles)
+var _ovl: Array = []                   # overlap height-reconcile patches {sc,w,a,b}
+var _ovl_resid := 0.0                  # worst height mismatch left after patching
+var _tile_partners := {}               # tile -> {tile: true} spatially-linked tiles
+
 # --- collectible pickups (coins + fuel), streamed by arc-length ahead of the car -
 # Deterministic slots along the road, streamed in a window and freed behind. They are
 # RESPAWNABLE: collecting one only removes it for the current run; reset_pickups()
@@ -116,7 +142,9 @@ const CHEVRON_OFFSET := 2.5          # metres past the road edge (outside of the
 const CHEVRON_HEIGHT := 1.1          # board centre height above ground
 
 func _ready() -> void:
+	_parse_stunts()
 	_build_path()
+	_reconcile_overlaps()
 	_build_gaps()
 
 # --- deterministic 2-D path generation with hard no-overlap -------------------
@@ -140,7 +168,23 @@ func _build_path() -> void:
 		_px[i] = x; _pz[i] = z; _ph[i] = th; _pw[i] = seg_widen
 		_grid_add(i, x, z)
 		if seg_left <= 0:
-			var seg := _next_segment(rng, x, z, th, i)
+			var seg: Dictionary
+			if not _script.is_empty():
+				seg = _script.pop_front()   # mid-stunt: play the scripted pieces verbatim
+			else:
+				if _scripted:
+					# stunt finished: unwind the accumulated coil angle by an exact
+					# number of full turns (trig-identical) so _pick_dir's keep-
+					# progressing bias doesn't see a huge heading and force every
+					# following turn one way (a 720° corkscrew would otherwise drag
+					# the road into a compensating spiral).
+					th -= TAU * round(th / TAU)
+					_scripted = false
+				seg = _try_stunt(rng, x, z, th, i)
+				if seg.is_empty():
+					seg = _next_segment(rng, x, z, th, i)
+				else:
+					_scripted = true
 			seg_left = int(seg.len); seg_kappa = seg.kappa; seg_widen = seg.widen
 		th += seg_kappa
 		x += sin(th) * STEP
@@ -240,19 +284,442 @@ func _smooth_widen() -> void:
 		out[i] = a / float(hi - lo + 1)
 	_pw = out
 
+# --- stunts: scheduling + scripted geometry ------------------------------------
+
+func _parse_stunts() -> void:
+	_plan.clear()
+	for tok in stunts.split(",", false):
+		var p := tok.strip_edges().split(":")
+		if p.size() < 2:
+			continue
+		var d := {"kind": p[0], "s": maxf(float(p[1]), 400.0), "defer": 0}
+		if p.size() > 2:
+			d["p1"] = float(p[2])
+		if p.size() > 3:
+			d["p2"] = float(p[3])
+		_plan.append(d)
+	_plan.sort_custom(func(a, b): return float(a.s) < float(b.s))
+
+## At a segment boundary: if the next planned stunt is due here and its scripted
+## footprint doesn't hit earlier road, register it and start emitting its pieces.
+## Returns the first piece, or {} to fall through to the random generator. Consumes
+## NO RNG unless a stunt is actually due, so plan-less maps generate bit-identical
+## paths to before this feature existed.
+func _try_stunt(rng: RandomNumberGenerator, x: float, z: float, th: float, i: int) -> Dictionary:
+	if _plan_idx >= _plan.size():
+		return {}
+	var st: Dictionary = _plan[_plan_idx]
+	if float(i) * STEP < float(st.s):
+		return {}
+	var pieces := _stunt_pieces(st, rng)
+	var total := 0
+	for p in pieces:
+		total += int(p.len)
+	if i + total > N_MAX - 150:
+		push_warning("HCTrack: stunt '%s' past track end — dropped" % str(st.kind))
+		_plan_idx += 1
+		return {}
+	var sim := _sim_pieces(x, z, th, pieces)
+	if not _stunt_fits(sim, i):
+		st.s = float(st.s) + 60.0   # boxed in by earlier road — slide the plan forward
+		st.defer = int(st.defer) + 1
+		if st.defer > 80:
+			push_warning("HCTrack: stunt '%s' never found room — dropped" % str(st.kind))
+			_plan_idx += 1
+		return {}
+	_register_feature(st, pieces, sim, float(i) * STEP)
+	_plan_idx += 1
+	_plan_placed += 1
+	_script = pieces.duplicate()
+	return _script.pop_front()
+
+## The scripted piece list ({len (samples), kappa, widen}) for one stunt.
+func _stunt_pieces(st: Dictionary, rng: RandomNumberGenerator) -> Array:
+	var dir: float = 1.0 if rng.randf() < 0.5 else -1.0
+	match str(st.kind):
+		"overpass":
+			# straight approach -> 252° constant-radius teardrop -> straight exit.
+			# The exit leg crosses back over the approach at ~1.38 R before the turn
+			# entry, at ~108° incidence (computed; verified numerically on placement).
+			var r: float = clampf(float(st.get("p1", 46.0)), 30.0, 70.0)
+			var turn_n := int(round(r * deg_to_rad(252.0) / STEP))
+			return [
+				{"len": 35, "kappa": 0.0, "widen": 0.0},
+				{"len": turn_n, "kappa": dir * (STEP / r), "widen": 1.0},
+				{"len": 75, "kappa": 0.0, "widen": 0.0},
+			]
+		"corkscrew":
+			# straight climb ramp -> descending helix of COILS×360°+90° -> level exit.
+			# The +90° puts the exit tangent perpendicular to the entry ramp so the
+			# level exit road diverges instead of running underneath the climb. The
+			# ramp is longer than the climb needs: its top HOLDS flat, because the
+			# first coil pass curls back alongside the ramp corridor and the ramp
+			# must already be at full height there to keep vertical clearance.
+			var coils := clampi(int(float(st.get("p1", 2.0))), 1, 3)
+			# default radius comfortably above the widened half-width so the spiral
+			# keeps an open centre (a hole, not a stacked disc) and reads as a road
+			var r2: float = clampf(float(st.get("p2", 52.0)), 34.0, 70.0)
+			var h: float = _cork_h(coils)
+			var ramp_n := int(round((h * 12.0 + 110.0) / STEP))
+			var coil_n := int(round(r2 * deg_to_rad(float(coils) * 360.0 + 90.0) / STEP))
+			return [
+				{"len": ramp_n, "kappa": 0.0, "widen": 0.35},
+				{"len": coil_n, "kappa": dir * (STEP / r2), "widen": 0.55},
+				{"len": 60, "kappa": 0.0, "widen": 0.0},
+			]
+	return [{"len": 20, "kappa": 0.0, "widen": 0.0}]   # unknown token: harmless straight
+
+## Simulate the pieces exactly as the emission loop will step them. Sim sample k
+## (0-based) becomes path sample i+k+1, i.e. arc-length s0 + (k+1)·STEP.
+func _sim_pieces(x: float, z: float, th: float, pieces: Array) -> Dictionary:
+	var pxs := PackedFloat32Array()
+	var pzs := PackedFloat32Array()
+	var sx := x; var sz := z; var sth := th
+	for p in pieces:
+		for k in range(int(p.len)):
+			sth += float(p.kappa)
+			sx += sin(sth) * STEP
+			sz += -cos(sth) * STEP
+			pxs.append(sx)
+			pzs.append(sz)
+	return {"px": pxs, "pz": pzs}
+
+## Would the scripted footprint hit NON-adjacent earlier road? (Its own intended
+## self-crossing is fine — sim samples aren't in the grid yet, so only pre-stunt
+## road is tested, with the same clearance the random generator enforces.)
+func _stunt_fits(sim: Dictionary, i: int) -> bool:
+	var clear := 2.0 * (road_half_turn + mesh_verge) + 8.0
+	var pxs: PackedFloat32Array = sim.px
+	var pzs: PackedFloat32Array = sim.pz
+	for k in range(pxs.size()):
+		if _grid_near(pxs[k], pzs[k], i - 45, clear):
+			return false
+	return true
+
+## Anchor the feature's analytic elevation/bank profile at s0 and record it.
+## Elevation is H·(smoothstep(u0,u1,s) − smoothstep(d0,d1,s)) — C1 everywhere,
+## zero (with zero slope) at both feature ends. The whole feature also flattens
+## the base hills toward a fixed level (lvl) via _stunt_w, so crossing clearances
+## are exact by construction instead of at the mercy of the noise field.
+func _register_feature(st: Dictionary, pieces: Array, sim: Dictionary, s0: float) -> void:
+	var total := 0
+	for p in pieces:
+		total += int(p.len)
+	var s1 := s0 + float(total) * STEP
+	var f := {
+		"kind": str(st.kind), "s0": s0, "s1": s1,
+		"lvl": _base_hill(s0 + 60.0, 0.0, road_half),
+		"h": 0.0, "u0": s0, "u1": s0, "d0": s1, "d1": s1,
+		"b0": 0.0, "b1": 0.0, "bin": 100.0, "bslope": 0.0,
+		"minclear": INF, "crossings": 0,
+	}
+	var len0 := int(pieces[0].len)
+	match str(st.kind):
+		"overpass":
+			# find where the turn/exit passes back over the approach piece
+			var pxs: PackedFloat32Array = sim.px
+			var pzs: PackedFloat32Array = sim.pz
+			var lim := road_half_turn + road_half + 6.0
+			var lim2 := lim * lim
+			var c0 := INF
+			var c1 := -INF
+			for m in range(len0 + 20, pxs.size()):
+				for a in range(len0):
+					var dx := pxs[m] - pxs[a]
+					var dz := pzs[m] - pzs[a]
+					if dx * dx + dz * dz < lim2:
+						var sm := s0 + float(m + 1) * STEP
+						c0 = minf(c0, sm)
+						c1 = maxf(c1, sm)
+						break
+			if c0 == INF:
+				push_warning("HCTrack: overpass found no self-crossing — flat feature")
+			else:
+				f.h = stunt_clearance
+				f.u0 = s0 + float(len0) * STEP   # climb through the turn...
+				f.u1 = maxf(c0 - 8.0, f.u0 + 80.0)   # ...topping out before the bridge
+				f.d0 = c1 + 8.0
+				f.d1 = f.d0 + 120.0
+		"corkscrew":
+			var coil_n := int(pieces[1].len)
+			f.h = _cork_h(clampi(int(float(st.get("p1", 2.0))), 1, 3))
+			f.u0 = s0 + 4.0
+			f.u1 = s0 + float(len0) * STEP - 110.0   # top out early: flat hold to the coil
+			f.d0 = s0 + float(len0) * STEP
+			f.d1 = f.d0 + float(coil_n) * STEP   # descend across the whole helix...
+			f.lin = true                          # ...at CONSTANT pitch (see _lin_ease)
+			f.b0 = f.d0 + 100.0
+			f.b1 = f.d1 - 60.0
+			f.bslope = -signf(float(pieces[1].kappa)) * tan(deg_to_rad(stunt_bank_deg))
+	_features.append(f)
+	_verify_feature(f, sim, s0)
+
+## Numerically verify the crossing clearances the profile promises, and link the
+## tile pairs that overlap in (x,z) so streaming keeps a bridge deck alive while
+## the car drives the road underneath it (and vice versa).
+func _verify_feature(f: Dictionary, sim: Dictionary, s0: float) -> void:
+	var pxs: PackedFloat32Array = sim.px
+	var pzs: PackedFloat32Array = sim.pz
+	var i0 := int(round(s0 / STEP))
+	var lim := 2.0 * road_half_turn
+	var lim2 := lim * lim
+	var minclear := INF
+	var crossings := 0
+	for m in range(pxs.size()):
+		for a in range(m - 45):
+			var dx := pxs[m] - pxs[a]
+			var dz := pzs[m] - pzs[a]
+			if dx * dx + dz * dz < lim2:
+				var sm := s0 + float(m + 1) * STEP
+				var sa := s0 + float(a + 1) * STEP
+				var dh := absf(_f_elev(f, sm) - _f_elev(f, sa))
+				minclear = minf(minclear, dh)
+				crossings += 1
+				_link_tiles(i0 + m + 1, i0 + a + 1)
+	f.minclear = minclear
+	f.crossings = crossings
+	if crossings > 0 and minclear < 6.0:
+		push_warning("HCTrack: stunt '%s' clearance %.1fm < 6m" % [str(f.kind), minclear])
+
+func _link_tiles(ia: int, ib: int) -> void:
+	var ta := ia / TILE_SAMPLES
+	var tb := ib / TILE_SAMPLES
+	if ta == tb:
+		return
+	if not _tile_partners.has(ta):
+		_tile_partners[ta] = {}
+	if not _tile_partners.has(tb):
+		_tile_partners[tb] = {}
+	_tile_partners[ta][tb] = true
+	_tile_partners[tb][ta] = true
+
+# --- stunt analytic profiles (pure functions of s — nothing sampled/interpolated) --
+
+## Corkscrew total height: one coil needs extra pitch (the single 360° wrap and the
+## ramp pinch both eat into it), taller stacks scale by 10 m per coil.
+func _cork_h(coils: int) -> float:
+	return maxf(12.0, 10.0 * float(coils))
+
+## C1 "linear with eased ends" 0..1 ramp (ease = first/last 10% of the span). The
+## corkscrew DESCENT uses this instead of smoothstep: smoothstep's zero-slope ends
+## would pinch the vertical gap between stacked coils (and against the entry ramp
+## alongside the first coil) well below the clearance floor — constant mid-pitch
+## keeps every wrap-to-wrap gap ~equal.
+func _lin_ease(t: float) -> float:
+	t = clampf(t, 0.0, 1.0)
+	var a := 0.1
+	var norm := 1.0 - a          # integral of the trapezoid velocity profile
+	if t < a:
+		return t * t / (2.0 * a * norm)
+	if t > 1.0 - a:
+		var u := 1.0 - t
+		return 1.0 - u * u / (2.0 * a * norm)
+	return (t - a * 0.5) / norm
+
+## Elevation of feature f at arc-length s (0 at both feature ends, C1 everywhere).
+func _f_elev(f: Dictionary, s: float) -> float:
+	var up := smoothstep(float(f.u0), float(f.u1), s)
+	var down: float
+	if bool(f.get("lin", false)):
+		down = _lin_ease((s - float(f.d0)) / maxf(float(f.d1) - float(f.d0), 1.0))
+	else:
+		down = smoothstep(float(f.d0), float(f.d1), s)
+	return float(f.h) * (up - down)
+
+## Signed bank cross-slope (dh per +lat metre) of feature f at s.
+func _f_bank(f: Dictionary, s: float) -> float:
+	var bs: float = float(f.bslope)
+	if bs == 0.0:
+		return 0.0
+	return bs * (smoothstep(float(f.b0), float(f.b0) + float(f.bin), s) - smoothstep(float(f.b1) - float(f.bin), float(f.b1), s))
+
+## How much the feature owns the ground at s (blends base hills -> flat lvl+profile).
+func _stunt_w(f: Dictionary, s: float) -> float:
+	return smoothstep(float(f.s0), float(f.s0) + 60.0, s) * (1.0 - smoothstep(float(f.s1) - 110.0, float(f.s1), s))
+
+## 0..1 "this is an elevated bridge deck, not ground" factor at s — drives the
+## deck meshing (narrow ribbon, underside slab, no grass/scatter).
+func _deck_at(s: float) -> float:
+	var dk := 0.0
+	for f in _features:
+		if s > float(f.s0) and s < float(f.s1):
+			dk = maxf(dk, smoothstep(2.5, 6.0, _f_elev(f, s)))
+	return dk
+
+## Is s inside any stunt feature's span (+margin)? Gaps must never share ground
+## with a stunt (their carve + the stunt flatten would fight).
+func _in_stunt_span(s: float, margin := 0.0) -> bool:
+	for f in _features:
+		if s > float(f.s0) - margin and s < float(f.s1) + margin:
+			return true
+	return false
+
+# --- overlap height reconciliation ---------------------------------------------
+# THE random-pop fix. The generator's hard no-overlap clearance only applies to
+# NON-adjacent road (index gap > 45); a tight hairpin (radius < the widened
+# half-width, e.g. canyon's R26 vs half 32) legitimately pinches its own two legs
+# — and its apex — into overlapping ribbons at DIFFERENT noise heights. A wheel
+# query drifting wide there used to snap between the legs' surfaces: a
+# discontinuous ground step under one wheel = spring spike = the random hop.
+# Fix in two halves: (1) here, cancel ~most of the height DISAGREEMENT with
+# smooth cosine-windowed patches so overlapping decks nearly agree; (2) at query
+# time, _surface_blend rides overlaps continuously instead of snapping.
+func _reconcile_overlaps() -> void:
+	for _pass in range(2):   # second pass mops up what the windowing under-corrects
+		var mism := PackedFloat32Array(); mism.resize(_n)
+		var cnt := PackedInt32Array(); cnt.resize(_n)
+		var found := false
+		for i in range(_n - 11):
+			# overlaps need real curvature inside the window — skip pure straights
+			if _pw[i] < 0.03 and _pw[mini(i + 24, _n - 1)] < 0.03 and _pw[mini(i + 45, _n - 1)] < 0.03:
+				continue
+			var si := float(i) * STEP
+			if _in_stunt_span(si, 40.0):
+				continue   # stunts manage their own crossings (big, verified clearances)
+			var rh_i := lerpf(road_half, road_half_turn, _pw[i])
+			for j in range(i + 11, mini(i + 46, _n)):
+				var dx := _px[j] - _px[i]
+				var dz := _pz[j] - _pz[i]
+				var lim := rh_i + lerpf(road_half, road_half_turn, _pw[j]) + 10.0
+				if dx * dx + dz * dz >= lim * lim:
+					continue
+				var sj := float(j) * STEP
+				if _in_stunt_span(sj, 40.0):
+					continue
+				var hi := _center_h(i)
+				var hj := _center_h(j)
+				if absf(hi - hj) > 5.5:
+					continue   # a deliberate deck-over-road — leave it alone
+				mism[i] += hj - hi; cnt[i] += 1
+				mism[j] += hi - hj; cnt[j] += 1
+				found = true
+		if not found:
+			break
+		_emit_ovl_patches(mism, cnt)
+	_measure_ovl_residual()   # record the worst remaining disagreement for probes
+
+## Centre-line height at sample i including any patches placed so far.
+func _center_h(i: int) -> float:
+	var s := float(i) * STEP
+	var rh := lerpf(road_half, road_half_turn, _pw[i])
+	return _base_hill(s, 0.0, rh) + _ovl_off(s)
+
+## Cluster the flagged samples and fit one smooth linear-trend cosine patch per
+## cluster (gain 0.7 of the half-gap — intentionally imperfect so overlapping
+## decks land CLOSE but not coplanar, which would z-fight).
+func _emit_ovl_patches(mism: PackedFloat32Array, cnt: PackedInt32Array) -> void:
+	var i := 0
+	while i < _n:
+		if cnt[i] == 0:
+			i += 1
+			continue
+		var a := i
+		var b := i
+		var gap := 0
+		var j := i + 1
+		while j < _n and gap <= 8:
+			if cnt[j] > 0:
+				b = j
+				gap = 0
+			else:
+				gap += 1
+			j += 1
+		# least-squares linear fit of the desired offsets across the cluster
+		var sc := (float(a) + float(b)) * 0.5 * STEP
+		var sum_o := 0.0; var sum_od := 0.0; var sum_dd := 0.0; var m := 0
+		for k in range(a, b + 1):
+			if cnt[k] == 0:
+				continue
+			var o: float = 0.7 * 0.5 * mism[k] / float(cnt[k])   # half each leg, 0.7 gain
+			var dd := float(k) * STEP - sc
+			sum_o += o; sum_od += o * dd; sum_dd += dd * dd; m += 1
+		if m > 0:
+			var pa: float = clampf(sum_o / float(m), -3.0, 3.0)
+			var pb: float = clampf(sum_od / sum_dd, -0.08, 0.08) if sum_dd > 1.0 else 0.0
+			_ovl.append({"sc": sc, "w": (float(b - a) * 0.5) * STEP + 30.0, "a": pa, "b": pb})
+		i = b + 1
+
+## Worst remaining centre-height disagreement across all detected overlaps.
+func _measure_ovl_residual() -> void:
+	_ovl_resid = 0.0
+	if _ovl.is_empty():
+		return
+	for i in range(_n - 11):
+		if _pw[i] < 0.03 and _pw[mini(i + 24, _n - 1)] < 0.03 and _pw[mini(i + 45, _n - 1)] < 0.03:
+			continue
+		if _in_stunt_span(float(i) * STEP, 40.0):
+			continue
+		var rh_i := lerpf(road_half, road_half_turn, _pw[i])
+		for j in range(i + 11, mini(i + 46, _n)):
+			var dx := _px[j] - _px[i]
+			var dz := _pz[j] - _pz[i]
+			var lim := rh_i + lerpf(road_half, road_half_turn, _pw[j]) + 10.0
+			if dx * dx + dz * dz >= lim * lim:
+				continue
+			if _in_stunt_span(float(j) * STEP, 40.0):
+				continue
+			var d := absf(_center_h(i) - _center_h(j))
+			if d <= 5.5:
+				_ovl_resid = maxf(_ovl_resid, d)
+
+## Summed smooth patch offset at arc-length s (analytic: cosine windows, C1).
+func _ovl_off(s: float) -> float:
+	var off := 0.0
+	for p in _ovl:
+		var d: float = s - float(p.sc)
+		var w: float = float(p.w)
+		if absf(d) < w:
+			off += (float(p.a) + float(p.b) * d) * (0.5 + 0.5 * cos(PI * d / w))
+	return off
+
+## Debug/probe: what the stunts plan + overlap pass actually produced.
+func stunt_report() -> Dictionary:
+	return {
+		"features": _features,
+		"placed": _plan_placed,
+		"planned": _plan.size(),
+		"patches": _ovl.size(),
+		"overlap_residual": _ovl_resid,
+		"partner_tiles": _tile_partners.size(),
+	}
+
+## Debug/probe: world centre-line point at arc-length s (top of the drivable deck).
+func point_at_s(s: float) -> Vector3:
+	if _n == 0:
+		return Vector3.ZERO
+	var fi := clampf(s / STEP, 0.0, float(_n - 1))
+	var i := int(fi)
+	var t := fi - float(i)
+	var j := mini(i + 1, _n - 1)
+	var rh := lerpf(road_half, road_half_turn, lerpf(_pw[i], _pw[j], t))
+	return Vector3(lerpf(_px[i], _px[j], t), _carved_height(s, 0.0, rh), lerpf(_pz[i], _pz[j], t))
+
 # --- projection (world pos -> path sample) -----------------------------------
-## Nearest sample to (x,z) searching outward from `hint`. If the car isn't near the
-## hint (e.g. it just RESPAWNED far away), fall back to a global grid search so the
-## projection snaps to wherever the car actually is instead of the stale stretch.
+## Nearest sample to (x,z) searching OUTWARD from `hint` — iteration order matters:
+## where the road passes over/near itself, two samples on different passes can be
+## exactly equidistant (a crossing point), and outward iteration with a strict
+## comparison resolves the tie to the index-closest one (the pass the target is
+## already on) instead of arbitrarily. Unique minima are unaffected. If the target
+## isn't near the hint (e.g. it just RESPAWNED far away), fall back to a global
+## grid search so the projection snaps to wherever it actually is.
 func _nearest_from(x: float, z: float, hint: int) -> int:
-	var best := clampi(hint, 0, _n - 1)
+	var h0 := clampi(hint, 0, _n - 1)
+	var best := h0
 	var bestd := INF
-	var lo := maxi(0, hint - 40); var hi := mini(_n, hint + 40)
-	for j in range(lo, hi):
-		var dx: float = _px[j] - x; var dz: float = _pz[j] - z
-		var d := dx * dx + dz * dz
-		if d < bestd:
-			bestd = d; best = j
+	for off in range(0, 41):
+		var j := h0 + off
+		if j < _n:
+			var dx: float = _px[j] - x; var dz: float = _pz[j] - z
+			var d := dx * dx + dz * dz
+			if d < bestd:
+				bestd = d; best = j
+		if off > 0:
+			j = h0 - off
+			if j >= 0:
+				var dx2: float = _px[j] - x; var dz2: float = _pz[j] - z
+				var d2 := dx2 * dx2 + dz2 * dz2
+				if d2 < bestd:
+					bestd = d2; best = j
 	if bestd > 3600.0:   # >60 m from the local window -> teleport; search globally
 		return _nearest_grid(x, z, best)
 	return best
@@ -358,12 +825,43 @@ func road_half_here(pos: Vector3) -> float:
 ## Ground height at an arbitrary world (x,z) — rolling hills + carved jumps.
 ## Continuous everywhere (segment-projected s/lat), so finite-difference
 ## gradients over it are smooth — safe for suspension and ramp launches.
+## Where several surfaces stack (bridge over road), this hint-less form returns
+## the LOWEST claiming surface — the conservative answer for its callers (the
+## camera floor clamp must never teleport the camera on top of an overpass the
+## car is driving under).
 func height_at(x: float, z: float) -> float:
 	if _n == 0:
 		return 0.0
+	var cands := _branch_samples(x, z)
+	if cands.size() > 1:
+		var best := INF
+		for ci in cands:
+			var pc := _project_at(ci, x, z)
+			var rhc: float = lerpf(road_half, road_half_turn, pc.w)
+			if absf(pc.lat) > rhc + 8.0:
+				continue
+			best = minf(best, _carved_height(pc.s, pc.lat, rhc))
+		if best < INF:
+			return best
 	var p := _project_at(_nearest_grid(x, z), x, z)
 	var rh: float = lerpf(road_half, road_half_turn, p.w)
 	return _carved_height(p.s, p.lat, rh)
+
+## Height of the surface a body AT height y_hint would ride at (x,z) — the same
+## blended field the wheels use, so HCCar's anti-tunnel floor and the springs
+## always agree about where "the ground" is.
+func height_at_y(x: float, z: float, y_hint: float) -> float:
+	if _n == 0:
+		return 0.0
+	var cands := _branch_samples(x, z)
+	if cands.size() <= 1:
+		var i := cands[0] if cands.size() == 1 else _nearest_grid(x, z)
+		var p := _project_at(i, x, z)
+		return _carved_height(p.s, p.lat, lerpf(road_half, road_half_turn, p.w))
+	var b := _surface_blend(cands, x, z, y_hint)
+	if float(b.wsum) <= 0.0:
+		return -1e6   # under every deck with no ground below: free air
+	return b.h
 
 ## World centre-line point `dist` metres further along the road from pos's
 ## projection (dist 0 = the projection itself). Lets the camera read bends early —
@@ -385,12 +883,45 @@ func path_ahead(pos: Vector3, dist: float) -> Vector3:
 func ground_info(x: float, z: float) -> Dictionary:
 	if _n == 0:
 		return {"h": 0.0, "n": Vector3.UP}
-	var p := _project(x, z)
+	return _ground_from(_project(x, z))
+
+## ground_info with the querier's height: where several road surfaces stack at one
+## (x,z) (overpass decks, corkscrew coils, hairpin legs pinching together), the
+## candidates are blended CONTINUOUSLY with y_hint disambiguating which deck is
+## "the ground" (a surface far above the querier is a roof, not a floor). With a
+## single candidate this is exactly ground_info — bit-identical on plain road.
+func ground_info_y(x: float, z: float, y_hint: float) -> Dictionary:
+	if _n == 0:
+		return {"h": 0.0, "n": Vector3.UP}
+	var cands := _branch_samples(x, z)
+	if cands.size() == 1:
+		_proj_i = cands[0]   # keep the stateful hint glued to the ridden branch
+		return _ground_from(_project_at(cands[0], x, z))
+	if cands.is_empty():
+		return _ground_from(_project(x, z))   # off-mesh: classic stateful fallback
+	var b := _surface_blend(cands, x, z, y_hint)
+	if float(b.wsum) <= 0.0:
+		return {"h": -1e6, "n": Vector3.UP}   # under everything: free air
+	var bp: Dictionary = b.p
+	if not bp.is_empty():
+		_proj_i = int(bp.i)
+	# world-frame gradient of the blended field (same candidate set, offset points)
+	var e := 0.9
+	var hx1: float = _surface_blend(cands, x + e, z, y_hint).h
+	var hx0: float = _surface_blend(cands, x - e, z, y_hint).h
+	var hz1: float = _surface_blend(cands, x, z + e, y_hint).h
+	var hz0: float = _surface_blend(cands, x, z - e, y_hint).h
+	var gx := clampf((hx1 - hx0) / (2.0 * e), -4.0, 4.0)
+	var gz := clampf((hz1 - hz0) / (2.0 * e), -4.0, 4.0)
+	return {"h": b.h, "n": Vector3(-gx, 1.0, -gz).normalized()}
+
+## The classic single-surface ground answer from a finished projection: height plus
+## a normal from partial derivatives in the road frame (forward = +s, right = +lat).
+func _ground_from(p: Dictionary) -> Dictionary:
 	var s: float = p.s
 	var lat: float = p.lat
 	var rh: float = lerpf(road_half, road_half_turn, p.w)
 	var h := _carved_height(s, lat, rh)
-	# partial derivatives in the road frame (forward = +s, right = +lat)
 	var e := 0.9
 	var dh_ds := (_carved_height(s + e, lat, rh) - _carved_height(s - e, lat, rh)) / (2.0 * e)
 	var dh_dl := (_carved_height(s, lat + e, rh) - _carved_height(s, lat - e, rh)) / (2.0 * e)
@@ -400,6 +931,128 @@ func ground_info(x: float, z: float) -> Dictionary:
 	var n := Vector3(-(dh_ds * fx + dh_dl * rx), 1.0, -(dh_ds * fz + dh_dl * rz)).normalized()
 	return {"h": h, "n": n}
 
+## Candidate road branches near (x,z): every LOCAL MINIMUM of centre-line distance
+## along the sample-index sequence (runs split at index gaps). One winning sample
+## per branch. A straight has one minimum; a hairpin whose legs pinch together has
+## two; a corkscrew column has one per coil. Plain road far from any self-approach
+## always yields exactly one — the same sample the classic projection picks.
+func _branch_samples(x: float, z: float) -> PackedInt32Array:
+	var out := PackedInt32Array()
+	var c := _cell(x, z)
+	var idxs: Array = []
+	for dx in range(-2, 3):
+		for dz in range(-2, 3):
+			var key := Vector2i(c.x + dx, c.y + dz)
+			if not _grid.has(key):
+				continue
+			for j in _grid[key]:
+				var ddx: float = _px[j] - x
+				var ddz: float = _pz[j] - z
+				if ddx * ddx + ddz * ddz < 2025.0:   # 45 m gather radius
+					idxs.append(j)
+	if idxs.is_empty():
+		return out
+	idxs.sort()
+	# walk runs (split at index gaps > 8) and keep each run's local d2 minima
+	var run: Array = []
+	var prev := -100
+	for j in idxs:
+		if j - prev > 8 and not run.is_empty():
+			out.append_array(_run_minima(run, x, z))
+			run.clear()
+		run.append(j)
+		prev = j
+	if not run.is_empty():
+		out.append_array(_run_minima(run, x, z))
+	return out
+
+## Local minima of centre-distance² along one contiguous index run, merging
+## minima within 8 samples (plateau ties) keeping the closest.
+func _run_minima(run: Array, x: float, z: float) -> PackedInt32Array:
+	var out := PackedInt32Array()
+	var n := run.size()
+	var ds := PackedFloat32Array(); ds.resize(n)
+	for k in range(n):
+		var j: int = run[k]
+		var ddx: float = _px[j] - x
+		var ddz: float = _pz[j] - z
+		ds[k] = ddx * ddx + ddz * ddz
+	var last_j := -1000
+	var last_d := INF
+	for k in range(n):
+		var lo_ok: bool = k == 0 or ds[k] <= ds[k - 1]
+		var hi_ok: bool = k == n - 1 or ds[k] <= ds[k + 1]
+		if lo_ok and hi_ok:
+			var j: int = run[k]
+			if j - last_j <= 8:
+				if ds[k] < last_d:   # plateau/near-tie: keep the closer sample
+					out[out.size() - 1] = j
+					last_j = j
+					last_d = ds[k]
+				continue
+			out.append(j)
+			last_j = j
+			last_d = ds[k]
+	return out
+
+## Blend the candidate surfaces at (x,z) into ONE continuous ground height.
+## Weights per candidate (all continuous in x, z and y_hint, so the blended field
+## can never step under a wheel):
+##  · a lateral claim fade past the branch's drivable edge (+2..+8 m) — driving
+##    off a bridge deck's side becomes "no support", i.e. a real fall;
+##  · a distance taper (35..45 m) so branches entering the gather radius arrive
+##    with zero weight;
+##  · a normalised ASYMMETRIC exponential around y_hint: surfaces below the
+##    querier decay gently (1/1.2 per m — the highest below wins, so overlapping
+##    near-equal decks blend and you ride the one that renders on top), while
+##    surfaces above a 1.5 m dead-band decay HARD (1/0.35 per m — an overpass
+##    roof is not a floor). The above-rate strictly exceeding the below-rate is
+##    what makes runaway impossible: no ceiling can out-score a floor by being
+##    higher, which an absolute softmax-over-height allowed (h_eff crept up,
+##    opening the ceiling's gate further — positive feedback).
+## Returns {"h": blended height, "p": dominant projection, "wsum": total weight}.
+func _surface_blend(cands: PackedInt32Array, x: float, z: float, y_hint: float) -> Dictionary:
+	var hs := PackedFloat32Array()
+	var gs := PackedFloat32Array()   # lat/distance gates
+	var es := PackedFloat32Array()   # log-space y-affinity (normalised before exp)
+	var ps: Array = []
+	var emax := -INF
+	for ci in cands:
+		var p := _project_at(ci, x, z)
+		var rh: float = lerpf(road_half, road_half_turn, p.w)
+		var h := _carved_height(p.s, p.lat, rh)
+		var g := 1.0 - smoothstep(rh + 2.0, rh + 8.0, absf(p.lat))
+		var ddx: float = _px[ci] - x
+		var ddz: float = _pz[ci] - z
+		g *= 1.0 - smoothstep(1225.0, 2025.0, ddx * ddx + ddz * ddz)
+		var e: float
+		if is_nan(y_hint):
+			e = h / 1.2   # no querier height: plain prefer-the-upper-deck softmax
+		else:
+			e = -maxf(0.0, y_hint - h) / 1.2 - maxf(0.0, h - y_hint - 1.5) / 0.35
+		hs.append(h)
+		gs.append(g)
+		es.append(e)
+		ps.append(p)
+		if g > 0.0001:
+			emax = maxf(emax, e)
+	if emax == -INF:
+		return {"h": -1e6, "p": {}, "wsum": 0.0}
+	var num := 0.0
+	var den := 0.0
+	var best_w := -1.0
+	var best_p: Dictionary = {}
+	for k in range(hs.size()):
+		var w: float = gs[k] * exp(clampf(es[k] - emax, -60.0, 0.0))
+		num += w * hs[k]
+		den += w
+		if w > best_w:
+			best_w = w
+			best_p = ps[k]
+	if den <= 0.0:
+		return {"h": -1e6, "p": {}, "wsum": 0.0}
+	return {"h": num / den, "p": best_p, "wsum": den}
+
 ## Base rolling-hill height (no jumps) at distance s, lateral lat.
 func _base_hill(s: float, lat: float, rh: float) -> float:
 	var amp := lerpf(3.0, hill_amp, clampf(s / 450.0, 0.0, 1.0))
@@ -407,16 +1060,29 @@ func _base_hill(s: float, lat: float, rh: float) -> float:
 	var edge := smoothstep(rh, rh + edge_falloff, absf(lat))
 	return prof * lerpf(amp, amp * 0.1, edge)
 
-## Hill height with any jump (ramp -> void -> landing) carved into the road at s.
+## Hill height with any jump (ramp -> void -> landing) carved into the road at s,
+## plus overlap-reconcile patches and any stunt feature's elevation/bank profile.
+## Every added term is an analytic C1 function of s (and linear in lat for bank),
+## so the field stays as smooth as the base noise — no staircases, ever.
 func _carved_height(s: float, lat: float, rh: float) -> float:
 	var base := _base_hill(s, lat, rh)
+	if not _ovl.is_empty():
+		base += _ovl_off(s)
 	var gi := _gap_index_at_s(s)
-	if gi < 0:
-		return base
-	var on_road := 1.0 - smoothstep(rh, rh + edge_falloff, absf(lat))
-	if on_road < 0.01:
-		return base
-	return lerpf(base, _gap_profile(_gaps[gi], s), on_road)
+	if gi >= 0:
+		var on_road := 1.0 - smoothstep(rh, rh + edge_falloff, absf(lat))
+		if on_road >= 0.01:
+			base = lerpf(base, _gap_profile(_gaps[gi], s), on_road)
+	for f in _features:
+		if s <= float(f.s0) or s >= float(f.s1):
+			continue
+		var w := _stunt_w(f, s)
+		if w <= 0.0001:
+			continue
+		# inside a stunt the ground is a FLAT reference level + the feature's own
+		# elevation/bank — hills are blended out so crossing clearances are exact
+		base = lerpf(base, float(f.lvl) + _f_elev(f, s) + _f_bank(f, s) * lat, w)
+	return base
 
 ## Which gap (index into _gaps) covers distance s, or -1.
 func _gap_index_at_s(s: float) -> int:
@@ -467,7 +1133,9 @@ func _build_gaps() -> void:
 		var vw := minf(gap_base_width + float(idx) * gap_grow, gap_max_width)
 		var ll := gap_land_len + vw * 0.5   # wider void = faster jump = longer landing catch
 		var span := gap_ramp_len + vw + ll + 24.0
-		if _is_straight(s - span * 0.5, s + span * 0.5):
+		# never carve a jump inside (or hugging) a stunt feature — the gap's void and
+		# the stunt's flattened-deck profile would fight over the same ground
+		if _is_straight(s - span * 0.5, s + span * 0.5) and not _in_stunt_span(s, span * 0.5 + 60.0):
 			_gaps.append({"cs": s, "vw": vw, "ll": ll, "lvl": _base_hill(s, 0.0, road_half), "idx": idx})
 			var i0 := clampi(int((s - vw * 0.5 - gap_ramp_len) / STEP), 0, _n - 1)
 			var i1 := clampi(int((s + vw * 0.5 + ll) / STEP), 0, _n - 1)
@@ -570,7 +1238,12 @@ func _spawn_pickup_at_s(s: float) -> void:
 		off = float((slot % 3) - 1) * (road_half * 0.4)
 	var right := Vector3(cos(_ph[i]), 0.0, sin(_ph[i]))
 	var base := Vector3(_px[i], 0.0, _pz[i]) + right * off
-	base.y = height_at(base.x, base.z) + 1.4
+	# height for THIS slot's stretch of road: seed with the row's own surface, then
+	# resolve the blended field a car there would ride (a bare height_at could pick
+	# a different deck where the track stacks over itself, burying the pickup)
+	var rh := lerpf(road_half, road_half_turn, _pw[i])
+	var own_h := _carved_height(s, off, rh)
+	base.y = height_at_y(base.x, base.z, own_h + 1.5) + 1.4
 	_add_pickup(kind, value, base, s)
 
 ## A short parabola of coins arced over a gap's void, peaking so a clean jump scoops them.
@@ -609,24 +1282,40 @@ func reset_pickups() -> void:
 func _update_tiles() -> void:
 	if _n == 0:
 		return
+	# read-only use of the hint: the physics-side ground queries own _proj_i (they
+	# know which BRANCH the car rides where the road stacks over itself; a raw
+	# 2-D-nearest write from here could flip it to the other deck at a crossing)
 	var ci := _nearest_from(_target.global_position.x, _target.global_position.z, _proj_i)
-	_proj_i = ci
 	var ct := ci / TILE_SAMPLES
 	var want := {}
 	for t in range(ct - BEHIND_TILES, ct + AHEAD_TILES + 1):
 		if t >= 0 and t * TILE_SAMPLES < _n - 1:
 			want[t] = true
+	# keep spatially-linked tiles alive too: a bridge deck must stay streamed while
+	# the car drives the road underneath it, even when the deck's own arc-length
+	# window has long moved on (and vice versa)
+	if not _tile_partners.is_empty():
+		var extra := {}
+		for t in want:
+			if _tile_partners.has(t):
+				for u in _tile_partners[t]:
+					if u >= 0 and u * TILE_SAMPLES < _n - 1:
+						extra[u] = true
+		for u in extra:
+			want[u] = true
 	# free tiles out of range
 	for t in _tiles.keys():
 		if not want.has(t):
 			_tiles[t].queue_free()
 			_tiles.erase(t)
 	# build up to a few missing tiles per frame (nearest first) to avoid hitches
+	var keys := want.keys()
+	keys.sort_custom(func(a, b): return absi(int(a) - ct) < absi(int(b) - ct))
 	var built := 0
-	for t in range(ct - BEHIND_TILES, ct + AHEAD_TILES + 1):
+	for t in keys:
 		if built >= 3:
 			break
-		if want.has(t) and not _tiles.has(t):
+		if not _tiles.has(t):
 			_build_tile(t)
 			built += 1
 
@@ -678,6 +1367,9 @@ func _build_tile(t: int) -> void:
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var col := SurfaceTool.new()   # collision surface (drivable band only)
 	col.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var und := SurfaceTool.new()   # bridge-deck underside + skirts (decks only)
+	und.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var have_und := false
 	var rows: Array = []       # per sample: Array of Vector3 cross-section points
 	var half_mesh := road_half_turn + mesh_verge
 	for i in range(i0, i1 + 1):
@@ -685,16 +1377,21 @@ func _build_tile(t: int) -> void:
 		var rx := cos(_ph[i]); var rz := sin(_ph[i])
 		var d := float(i) * STEP
 		var rh := lerpf(road_half, road_half_turn, _pw[i])
+		# on an elevated deck the ground ribbon narrows to the road + a shoulder —
+		# a bridge, not a floating slice of hillside (dk eases 0..1 so the taper
+		# is smooth where a deck rises out of the ground)
+		var dk := _deck_at(d)
+		var hm := lerpf(half_mesh, rh + 3.0, dk)
 		var pts: Array = []
 		var cols: Array = []
 		for fr in LAT_FR:
-			var lat: float = float(fr) * half_mesh
+			var lat: float = float(fr) * hm
 			var wx := cx + rx * lat
 			var wz := cz + rz * lat
 			var wy := _height_lat(d, lat, rh)
 			pts.append(Vector3(wx, wy, wz))
 			cols.append(_surface_color(d, lat, rh))
-		rows.append({"p": pts, "c": cols, "rh": rh, "cx": cx, "cz": cz, "rx": rx, "rz": rz, "d": d, "void": _in_void_s(d)})
+		rows.append({"p": pts, "c": cols, "rh": rh, "cx": cx, "cz": cz, "rx": rx, "rz": rz, "d": d, "void": _in_void_s(d), "dk": dk, "hm": hm, "i": i})
 	# stitch rows into the ribbon + collision band
 	for r in range(rows.size() - 1):
 		var a: Dictionary = rows[r]
@@ -703,15 +1400,34 @@ func _build_tile(t: int) -> void:
 		for k in range(LAT_FR.size() - 1):
 			_quad(st, a.p[k], a.p[k + 1], b.p[k], b.p[k + 1], a.c[k], a.c[k + 1], b.c[k], b.c[k + 1])
 			# collision across the drivable band (a bit past the rails so a slide still lands)
-			var midlat: float = (float(LAT_FR[k]) + float(LAT_FR[k + 1])) * 0.5 * half_mesh
+			var midlat: float = (float(LAT_FR[k]) + float(LAT_FR[k + 1])) * 0.5 * minf(float(a.hm), float(b.hm))
 			if not over_void and absf(midlat) <= road_half_turn + 2.0:
 				_quad(col, a.p[k], a.p[k + 1], b.p[k], b.p[k + 1], Color.WHITE, Color.WHITE, Color.WHITE, Color.WHITE)
+		# bridge-deck slab: underside + side skirts so an overpass reads as a solid
+		# deck from below (thickness scales with dk so it tapers out at the ends)
+		if float(a.dk) > 0.02 or float(b.dk) > 0.02:
+			have_und = true
+			var ta := Vector3(0, 0.9 * float(a.dk) + 0.05, 0)
+			var tb := Vector3(0, 0.9 * float(b.dk) + 0.05, 0)
+			var cu := Color(0.30, 0.29, 0.28)
+			var last := LAT_FR.size() - 1
+			for k in range(last):
+				_quad(und, a.p[k] - ta, a.p[k + 1] - ta, b.p[k] - tb, b.p[k + 1] - tb, cu, cu, cu, cu)
+			var ce := Color(0.38, 0.37, 0.35)
+			_quad(und, a.p[0], a.p[0] - ta, b.p[0], b.p[0] - tb, ce, cu, ce, cu)
+			_quad(und, a.p[last], a.p[last] - ta, b.p[last], b.p[last] - tb, ce, cu, ce, cu)
 	st.generate_normals()
 	var container := Node3D.new()
 	var mi := MeshInstance3D.new()
 	mi.mesh = st.commit()
 	mi.material_override = _road_mat
 	container.add_child(mi)
+	if have_und:
+		und.generate_normals()
+		var umi := MeshInstance3D.new()
+		umi.mesh = und.commit()
+		umi.material_override = _rail_mat   # vertex-coloured + double-sided
+		container.add_child(umi)
 	# rails down both edges (band + emissive cap + posts)
 	_build_rail_side(container, rows, -1.0)
 	_build_rail_side(container, rows, 1.0)
@@ -749,6 +1465,10 @@ func _surface_color(d: float, lat: float, rh: float) -> Color:
 	# touching _noise's persistent frequency (that field also drives the hills).
 	var vh := _noise.get_noise_2d(d * 9.0, lat * 9.0)   # -1..1, deterministic per-vertex
 	var grass := _varied_grass(vh)
+	var dk := _deck_at(d)
+	if dk > 0.01:
+		# elevated deck: the shoulder is concrete, not floating grass
+		grass = grass.lerp(Color(0.46, 0.45, 0.43) * (1.0 + vh * 0.05), dk)
 	var al := absf(lat)
 	if al > rh + 1.0:
 		return grass
@@ -936,8 +1656,8 @@ func _scatter_tile(t: int, rows: Array, container: Node3D) -> void:
 	for k in scatter_kinds:
 		buckets[k] = [] as Array[Transform3D]
 	for r in rows:
-		if r.void:
-			continue
+		if r.void or float(r.dk) > 0.05:
+			continue   # no trees growing out of a bridge deck
 		var rh: float = r.rh
 		var lo: float = rh + 5.0
 		var hi: float = half_mesh - 2.0
@@ -952,6 +1672,11 @@ func _scatter_tile(t: int, rows: Array, container: Node3D) -> void:
 				continue
 			var wx: float = r.cx + r.rx * lat
 			var wz: float = r.cz + r.rz * lat
+			# THE trees-on-the-road fix: this point is verge relative to ITS row, but
+			# where the track self-approaches (hairpin legs, an overpass above) the
+			# same (x,z) can be DRIVABLE road of another stretch — reject those.
+			if _claimed_by_other(wx, wz, int(r.i), 5.0):
+				continue
 			var wy: float = _carved_height(r.d, lat, rh)
 			var s: float = rng.randf_range(0.8, 1.6) * float(_scatter_kind_scale.get(kind, 1.0))
 			var b := Basis(Vector3.UP, rng.randf() * TAU).scaled(Vector3(s, s, s))
@@ -972,6 +1697,19 @@ func _scatter_tile(t: int, rows: Array, container: Node3D) -> void:
 		mmi.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
 		container.add_child(mmi)
 
+## True if a DIFFERENT stretch of road (index gap > 10 from `own_i`) claims (x,z)
+## as drivable-or-nearly (within its half-width + margin). Keeps verge props and
+## signs off road that belongs to another pass of the track.
+func _claimed_by_other(x: float, z: float, own_i: int, margin: float) -> bool:
+	for ci in _branch_samples(x, z):
+		if absi(ci - own_i) <= 10:
+			continue
+		var p := _project_at(ci, x, z)
+		var rh: float = lerpf(road_half, road_half_turn, p.w)
+		if absf(p.lat) < rh + margin:
+			return true
+	return false
+
 # --- chevron turn-warning signs ------------------------------------------------
 
 ## Places classic red/white chevron boards on the OUTSIDE of any bend spanned by tile
@@ -986,13 +1724,18 @@ func _build_chevrons(t: int, container: Node3D) -> void:
 	for i in range(i0, i1):
 		if i % CHEVRON_STRIDE != 0:
 			continue
-		var dph := _ph[i + 1] - _ph[i]     # local curvature (no wrap needed: th is a
-		                                    # continuous accumulator, never wrapped)
-		if absf(dph) <= deg_to_rad(CHEVRON_TURN_THRESH):
+		var dph := _ph[i + 1] - _ph[i]     # local curvature (th is a continuous
+		                                    # accumulator; the ONE exception is the
+		                                    # exact-TAU unwind after a stunt — the
+		                                    # >20°/sample guard below skips it, since
+		                                    # no real turn is that tight)
+		if absf(dph) <= deg_to_rad(CHEVRON_TURN_THRESH) or absf(dph) > deg_to_rad(20.0):
 			continue
 		var d := float(i) * STEP
 		if _in_void_s(d):                  # never plant a sign over a jump's void
 			continue
+		if _deck_at(d) > 0.2:
+			continue                        # no boards floating beside a bridge deck
 		var rh: float = lerpf(road_half, road_half_turn, _pw[i])
 		var side := -signf(dph)            # outside = opposite the turn direction
 		var lat: float = side * (rh + CHEVRON_OFFSET)
@@ -1001,7 +1744,11 @@ func _build_chevrons(t: int, container: Node3D) -> void:
 		var fx := sin(ph); var fz := -cos(ph)            # road forward vector
 		var wx := _px[i] + rx * lat
 		var wz := _pz[i] + rz * lat
-		var wy := height_at(wx, wz) + CHEVRON_HEIGHT
+		if _claimed_by_other(wx, wz, i, 3.0):
+			continue                        # that spot is another pass's road
+		# height from THIS row's s (not a bare height_at, which could resolve to a
+		# different surface where the track stacks over itself)
+		var wy := _carved_height(d, lat, rh) + CHEVRON_HEIGHT
 		# arrow must point toward the INSIDE of the turn: mirror the mesh's local
 		# +X (its authored arrow direction) across the turn direction sign.
 		var flip := -1.0 if dph < 0.0 else 1.0

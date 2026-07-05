@@ -86,8 +86,29 @@ const MAPS := {
 			],
 		},
 	},
+	"gravity": {
+		"name": "Gravity Works", "desc": "Overpasses and banked corkscrews — the road crosses OVER itself. Look up.",
+		"mode": "classic", "sky_time": 0.33, "accent": Color(0.95, 0.75, 0.2),
+		"overrides": {
+			"stunts": "overpass:650,corkscrew:1500:2,overpass:2900,corkscrew:3900:1",
+			"straight_bias": 0.6, "turn_radius_min": 40.0, "turn_radius_max": 80.0,
+			"road_half": 18.0, "road_half_turn": 26.0,
+			"hill_amp": 5.0, "noise_frequency": 0.0024,
+			"gap_start": 5600.0, "gap_spacing": 420.0,
+			"path_seed": 777333, "noise_seed": 424,
+			"grass_color": Color(0.30, 0.42, 0.24), "asphalt_color": Color(0.15, 0.15, 0.17),
+			"centre_line_color": Color(1.0, 0.8, 0.25), "edge_line_color": Color(0.95, 0.93, 0.88),
+			"rail_band_color": Color(0.95, 0.45, 0.1),
+			"scatter_density": 0.6,
+			"scatter_kinds": [
+				"res://assets/trees/pine_quaternius_cc0.glb",
+				"res://assets/trees/pine_tall_quaternius_cc0.glb",
+				"res://assets/rocks/rock_quaternius_1_cc0.glb",
+			],
+		},
+	},
 }
-const MAP_KEYS := ["hills", "canyon", "alpine", "midnight"]
+const MAP_KEYS := ["hills", "canyon", "alpine", "midnight", "gravity"]
 var _map := "hills"
 var _best := {}            # map_key -> best distance (m) reached on that map, persisted
 var _map_btns := {}       # key -> Button (title-screen map card)

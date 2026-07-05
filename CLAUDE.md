@@ -30,6 +30,7 @@ first so you can checkpoint and diff your own work.
 <console> --headless --path . tests/CarBodyProbe.tscn   # GLB car bodies load/scale
 <console> --headless --path . tests/TrialProbe.tscn     # time-trial: timer/record/ghost/medals
 <console> --headless --path . tests/AudioProbe.tscn     # synth buffers non-silent, non-clipping
+<console> --headless --path . tests/StuntProbe.tscn     # overpass/corkscrew surfaces + canyon pop regression
 ```
 
 Baseline SmoothProbe numbers (HC v5): `vert_accel rms=2.70` (worst ~26), `pitch_jerk

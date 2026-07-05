@@ -23,6 +23,28 @@ Design pillars (in priority order):
    all-drift sprint against the clock, big-air snow ridge. More flavors welcome.
 5. **Session-friendly.** Death → shop → retry in seconds. No friction.
 
+## Update (2026-07-04, fifth pass — "HC v7")
+
+- **The road can now cross OVER itself.** Multi-surface analytic ground: `ground_info_y /
+  height_at_y (x, z, y_hint)` resolve stacked surfaces with a continuous asymmetric blend
+  (surfaces above a querier decay much faster than below — the anti-runaway rule).
+  Stunts are per-map export strings (`stunts = "overpass:650,corkscrew:1500:2,…"`), pure
+  C1 analytic profiles; bridge decks get real meshes/undersides/partner-tile streaming.
+- **POP/HOP BUG FIXED** (owner-reported, twice-survived): root cause was nearest-sample
+  projection snapping between overlapping road branches (canyon: road_half_turn 32 >
+  turn_radius_min 26). Fix = build-time overlap height reconciliation (cosine-windowed
+  patches) + the query-time blend + stateful branch hints in HCCar. Canyon wide-weave
+  regression in `tests/StuntProbe.tscn`: worst step 0.171 m, zero anti-tunnel lifts
+  (new `HCCar.tunnel_lifts` counter).
+- **Alpine trees-on-road FIXED**: scatter + chevrons now reject positions claimed by any
+  other road branch (`_claimed_by_other`), MapShot-verified on alpine/canyon.
+- **5th map: Gravity Works** (gold accent) — 2 overpasses + 2 banked corkscrews (13°,
+  constant-pitch helix, suspension rides the banking with zero car changes), trial line
+  at 1800 m (medals NOT bot-calibrated — human pass wanted, like all trial medals).
+- Full vertical loops: not attempted (deliberate) — needs an opt-in spline-adherence
+  "loop zone" in HCCar; the branch-candidate machinery is the foundation. Design sketch
+  in the 2026-07-04 loop-agent report (session transcript).
+
 ## Update (2026-07-04, fourth pass — "HC v6")
 
 - **Owner playtested the maps (finally!)**: Sunset Canyon APPROVED — favorite by far,

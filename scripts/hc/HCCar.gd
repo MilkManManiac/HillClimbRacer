@@ -103,6 +103,8 @@ var _steer: float = 0.0
 var _air_time: float = 0.0
 var _flip_accum: float = 0.0
 var _last_up: Vector3 = Vector3.UP
+var _ter_hint: bool = false     # terrain supports height-hinted (multi-surface) ground queries
+var tunnel_lifts: int = 0       # anti-tunnel floor activations (probes assert 0 mid-drive)
 
 # --- gap / checkpoint state --------------------------------------------------
 signal gap_cleared(idx: int)
@@ -243,6 +245,11 @@ func _physics_process(delta: float) -> void:
 	_grounded = false
 	var gnormal := Vector3.ZERO   # averaged ground normal under the wheels (for pitch stability)
 	var analytic: bool = terrain != null and terrain.has_method("ground_info")
+	# height-hinted queries: where the track stacks over itself (overpass decks,
+	# corkscrew coils, pinched hairpin legs) the terrain needs to know the wheel's
+	# own height to resolve WHICH surface is under it — and to blend overlapping
+	# surfaces continuously instead of snapping (the random-pop bug).
+	_ter_hint = analytic and terrain.has_method("ground_info_y")
 	for i in range(_rays.size()):
 		var d := -1.0   # contact distance from the wheel-ray origin (-1 = in the air)
 		if analytic:
@@ -511,8 +518,15 @@ func _physics_process(delta: float) -> void:
 		var gs: Dictionary = terrain.call("gap_state", global_position)
 		if gs.get("active", false) and gs.get("on_road", true) and not gs.get("over_void", false) and not gs.get("past_far", false):
 			var e := 1.5
-			var gx: float = (float(terrain.call("height_at", global_position.x + e, global_position.z)) - float(terrain.call("height_at", global_position.x - e, global_position.z))) / (2.0 * e)
-			var gz: float = (float(terrain.call("height_at", global_position.x, global_position.z + e)) - float(terrain.call("height_at", global_position.x, global_position.z - e))) / (2.0 * e)
+			var gy := global_position.y
+			var gx: float
+			var gz: float
+			if _ter_hint:   # hinted so the gradient reads OUR surface near any crossing
+				gx = (float(terrain.call("height_at_y", global_position.x + e, global_position.z, gy)) - float(terrain.call("height_at_y", global_position.x - e, global_position.z, gy))) / (2.0 * e)
+				gz = (float(terrain.call("height_at_y", global_position.x, global_position.z + e, gy)) - float(terrain.call("height_at_y", global_position.x, global_position.z - e, gy))) / (2.0 * e)
+			else:
+				gx = (float(terrain.call("height_at", global_position.x + e, global_position.z)) - float(terrain.call("height_at", global_position.x - e, global_position.z))) / (2.0 * e)
+				gz = (float(terrain.call("height_at", global_position.x, global_position.z + e)) - float(terrain.call("height_at", global_position.x, global_position.z - e))) / (2.0 * e)
 			var ramp_vy: float = linear_velocity.x * gx + linear_velocity.z * gz
 			if ramp_vy > 0.5:
 				linear_velocity.y = maxf(linear_velocity.y, minf(ramp_vy, 24.0))
@@ -542,13 +556,18 @@ func _physics_process(delta: float) -> void:
 			for cys in [-1.0, 1.0]:
 				for czs in [-1.0, 1.0]:
 					var cw := to_global(Vector3(hx * cxs, cy + hy * cys, hz * czs))
-					var gh: float = terrain.call("height_at", cw.x, cw.z)
+					# hinted: measure against the SAME blended surface the springs ride —
+					# under an overpass the plain height_at would answer with the deck
+					# overhead and this floor would teleport the car up through it
+					var gh: float = (terrain.call("height_at_y", cw.x, cw.z, cw.y) if _ter_hint
+							else terrain.call("height_at", cw.x, cw.z))
 					deficit = maxf(deficit, gh - cw.y)
 		# Dead-band: rigid-box corners legitimately sit up to ~0.2 m "inside" curved
 		# terrain (front overhang in a dip, nose corner on a crest) — only a REAL
 		# punch-through goes deeper. 0.35 m ignores all geometry while still catching
 		# tunneling within a tick or two (a falling car gains ~0.17 m/tick at 20 m/s).
 		if deficit > 0.35:
+			tunnel_lifts += 1   # probes assert this stays 0 during normal driving
 			global_position.y += deficit
 			if linear_velocity.y < 0.0:
 				linear_velocity.y = 0.0
@@ -574,7 +593,9 @@ func _on_land(vel: Vector3) -> void:
 	# flat ground from the same height still hurts.
 	var n := Vector3.UP
 	if terrain and terrain.has_method("ground_info"):
-		var gi: Dictionary = terrain.call("ground_info", global_position.x, global_position.z)
+		var gp := global_position
+		var gi: Dictionary = (terrain.call("ground_info_y", gp.x, gp.z, gp.y) if terrain.has_method("ground_info_y")
+				else terrain.call("ground_info", gp.x, gp.z))
 		n = gi.n
 	var into: float = maxf(0.0, -vel.dot(n))
 	var impact := maxf(0.0, into - land_damage_speed)
@@ -654,6 +675,7 @@ func reset_run(start: Vector3) -> void:
 	checkpoint_z = 0.0
 	_gap_armed = false
 	_falling_out = false
+	tunnel_lifts = 0
 	linear_velocity = Vector3.ZERO
 	angular_velocity = Vector3.ZERO
 	global_transform = Transform3D(Basis(), start)
@@ -909,7 +931,8 @@ func _suspend(ray: RayCast3D, up: Vector3, vel: Vector3) -> bool:
 ## via the local ground plane. Returns {"d": dist, "n": normal} or {} if airborne.
 func _suspend_analytic(idx: int, up: Vector3, vel: Vector3) -> Dictionary:
 	var origin := to_global(_wheel_positions[idx])
-	var gi: Dictionary = terrain.call("ground_info", origin.x, origin.z)
+	var gi: Dictionary = (terrain.call("ground_info_y", origin.x, origin.z, origin.y) if _ter_hint
+			else terrain.call("ground_info", origin.x, origin.z))
 	var n: Vector3 = gi.n
 	var d: float = n.y * (origin.y - float(gi.h)) / maxf(up.dot(n), 0.25)
 	if d > suspension_rest + wheel_radius + 0.35:   # beyond the old ray's reach = airborne
