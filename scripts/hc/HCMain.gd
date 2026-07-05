@@ -8,6 +8,8 @@ const HCTerrainScript := preload("res://scripts/hc/HCTerrain.gd")
 const HCTrackScript := preload("res://scripts/hc/HCTrack.gd")
 const HCCarScript := preload("res://scripts/hc/HCCar.gd")
 const HCAudioScript := preload("res://scripts/hc/HCAudio.gd")
+const HCTimeTrialScript := preload("res://scripts/hc/HCTimeTrial.gd")   # static rules only, never instanced
+const HCGhostScript := preload("res://scripts/hc/HCGhost.gd")
 const USE_TRACK := true   # true = new 2-D winding road (HCTrack); false = classic corridor
 
 var _car: RigidBody3D
@@ -25,11 +27,11 @@ var _start := Vector3(0, 6, 0)
 const MAPS := {
 	"hills": {
 		"name": "Rolling Hills", "desc": "The classic ride — gentle sweepers, occasional jumps.",
-		"mode": "classic", "sky_time": 0.37, "overrides": {},
+		"mode": "classic", "sky_time": 0.37, "accent": Color(0.55, 0.78, 0.35), "overrides": {},
 	},
 	"canyon": {
 		"name": "Sunset Canyon", "desc": "All-drifting speedrun through red sandstone — no jumps, beat the clock.",
-		"mode": "sprint", "sky_time": 0.31,
+		"mode": "sprint", "sky_time": 0.31, "accent": Color(0.92, 0.48, 0.2),
 		"overrides": {
 			"straight_bias": 0.22, "max_turn_deg": 150.0, "turn_radius_min": 26.0, "turn_radius_max": 60.0,
 			"road_half": 20.0, "road_half_turn": 32.0, "hill_amp": 2.5, "noise_frequency": 0.004,
@@ -42,7 +44,7 @@ const MAPS := {
 	},
 	"alpine": {
 		"name": "Alpine Ridge", "desc": "Big snowy hills, big-air jumps — a stock ride can't clear them; bring engine + suspension upgrades.",
-		"mode": "classic", "sky_time": 0.45,
+		"mode": "classic", "sky_time": 0.45, "accent": Color(0.4, 0.6, 0.95),
 		"overrides": {
 			# bot-tuned (tests/AutoDrive.gd): the old 240 m / rise-8.5 first jump zeroed a
 			# stock car's health on its first landing — later start, lower kick, longer
@@ -64,7 +66,7 @@ const MAPS := {
 	},
 	"midnight": {
 		"name": "Midnight Run", "desc": "Neon night cruise — headlights on, follow the glow.",
-		"mode": "classic", "sky_time": 0.95, "night": true,
+		"mode": "classic", "sky_time": 0.95, "night": true, "accent": Color(0.65, 0.35, 0.95),
 		"overrides": {
 			"straight_bias": 0.45, "turn_radius_min": 34.0, "turn_radius_max": 70.0,
 			"road_half": 19.0, "hill_amp": 5.0, "noise_frequency": 0.003,
@@ -88,7 +90,10 @@ const MAPS := {
 const MAP_KEYS := ["hills", "canyon", "alpine", "midnight"]
 var _map := "hills"
 var _best := {}            # map_key -> best distance (m) reached on that map, persisted
-var _map_btns := {}       # key -> Button (title-screen row)
+var _map_btns := {}       # key -> Button (title-screen map card)
+var _map_card_stat_lbl := {}   # key -> Label (title-screen card's "best distance/time" line)
+var _mode_btns := {}      # "classic"/"trial" -> Button (title-screen mode toggle)
+var _veh_title_btns := {} # vehicle key -> Button (title-screen vehicle strip)
 var _map_row_lbl: Label   # shop/death-screen "MAP: <name>" readout
 
 # --- sprint mode (mode "sprint" — race the clock) -------------------------
@@ -105,6 +110,25 @@ var _sprint_active := false
 var _sprint_time := 0.0
 var _sprint_next_checkpoint := 0.0
 var _sprint_lbl: Label
+
+# --- time trial mode (title-screen "TIME TRIAL" toggle) -------------------------
+# Orthogonal to sprint: sprint is a per-map property (canyon only) and always wins
+# on maps that declare it; trial is a player-picked global toggle that only takes
+# effect on maps WITHOUT their own mode (see HCTimeTrialScript.FINISH_M / _reset_run_mode).
+# Crossing the finish line does not end the run — it banks a record/ghost and the
+# drive continues classic-style, so trial composes with the existing death/shop flow
+# instead of replacing it.
+var _run_mode := "classic"        # "classic" | "trial" — persisted, defaults to classic
+var _trial_active := false        # true this run iff sprint isn't active + trial supports _map
+var _trial_time := 0.0
+var _trial_finished := false
+var _trial_splits_hit := {}       # split index (int) -> true, cleared every run
+var _trial_result := ""           # last finish summary line, folded into the wreck screen
+var _ghost: Node3D                # HCGhostScript instance; duck-typed via .call() like _terrain/_audio
+var _best_time := {}              # "<map>|<vehicle>" -> seconds, persisted
+var _ghost_data := {}             # "<map>|<vehicle>" -> Array[float] (HCGhostScript sample dump), persisted
+var _trial_lbl: Label             # HUD: big live/finish timer (top-center)
+var _trial_sub_lbl: Label         # HUD: "to go / best / medal ladder" readout under the timer
 
 # HUD
 var _fuel_bar: ColorRect
@@ -217,6 +241,8 @@ var _kit_options: Array[String] = [""]     # "" (stock) + every assets/car/*.glb
 var _kit_lbl: Label                        # garage "BODY KIT" readout
 var _owned := {"minivan": true, "hotrod": false, "monster": false, "sports": false, "f1": false}
 var _was_dead := false
+var _was_drifting := false   # edge-detectors for the continuous drift/boost loops
+var _was_boosting := false
 var _respawning := false
 var _shake := 0.0           # camera shake magnitude (decays)
 var _shake_off := Vector3.ZERO
@@ -282,6 +308,12 @@ var _speed_lines_size := Vector2.ZERO  # viewport size the streaks were laid out
 # Schema v1: {"version", "money", "levels" (vehicle_key -> {upgrade_key: int}),
 # "owned" ([vehicle_key,...]), "vehicle", "cosm_owned" ([cosm_key,...]),
 # "cosm_color" (cosm_key -> "#rrggbb"), "map", "best" (map_key -> float metres)}.
+# v1 also carries (added without a version bump — every field is .get()-defaulted so
+# older saves just don't have them yet): "run_mode" ("classic"/"trial"), "best_time"
+# ("<map>|<vehicle>" -> seconds), "ghosts" ("<map>|<vehicle>" -> Array[float] sample
+# dump, HCGhostScript.recorded_data() format), "ghost_version" (HCGhostScript.VERSION at save
+# time — a mismatch drops ALL saved ghosts on load rather than risk feeding a stale
+# sample layout into HCGhostScript.load_data(); best_time survives regardless).
 # _collect_save() / _apply_save() are the single choke point for the schema — adding
 # a field later is "write it in one, read it with .get(key, fallback) in the other."
 const SAVE_PATH := "user://hc_save.json"
@@ -314,6 +346,12 @@ func _collect_save() -> Dictionary:
 	var best_out := {}
 	for mk in _best:
 		best_out[mk] = _best[mk]
+	var best_time_out := {}
+	for k in _best_time:
+		best_time_out[k] = _best_time[k]
+	var ghosts_out := {}
+	for k in _ghost_data:
+		ghosts_out[k] = _ghost_data[k]
 	return {
 		"version": 1,
 		"money": money,
@@ -325,6 +363,11 @@ func _collect_save() -> Dictionary:
 		"map": _map,
 		"best": best_out,
 		"body_kits": _body_kits.duplicate(),
+		"run_mode": _run_mode,
+		"best_time": best_time_out,
+		"ghosts": ghosts_out,
+		"ghost_version": HCGhostScript.VERSION,
+		"volume": master_volume,
 	}
 
 ## Merge a loaded save dict onto the in-memory defaults. EVERY read goes through
@@ -366,6 +409,21 @@ func _apply_save(d: Dictionary) -> void:
 	for vk in kits_in:
 		if VEHICLES.has(vk) and _kit_options.has(str(kits_in[vk])):
 			_body_kits[vk] = str(kits_in[vk])
+	var mode_in: String = str(d.get("run_mode", _run_mode))
+	if mode_in == "classic" or mode_in == "trial":
+		_run_mode = mode_in
+	var best_time_in: Dictionary = d.get("best_time", {})
+	for k in best_time_in:
+		_best_time[k] = float(best_time_in[k])
+	# ghosts are versioned separately from the save schema itself: a mismatch means
+	# HCGhostScript's sample layout changed since this save was written, so every stored
+	# ghost is dropped (best TIMES still restore above — only the visual replay is lost)
+	if int(d.get("ghost_version", HCGhostScript.VERSION)) == HCGhostScript.VERSION:
+		var ghosts_in: Dictionary = d.get("ghosts", {})
+		for k in ghosts_in:
+			if ghosts_in[k] is Array:
+				_ghost_data[k] = ghosts_in[k]
+	master_volume = clampf(float(d.get("volume", master_volume)), 0.0, 1.0)
 
 ## Write the full save snapshot to disk. Cheap enough to call on every purchase/switch/
 ## death — it's a few hundred bytes of JSON, not a hot-path concern.
@@ -406,12 +464,15 @@ func _ready() -> void:
 	_scan_body_kits()   # before _load_game so a saved kit path can be validated
 	_load_game()   # restore money/levels/owned/vehicle/cosmetics/map/best BEFORE anything
 	               # below reads them — terrain (_map) and car (_vehicle) are built next
+	_ghost = HCGhostScript.new()
+	add_child(_ghost)   # one persistent record+playback node; must exist before _setup_terrain_and_car
 	_setup_sky()
 	_setup_terrain_and_car()
 	_setup_camera()
 	_setup_hud()
 	_setup_speed_lines()
 	_build_shop()
+	_build_pause_menu()
 	_apply_upgrades()
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 	_build_start_menu()   # title + how-to-play; pauses the game until you hit START
@@ -443,6 +504,9 @@ func _cycle_body_kit() -> void:
 	_swap_vehicle(_vehicle)   # full rebuild in the new shell (+ saves + refreshes shop)
 
 func _input(event: InputEvent) -> void:
+	if event.is_action_pressed("pause_menu"):
+		_toggle_pause_menu()
+		return
 	# works for keyboard (Enter/Tab) AND gamepad (Back / Start) via the input actions
 	if event.is_action_pressed("restart"):
 		_restart()
@@ -475,6 +539,7 @@ func _setup_input() -> void:
 	_new_action("roll_right", 0.2, [_key(KEY_E), _axis(JOY_AXIS_RIGHT_X, 1.0)])
 	_new_action("toggle_shop", 0.5, [_key(KEY_TAB), _btn(JOY_BUTTON_START)])
 	_new_action("restart", 0.5, [_key(KEY_ENTER), _btn(JOY_BUTTON_BACK)])
+	_new_action("pause_menu", 0.5, [_key(KEY_ESCAPE)])
 	# shop tab switching (bumpers on a pad, Q/E on the keyboard — only read while the
 	# shop is open, so they can safely double as the in-game roll/dive/boost keys)
 	_new_action("shop_tab_left", 0.5, [_key(KEY_Q), _btn(JOY_BUTTON_LEFT_SHOULDER)])
@@ -655,9 +720,15 @@ func _setup_terrain_and_car() -> void:
 	_car.connect("landed", _on_car_landed)
 	_terrain.connect("pickup_collected", _on_pickup_collected)
 	_apply_headlights()
-	# audio intentionally OFF for now (user will source better sounds later). The
-	# HCAudio synth + all play_* calls stay guarded by `if _audio:` so leaving
-	# _audio null = fully silent; flip this back on by instancing HCAudioScript here.
+	_reset_run_mode_state()   # NOTE: this was missing at boot before trial mode landed —
+	                          # a save restoring onto canyon used to boot with sprint
+	                          # inactive until the first restart/map-switch; now correct
+	# procedural synth audio — every play_* call stays guarded by `if _audio:` so
+	# setting _audio = null here silences the whole game if the owner rejects the mix
+	_audio = HCAudioScript.new()
+	add_child(_audio)
+	_audio.call("setup", _car)
+	_apply_volume()
 
 ## Switch the car's headlights on for the active map's "night" flag, if the car
 ## supports it. Guarded by has_method so this works whether or not the concurrent
@@ -726,7 +797,7 @@ func _apply_map() -> void:
 	if _car:
 		_car.call("reset_run", _start)
 	_apply_headlights()
-	_reset_sprint_state()
+	_reset_run_mode_state()
 	if _cam:
 		_cam.global_position = _start + Vector3(0, 6, 12)
 	_cam_heading = Vector3(0, 0, -1)
@@ -745,19 +816,42 @@ func _on_title_map_button(key: String) -> void:
 	if key != _map:
 		_map = key
 		_apply_map()
-		_refresh_map_buttons()
+	# always resync toggle state — re-clicking the ALREADY-selected card still toggles
+	# its button_pressed (toggle_mode flips on every click), so without this it would
+	# visually deselect a card that's still actually the active map
+	_refresh_map_buttons()
 	# hand focus back to START so Enter/Ⓐ always launches (a clicked map button
 	# would otherwise keep focus and swallow the confirm key)
 	if _start_btn:
 		_start_btn.grab_focus()
 
-## Highlight the currently-selected map button on the title screen.
+## Highlight the currently-selected map card and refresh its stat line (best distance,
+## and — on trial-supporting maps — best time + medal for the ACTIVE vehicle). Called
+## from the title screen (map/mode/vehicle picks) and from the in-game shop's map
+## switcher; is_instance_valid guards because the title screen's card nodes are freed
+## by _begin_game() while this dict is never cleared (only ever repopulated on the
+## next _build_start_menu — i.e. after a Main Menu reload).
 func _refresh_map_buttons() -> void:
 	for mk in MAP_KEYS:
-		if not _map_btns.has(mk):
+		if not _map_btns.has(mk) or not is_instance_valid(_map_btns[mk]):
 			continue
 		var b: Button = _map_btns[mk]
 		b.button_pressed = (mk == _map)
+		if not _map_card_stat_lbl.has(mk) or not is_instance_valid(_map_card_stat_lbl[mk]):
+			continue
+		var stat: Label = _map_card_stat_lbl[mk]
+		var best_m := int(float(_best.get(mk, 0.0)))
+		var line := "Best: %d m" % best_m
+		if HCTimeTrialScript.supports(mk):
+			var bt: float = float(_best_time.get(_trial_key(mk, _vehicle), -1.0))
+			if bt >= 0.0:
+				var medal := HCTimeTrialScript.medal_for(mk, bt)
+				line += "   ⏱ %s %s" % [HCTimeTrialScript.format_time(bt), HCTimeTrialScript.medal_glyph(medal)]
+			else:
+				line += "   ⏱ no trial time yet"
+		elif MAPS[mk].mode == "sprint":
+			line += "   (sprint mode)"
+		stat.text = line
 
 ## Cycle to the next map from the shop/death-screen "MAP" row.
 func _cycle_map() -> void:
@@ -794,6 +888,8 @@ func _process(delta: float) -> void:
 	_update_hud()
 	_update_feel(delta)
 	_update_sprint(delta)
+	_update_trial(delta)
+	_update_audio(delta)
 	# on death, bank money earned from how far down the track you got, open the shop
 	var d: bool = _car.get("dead")
 	if d and not _was_dead:
@@ -803,6 +899,8 @@ func _process(delta: float) -> void:
 		var dist_now: float = _car.get("distance")
 		if dist_now > float(_best.get(_map, 0.0)):
 			_best[_map] = dist_now   # new PB on this map
+		if _ghost and _trial_active and not _trial_finished:
+			_ghost.call("stop_recording")   # crashed before the line — this attempt's recording is dead weight
 		_save_game()   # persist the bank + best BEFORE the shop even opens
 		if _audio:
 			_audio.call("play_wreck")
@@ -918,7 +1016,7 @@ func _restart() -> void:
 	_cam_look_ready = false   # reseed the look basis at the new spawn orientation
 	_speed_fx = 0.0
 	_was_dead = false
-	_reset_sprint_state()
+	_reset_run_mode_state()
 	if _shop:
 		_shop.visible = false
 
@@ -936,12 +1034,43 @@ func _on_car_gap_failed(_can_respawn: bool) -> void:
 
 # --- sprint mode: race the clock on "sprint"-mode maps (currently: canyon) --------
 
-## Reseed the countdown for the active map's mode. Classic maps stay inactive
-## (no timer shown, no death-on-zero) — this is purely opt-in per map.
-func _reset_sprint_state() -> void:
+## Reseed BOTH alternate run modes for the (possibly new) active map/vehicle: sprint's
+## countdown (opt-in per map via MAPS[_map].mode — classic maps stay inactive, no timer
+## shown, no death-on-zero) and time-trial's timer/splits/ghost. Sprint always wins on
+## maps that declare it (canyon) — the title-screen Classic/Time Trial toggle only takes
+## effect on maps that don't have their own mode, so canyon always plays like canyon
+## regardless of _run_mode.
+func _reset_run_mode_state() -> void:
 	_sprint_active = MAPS[_map].mode == "sprint"
 	_sprint_time = SPRINT_TIME
 	_sprint_next_checkpoint = SPRINT_CHECKPOINT_M
+	_trial_active = (not _sprint_active) and _run_mode == "trial" and HCTimeTrialScript.supports(_map)
+	_trial_time = 0.0
+	_trial_finished = false
+	_trial_splits_hit.clear()
+	_trial_result = ""
+	_load_ghost_for_current()
+	if _ghost:
+		if _trial_active and _car:
+			_ghost.call("start_recording", _car)
+		else:
+			_ghost.call("stop_recording")
+			_ghost.call("hide_ghost")
+
+func _trial_key(map_key: String, vehicle_key: String) -> String:
+	return "%s|%s" % [map_key, vehicle_key]
+
+## Load the saved ghost (if any) for the active map+vehicle into the shared HCGhostScript
+## node so it plays back this run. Cleared (no ghost shown) outside trial mode or
+## when there's no saved best yet.
+func _load_ghost_for_current() -> void:
+	if _ghost == null:
+		return
+	var key := _trial_key(_map, _vehicle)
+	if _trial_active and _ghost_data.has(key):
+		_ghost.call("load_data", _ghost_data[key])
+	else:
+		_ghost.call("clear_data")
 
 ## Tick the countdown while a sprint run is live; award +time every checkpoint
 ## distance and end the run (via the car's normal death flow) at zero.
@@ -962,11 +1091,65 @@ func _update_sprint(delta: float) -> void:
 		_car.set("trick_text", "CHECKPOINT  +%ds  ⛽  +$%d" % [int(SPRINT_BONUS_S), cash])
 		_car.set("_trick_timer", 2.0)
 		if _audio:
-			_audio.call("play_coin")
+			_audio.call("play_checkpoint")
 	_sprint_time -= delta
 	if _sprint_time <= 0.0:
 		_sprint_time = 0.0
 		_car.set("health", 0.0)   # normal death/shop flow takes it from here
+
+# --- time trial mode: race the clock to a fixed finish distance, keyed per map -----
+
+## Tick the live trial clock, fire split call-outs, keep the ghost recording/playing,
+## and detect the finish line. Unlike sprint, crossing the finish does NOT end the
+## run — it banks the record/ghost and driving continues classic-style.
+func _update_trial(delta: float) -> void:
+	if _ghost:
+		_ghost.call("tick_record", delta)   # no-op unless a recording is in progress
+	if not _trial_active or _car == null or bool(_car.get("dead")):
+		return
+	if not _trial_finished:
+		_trial_time += delta
+		var dist: float = _car.get("distance")
+		var splits := HCTimeTrialScript.split_distances(_map)
+		for i in range(splits.size()):
+			if not _trial_splits_hit.has(i) and dist >= splits[i]:
+				_trial_splits_hit[i] = true
+				_car.set("trick_text", "SPLIT %d — %s" % [i + 1, HCTimeTrialScript.format_time(_trial_time)])
+				_car.set("_trick_timer", 1.6)
+				if _audio:
+					_audio.call("play_click")
+		if dist >= HCTimeTrialScript.finish_distance(_map):
+			_finish_trial()
+	if _ghost:
+		_ghost.call("show_at", _trial_time)
+
+## Bank a finished trial run: compare against the saved best, persist a new record +
+## ghost if this run is faster (or the first clean finish on this map+vehicle), and
+## announce it through the same trick-text HUD channel sprint checkpoints use.
+func _finish_trial() -> void:
+	_trial_finished = true
+	var key := _trial_key(_map, _vehicle)
+	var prev: float = float(_best_time.get(key, -1.0))
+	var is_best: bool = prev < 0.0 or _trial_time < prev
+	var medal := HCTimeTrialScript.medal_for(_map, _trial_time)
+	var glyph := HCTimeTrialScript.medal_glyph(medal)
+	if is_best:
+		_best_time[key] = _trial_time
+		if _ghost:
+			var data: Array = _ghost.call("recorded_data")
+			if data.size() > 0:
+				_ghost_data[key] = data   # this run becomes the new ghost others race against
+		_trial_result = "FINISH!  %s  —  NEW BEST!  %s" % [HCTimeTrialScript.format_time(_trial_time), glyph]
+		_car.set("trick_text", "🏁 NEW BEST  %s  %s" % [HCTimeTrialScript.format_time(_trial_time), glyph])
+	else:
+		_trial_result = "FINISH!  %s   (best %s)  %s" % [HCTimeTrialScript.format_time(_trial_time), HCTimeTrialScript.format_time(prev), glyph]
+		_car.set("trick_text", "🏁 FINISH  %s  %s" % [HCTimeTrialScript.format_time(_trial_time), glyph])
+	_car.set("_trick_timer", 3.0)
+	if _ghost:
+		_ghost.call("stop_recording")
+	if _audio:
+		_audio.call("play_cash")
+	_save_game()   # bank the record/ghost immediately — don't wait for a death that may not come soon
 
 # --- feel: speed-lines overlay ----------------------------------------------
 
@@ -1138,8 +1321,15 @@ func _apply_upgrades() -> void:
 	# (Downforce/Aerodynamics are pure mechanical tuning now — no chassis resize.)
 	_apply_cosmetics()   # cosmetics, re-applied on every rebuild/swap
 
-## One-time title + how-to-play screen. Pauses the whole game (process_mode ALWAYS so
-## the panel still runs) until START, then unpauses and frees itself.
+## Title screen: logo, a Classic/Time-Trial mode toggle, map CARDS (accent colour +
+## description + best distance/time+medal), a vehicle strip, and START. Pauses the
+## whole game (process_mode ALWAYS so the panel still runs) until START, then
+## unpauses and frees itself.
+##
+## ADAPTIVE layout throughout (CenterContainer + an internal ScrollContainer, never
+## a hand-placed offset) — the old fixed-size panel once pushed START below the
+## 720px window edge; every growable section here is wrapped in the scroller instead
+## so it degrades to "scrolls" rather than "breaks" if it ever runs long on content.
 func _build_start_menu() -> void:
 	_start_layer = CanvasLayer.new()
 	_start_layer.layer = 20                       # above the HUD and the shop
@@ -1147,86 +1337,77 @@ func _build_start_menu() -> void:
 	add_child(_start_layer)
 	var dim := ColorRect.new()
 	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
-	dim.color = Color(0.03, 0.04, 0.06, 0.9)
+	dim.color = Color(0.03, 0.03, 0.05, 0.93)
 	_start_layer.add_child(dim)
 
-	# ADAPTIVE layout: the old fixed 720x640 panel at a hand-placed offset overflowed
-	# the 720 px window once the MAP row landed — START rendered BELOW the screen edge
-	# and the game looked "stuck" (nothing clickable could unpause it). Now the panel
-	# centres itself at any size, the how-to text scrolls, and MAP + START stay pinned.
 	var center := CenterContainer.new()
 	center.set_anchors_preset(Control.PRESET_FULL_RECT)
 	_start_layer.add_child(center)
 	var panel := PanelContainer.new()
-	panel.custom_minimum_size = Vector2(720, 0)
+	panel.custom_minimum_size = Vector2(760, 0)
+	_style_panel(panel, Color(0.07, 0.075, 0.1, 0.97), Color(0.32, 0.34, 0.42), 1, 16)
 	center.add_child(panel)
 	var pad := MarginContainer.new()
 	for m in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
-		pad.add_theme_constant_override(m, 20)
+		pad.add_theme_constant_override(m, 22)
 	panel.add_child(pad)
 	var box := VBoxContainer.new()
-	box.add_theme_constant_override("separation", 8)
+	box.add_theme_constant_override("separation", 10)
 	pad.add_child(box)
 
-	_shop_label(box, "🏎  HILL CLIMB RACER", 34, Color(1, 0.82, 0.42))
-	_shop_label(box, "Drive as far as you can. Fuel is your timer — don't run dry.", 16, Color(0.72, 0.78, 0.9))
+	# --- logo -----------------------------------------------------------------
+	var title_lbl := _shop_label(box, "🏎  HILL CLIMB RACER", 36, Color(1, 0.82, 0.42))
+	title_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	var sub_lbl := _shop_label(box, "Drive as far as you can — or race the clock. Fuel is your timer.", 14, Color(0.68, 0.74, 0.86))
+	sub_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	box.add_child(HSeparator.new())
 
-	# scrollable middle (controls + tips) so the pinned MAP/START rows below always
-	# fit on screen no matter how much how-to text accumulates
+	# scrollable middle: mode toggle + map cards + vehicle strip + control legend, so
+	# this whole section can grow without ever pushing START off the 720px window
 	var sc := ScrollContainer.new()
-	sc.custom_minimum_size = Vector2(672, 290)
+	sc.custom_minimum_size = Vector2(716, 434)
 	sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	box.add_child(sc)
 	var scb := VBoxContainer.new()
-	scb.add_theme_constant_override("separation", 8)
+	scb.add_theme_constant_override("separation", 10)
 	scb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	sc.add_child(scb)
 
-	_shop_label(scb, "CONTROLS", 16, Color(0.8, 0.85, 1.0))
-	var ctrls := [
-		"Throttle / Brake:   W / S   ·   RT / LT",
-		"Steer:   A / D   ·   left stick",
-		"In the air:   W/S pitch  ·  A/D yaw  ·  Q/E roll",
-		"Dive:   Space / LB      Boost (Rockets):   Ctrl / RB",
-		"Recover if flipped:   R / Y      Garage:   Tab / Start",
-	]
-	for c in ctrls:
-		_shop_label(scb, "•  " + c, 15, Color(0.86, 0.88, 0.92))
-	scb.add_child(HSeparator.new())
+	_build_mode_toggle(scb)
 
-	_shop_label(scb, "TIPS", 16, Color(0.8, 0.85, 1.0))
-	var tips := [
-		"Drift around most corners — brake while turning, or flick the wheel hard, to break the rear loose. Take a fast corner on pure grip and a top-heavy ride will TIP and roll out of control.",
-		"Read EVERY upgrade — each changes how the car handles, not just its numbers. (Downforce = tips far less · Aerodynamics = higher top speed · Bigger Wheels = clearance.)",
-		"Grab coins for cash and fuel cans to stretch your run — pickups respawn every run.",
-		"Clear the gaps by carrying speed. Fall in and the run ends.",
-		"Every vehicle feels different — try them all in the Garage (van → hot rod → monster → sports → F1).",
-	]
-	for t in tips:
-		var l := _shop_label(scb, "•  " + t, 14, Color(0.7, 0.74, 0.8))
-		l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		l.custom_minimum_size = Vector2(640, 0)
-	box.add_child(HSeparator.new())
-
-	_shop_label(box, "MAP", 16, Color(0.8, 0.85, 1.0))
-	var map_row := HBoxContainer.new()
-	map_row.add_theme_constant_override("separation", 8)
-	box.add_child(map_row)
+	_shop_label(scb, "SELECT MAP", 13, Color(0.6, 0.64, 0.72))
+	var grid := GridContainer.new()
+	grid.columns = 2
+	grid.add_theme_constant_override("h_separation", 10)
+	grid.add_theme_constant_override("v_separation", 10)
+	scb.add_child(grid)
 	_map_btns.clear()
+	_map_card_stat_lbl.clear()
 	for mk in MAP_KEYS:
-		var mbtn := Button.new()
-		mbtn.text = MAPS[mk].name
-		mbtn.tooltip_text = MAPS[mk].desc
-		mbtn.custom_minimum_size = Vector2(0, 40)
-		mbtn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		mbtn.toggle_mode = true
-		mbtn.pressed.connect(_on_title_map_button.bind(mk))
-		map_row.add_child(mbtn)
-		_map_btns[mk] = mbtn
+		_build_map_card(grid, mk)
 	_refresh_map_buttons()
-	box.add_child(HSeparator.new())
 
+	scb.add_child(HSeparator.new())
+	_build_title_vehicle_row(scb)
+
+	scb.add_child(HSeparator.new())
+	_shop_label(scb, "CONTROLS", 13, Color(0.6, 0.64, 0.72))
+	var hints := HBoxContainer.new()
+	hints.alignment = BoxContainer.ALIGNMENT_CENTER
+	hints.add_theme_constant_override("separation", 14)
+	scb.add_child(hints)
+	_nav_hint(hints, "W/S · RT/LT", "Throttle/Brake")
+	_nav_hint(hints, "A/D · ⇦⇨", "Steer")
+	_nav_hint(hints, "Space · LB", "Dive")
+	_nav_hint(hints, "Ctrl · RB", "Boost")
+	_nav_hint(hints, "R · Y", "Recover")
+	_nav_hint(hints, "Tab · ☰", "Garage")
+	_nav_hint(hints, "Esc", "Pause")
+	var tip := _shop_label(scb, "Drift corners by braking into the turn or flicking the wheel hard. Every upgrade changes HOW the car handles, not just the numbers — try them all in the Garage.", 12, Color(0.62, 0.66, 0.74))
+	tip.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	tip.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+
+	box.add_child(HSeparator.new())
 	_start_btn = Button.new()
 	_start_btn.text = "START  ▶   (Enter / Ⓐ)"
 	_start_btn.custom_minimum_size = Vector2(0, 54)
@@ -1238,6 +1419,153 @@ func _build_start_menu() -> void:
 	get_tree().paused = true
 	_start_btn.call_deferred("grab_focus")
 
+## Classic (default, endless) vs Time Trial (race the clock to a finish line — see
+## HCTimeTrialScript). A segmented pair of toggle buttons rather than a checkbox so both
+## states are always visible at a glance. Sprint-only maps (canyon) ignore this
+## entirely — see _reset_run_mode_state.
+func _build_mode_toggle(parent: Node) -> void:
+	var row := HBoxContainer.new()
+	row.alignment = BoxContainer.ALIGNMENT_CENTER
+	row.add_theme_constant_override("separation", 8)
+	parent.add_child(row)
+	_mode_btns.clear()
+	for mode_key in ["classic", "trial"]:
+		var b := Button.new()
+		b.text = "🏁  CLASSIC" if mode_key == "classic" else "⏱  TIME TRIAL"
+		b.toggle_mode = true
+		b.custom_minimum_size = Vector2(170, 38)
+		b.add_theme_font_size_override("font_size", 15)
+		b.pressed.connect(_on_title_mode_button.bind(mode_key))
+		row.add_child(b)
+		_mode_btns[mode_key] = b
+	_refresh_mode_buttons()
+
+func _on_title_mode_button(mode_key: String) -> void:
+	if _audio:
+		_audio.call("play_click")
+	if mode_key == _run_mode:
+		return
+	_run_mode = mode_key
+	_reset_run_mode_state()
+	_refresh_mode_buttons()
+	_refresh_map_buttons()
+	_save_game()
+
+func _refresh_mode_buttons() -> void:
+	for k in _mode_btns:
+		if is_instance_valid(_mode_btns[k]):
+			(_mode_btns[k] as Button).button_pressed = (k == _run_mode)
+
+## One map "card": a toggle Button styled as a panel (accent-tinted border, brighter
+## when selected/hovered) with its real content — name/description/stat line — laid
+## on top as IGNORE-mouse-filter children so clicks fall through to the Button
+## underneath. custom_minimum_size keeps every card the same footprint regardless of
+## how long its description runs.
+func _build_map_card(parent: Node, mk: String) -> void:
+	var m: Dictionary = MAPS[mk]
+	var accent: Color = m.get("accent", Color(0.6, 0.62, 0.68))
+	var card := Button.new()
+	card.text = ""
+	card.toggle_mode = true
+	card.focus_mode = Control.FOCUS_ALL
+	card.custom_minimum_size = Vector2(330, 108)
+	card.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	card.tooltip_text = str(m.desc)
+	var normal_sb := _panel_style(Color(0.09, 0.095, 0.12, 0.9), Color(accent.r, accent.g, accent.b, 0.35), 1, 10)
+	var hover_sb := _panel_style(Color(0.12, 0.125, 0.16, 0.94), accent, 2, 10)
+	var pressed_sb := _panel_style(Color(0.1, 0.11, 0.15, 0.97), accent, 3, 10)
+	card.add_theme_stylebox_override("normal", normal_sb)
+	card.add_theme_stylebox_override("hover", hover_sb)
+	card.add_theme_stylebox_override("pressed", pressed_sb)
+	card.add_theme_stylebox_override("focus", hover_sb)
+	card.pressed.connect(_on_title_map_button.bind(mk))
+	parent.add_child(card)
+
+	var cpad := MarginContainer.new()
+	cpad.set_anchors_preset(Control.PRESET_FULL_RECT)
+	cpad.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	for cm in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
+		cpad.add_theme_constant_override(cm, 10)
+	card.add_child(cpad)
+	var vb := VBoxContainer.new()
+	vb.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	vb.add_theme_constant_override("separation", 3)
+	cpad.add_child(vb)
+
+	var name_lbl := Label.new()
+	name_lbl.text = str(m.name)
+	name_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	name_lbl.add_theme_font_size_override("font_size", 18)
+	name_lbl.add_theme_color_override("font_color", accent)
+	vb.add_child(name_lbl)
+
+	var desc_lbl := Label.new()
+	desc_lbl.text = str(m.desc)
+	desc_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	desc_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	desc_lbl.clip_text = true
+	desc_lbl.custom_minimum_size = Vector2(300, 38)
+	desc_lbl.add_theme_font_size_override("font_size", 12)
+	desc_lbl.add_theme_color_override("font_color", Color(0.68, 0.7, 0.76))
+	vb.add_child(desc_lbl)
+
+	var hs := HSeparator.new()
+	hs.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	vb.add_child(hs)
+	var stat_lbl := Label.new()
+	stat_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	stat_lbl.add_theme_font_size_override("font_size", 12)
+	stat_lbl.add_theme_color_override("font_color", Color(0.85, 0.88, 0.92))
+	vb.add_child(stat_lbl)
+	_map_btns[mk] = card
+	_map_card_stat_lbl[mk] = stat_lbl
+
+## Title-screen vehicle strip: pick the STARTING ride without opening the Garage.
+## Owned rides are selectable; locked ones show a price/lock and just tooltip-hint
+## "unlock in the Garage" rather than letting you buy from the title screen (buying
+## needs the shop's money readout/context, which doesn't exist here).
+func _build_title_vehicle_row(parent: Node) -> void:
+	_shop_label(parent, "VEHICLE", 13, Color(0.6, 0.64, 0.72))
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 6)
+	parent.add_child(row)
+	_veh_title_btns.clear()
+	for vk in VEH_KEYS:
+		var b := Button.new()
+		b.toggle_mode = true
+		b.custom_minimum_size = Vector2(0, 38)
+		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		b.add_theme_font_size_override("font_size", 12)
+		b.pressed.connect(_on_title_vehicle_button.bind(vk))
+		row.add_child(b)
+		_veh_title_btns[vk] = b
+	_refresh_title_vehicle_buttons()
+
+func _on_title_vehicle_button(vk: String) -> void:
+	if _audio:
+		_audio.call("play_click")
+	if _vehicle == vk or not bool(_owned.get(vk, false)):
+		return   # locked rides are unlocked from the Garage (Tab), not here
+	_swap_vehicle(vk)
+	_refresh_title_vehicle_buttons()
+	_refresh_map_buttons()   # best-TIME column is per-vehicle; the active ride just changed
+
+func _refresh_title_vehicle_buttons() -> void:
+	for vk in VEH_KEYS:
+		if not _veh_title_btns.has(vk) or not is_instance_valid(_veh_title_btns[vk]):
+			continue
+		var b: Button = _veh_title_btns[vk]
+		var owned: bool = bool(_owned.get(vk, false))
+		b.button_pressed = (_vehicle == vk)
+		b.disabled = not owned
+		if _vehicle == vk:
+			b.text = "✓ " + str(VEHICLES[vk].name)
+		elif owned:
+			b.text = str(VEHICLES[vk].name)
+		else:
+			b.text = "🔒 " + str(VEHICLES[vk].name)
+		b.tooltip_text = str(VEHICLES[vk].desc) if owned else "%s — $%d (unlock in the Garage)" % [str(VEHICLES[vk].name), int(VEHICLES[vk].price)]
+
 ## Leave the title screen: unpause and drop the overlay.
 func _begin_game() -> void:
 	if _audio:
@@ -1246,6 +1574,164 @@ func _begin_game() -> void:
 	if _start_layer:
 		_start_layer.queue_free()
 		_start_layer = null
+
+# --- pause menu: ESC during a live run (not the title, not the garage) -------------
+
+var _pause_layer: CanvasLayer
+var _pause_resume_btn: Button
+var _fullscreen_btn: Button
+var master_volume := 1.0   # linear 0-1, persisted; pushed onto _audio (see _apply_volume)
+
+## Build the pause overlay once (hidden) — same "build hidden, toggle .visible" shape
+## as the shop, and the same PROCESS_MODE_ALWAYS + get_tree().paused pattern the title
+## screen uses (CLAUDE.md invariant: anything that pauses the tree must opt itself out
+## of that pause to keep receiving input).
+func _build_pause_menu() -> void:
+	_pause_layer = CanvasLayer.new()
+	_pause_layer.layer = 15   # above the shop (10) and HUD, below the title (20)
+	_pause_layer.process_mode = Node.PROCESS_MODE_ALWAYS
+	_pause_layer.visible = false
+	add_child(_pause_layer)
+	var dim := ColorRect.new()
+	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	dim.color = Color(0.02, 0.02, 0.05, 0.82)
+	_pause_layer.add_child(dim)
+	var center := CenterContainer.new()
+	center.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_pause_layer.add_child(center)
+	var panel := PanelContainer.new()
+	panel.custom_minimum_size = Vector2(380, 0)
+	_style_panel(panel, Color(0.08, 0.09, 0.12, 0.97), Color(0.4, 0.44, 0.55), 1, 14)
+	center.add_child(panel)
+	var pad := MarginContainer.new()
+	for m in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
+		pad.add_theme_constant_override(m, 22)
+	panel.add_child(pad)
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 10)
+	pad.add_child(box)
+
+	_shop_label(box, "PAUSED", 26, Color(1, 0.82, 0.42))
+	box.add_child(HSeparator.new())
+
+	_pause_resume_btn = _menu_button(box, "▶  Resume", _toggle_pause_menu)
+	# HCMain._input is gated by the SceneTree pause (Node process_mode PAUSABLE, the
+	# default) so it can't hear ESC while paused — only this ALWAYS-mode subtree can.
+	# A Shortcut on the Resume button routes ESC through Control's own (pause-exempt)
+	# shortcut-input path instead, so ESC both opens AND closes the pause menu.
+	var esc_shortcut := Shortcut.new()
+	esc_shortcut.events = [_key(KEY_ESCAPE)]
+	_pause_resume_btn.shortcut = esc_shortcut
+	_menu_button(box, "⟲  Restart Run", _pause_restart)
+	_menu_button(box, "🏠  Main Menu", _go_to_main_menu)
+	_fullscreen_btn = _menu_button(box, "⛶  Fullscreen", _toggle_fullscreen)
+
+	box.add_child(HSeparator.new())
+	var vol_row := HBoxContainer.new()
+	vol_row.add_theme_constant_override("separation", 10)
+	box.add_child(vol_row)
+	var vol_lbl := Label.new()
+	vol_lbl.text = "Volume"
+	vol_lbl.add_theme_font_size_override("font_size", 14)
+	vol_lbl.add_theme_color_override("font_color", Color(0.5, 0.52, 0.58))
+	vol_lbl.custom_minimum_size = Vector2(70, 0)
+	vol_row.add_child(vol_lbl)
+	var vol_slider := HSlider.new()
+	vol_slider.min_value = 0; vol_slider.max_value = 100
+	vol_slider.value = master_volume * 100.0
+	vol_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	vol_slider.value_changed.connect(_on_volume_changed)
+	vol_row.add_child(vol_slider)
+	var vol_note := _shop_label(box, "(no audio yet — the setting persists and applies when sound lands)", 11, Color(0.45, 0.47, 0.52))
+	vol_note.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+
+## Volume slider → persisted setting, pushed onto _audio when audio finally lands.
+## The parallel audio pass exposes master_volume (linear 0-1) on HCAudio; this is the
+## exact hook: whoever instances HCAudio should also call _apply_volume() once.
+func _on_volume_changed(v: float) -> void:
+	master_volume = clampf(v / 100.0, 0.0, 1.0)
+	_apply_volume()
+	_save_game()
+
+func _apply_volume() -> void:
+	if _audio:
+		_audio.set("master_volume", master_volume)
+
+## Continuous audio: engine follows speed/throttle every frame; drift/boost loops
+## start/stop on state EDGES (the synth manages its own envelopes, so re-calling
+## start every frame would retrigger the attack).
+func _update_audio(_delta: float) -> void:
+	if not _audio or _car == null:
+		return
+	var car_dead: bool = _car.get("dead")
+	var spd: float = _car.linear_velocity.length()
+	var max_spd: float = maxf(float(_car.get("max_speed")), 1.0)
+	var throttle: float = 0.0 if car_dead else float(_car.get("_prev_drive"))
+	_audio.call("set_engine", clampf(spd / max_spd, 0.0, 1.0), throttle)
+	var is_drifting: bool = not car_dead and bool(_car.get("drifting"))
+	if is_drifting != _was_drifting:
+		_audio.call("start_drift" if is_drifting else "stop_drift")
+		_was_drifting = is_drifting
+	var is_boosting: bool = not car_dead and bool(_car.get("boosting"))
+	if is_boosting != _was_boosting:
+		_audio.call("start_boost" if is_boosting else "stop_boost")
+		_was_boosting = is_boosting
+
+## One consistently-styled full-width menu button; returns it so callers can keep a ref.
+func _menu_button(parent: Node, text: String, on_press: Callable) -> Button:
+	var b := Button.new()
+	b.text = text
+	b.custom_minimum_size = Vector2(0, 44)
+	b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	b.add_theme_font_size_override("font_size", 16)
+	b.pressed.connect(on_press)
+	parent.add_child(b)
+	return b
+
+## ESC toggles the pause overlay during a live run only — a no-op over the title
+## screen or the garage/wreck shop so the three full-screen states never fight.
+func _toggle_pause_menu() -> void:
+	if _pause_layer == null or _start_layer != null:
+		return
+	if _shop and _shop.visible:
+		return
+	if _pause_layer.visible:
+		_pause_layer.visible = false
+		get_tree().paused = false
+	else:
+		if _audio:
+			_audio.call("play_click")
+		_refresh_fullscreen_btn()
+		_pause_layer.visible = true
+		get_tree().paused = true
+		if _pause_resume_btn:
+			_pause_resume_btn.call_deferred("grab_focus")
+
+## "Restart Run" from the pause menu: run the normal restart flow, then close the overlay.
+func _pause_restart() -> void:
+	_restart()
+	_toggle_pause_menu()
+
+func _toggle_fullscreen() -> void:
+	var win := get_window()
+	win.mode = Window.MODE_WINDOWED if win.mode == Window.MODE_FULLSCREEN else Window.MODE_FULLSCREEN
+	_refresh_fullscreen_btn()
+
+func _refresh_fullscreen_btn() -> void:
+	if _fullscreen_btn:
+		var is_full := get_window().mode == Window.MODE_FULLSCREEN
+		_fullscreen_btn.text = "⛶  Windowed Mode" if is_full else "⛶  Fullscreen"
+
+## Save + reload the whole scene fresh, landing back on the (paused) title screen —
+## the simplest correct way to "return to main menu" given how much live state a run
+## touches (terrain, car, camera, HUD); reusing boot's own setup path beats hand-
+## unwinding all of it here.
+func _go_to_main_menu() -> void:
+	if _audio:
+		_audio.call("play_click")
+	_save_game()
+	get_tree().paused = false
+	get_tree().reload_current_scene()
 
 func _build_shop() -> void:
 	var layer := CanvasLayer.new()
@@ -1266,6 +1752,7 @@ func _build_shop() -> void:
 	panel.set_anchors_preset(Control.PRESET_CENTER)
 	panel.custom_minimum_size = Vector2(672, 700)
 	panel.position = Vector2(-336, -350)
+	_style_panel(panel, Color(0.07, 0.075, 0.1, 0.97), Color(0.32, 0.34, 0.42), 1, 16)   # same look as the title/pause overlays
 	_shop.add_child(panel)
 	var pad := MarginContainer.new()
 	for m in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
@@ -1276,7 +1763,9 @@ func _build_shop() -> void:
 	pad.add_child(box)
 
 	_shop_header = _shop_label(box, "", 26, Color(1, 0.82, 0.42))
+	_shop_header.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_shop_money = _shop_label(box, "", 19, Color(0.65, 1.0, 0.7))
+	_shop_money.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	var sep := HSeparator.new()
 	box.add_child(sep)
 
@@ -1642,12 +2131,31 @@ func _shop_label(parent: Node, text: String, size: int, col: Color) -> Label:
 	parent.add_child(l)
 	return l
 
+## Shared "dark card" look for the title screen / pause menu / map cards — one place
+## to keep every overlay panel visually consistent instead of each screen inventing
+## its own StyleBoxFlat.
+func _panel_style(bg: Color, border: Color, border_w: int = 1, radius: int = 12) -> StyleBoxFlat:
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = bg
+	sb.border_color = border
+	sb.set_border_width_all(border_w)
+	sb.set_corner_radius_all(radius)
+	sb.content_margin_left = 14; sb.content_margin_right = 14
+	sb.content_margin_top = 10; sb.content_margin_bottom = 10
+	return sb
+
+## Apply the shared panel look to an existing PanelContainer.
+func _style_panel(p: PanelContainer, bg: Color, border: Color, border_w: int = 1, radius: int = 12) -> void:
+	p.add_theme_stylebox_override("panel", _panel_style(bg, border, border_w, radius))
+
 var _shop_summary := ""
 
 func _show_shop() -> void:
 	_shop_header.text = "WRECKED!"
 	var best_m := int(float(_best.get(_map, 0.0)))
 	_shop_summary = "You reached %d m  —  earned +$%d this run\nBEST: %d m" % [int(_car.get("distance")), _last_earned, best_m]
+	if _trial_result != "":
+		_shop_summary += "\n" + _trial_result   # trial finish recap, if this run crossed the line
 	_shop.visible = true
 	_refresh_shop()
 	# focus RETRY so a gamepad can just press A to go again (d-pad to browse upgrades)
@@ -1724,7 +2232,7 @@ func _swap_vehicle(vk: String) -> void:
 	_apply_upgrades()
 	_cam_heading = Vector3(0, 0, -1)
 	_was_dead = false
-	_reset_sprint_state()
+	_reset_run_mode_state()
 	_save_game()   # persists both the purchase (if any) and the new active vehicle
 	if was_visible:
 		_refresh_shop()
@@ -1750,6 +2258,9 @@ func _fresh_start() -> void:
 		_cosm_owned[ck] = false
 		_cosm_color[ck] = COSMETICS[ck].default
 	_body_kits = {}   # back to stock shells on every ride
+	_run_mode = "classic"
+	_best_time = {}
+	_ghost_data = {}
 	if save_enabled and FileAccess.file_exists(SAVE_PATH):
 		DirAccess.remove_absolute(SAVE_PATH)   # wipe the on-disk save, not just memory
 	_swap_vehicle("minivan")                          # rebuild the car clean + re-apply zeros
@@ -1796,10 +2307,15 @@ func _refresh_shop() -> void:
 		if lvl >= UP_MAX:
 			buy.text = "MAX"
 			buy.disabled = true
+			buy.add_theme_color_override("font_color", Color(1.0, 0.84, 0.4))
 		else:
 			var c: int = _cost(key)
+			var can_afford: bool = money >= c
 			buy.text = "$%d" % c
-			buy.disabled = money < c
+			buy.disabled = not can_afford
+			# affordance: a buyable upgrade reads GREEN, one you can't afford yet reads
+			# muted grey — same "can I press this" read the map/mode toggles use
+			buy.add_theme_color_override("font_color", Color(0.55, 1.0, 0.6) if can_afford else Color(0.55, 0.56, 0.6))
 		var sell: Button = row.sell
 		if lvl > 0:
 			sell.text = "+$%d" % int(UP_BASECOST[key] * pow(UP_COSTMULT, lvl - 1) * SELL_REFUND)
@@ -1960,6 +2476,24 @@ func _setup_hud() -> void:
 	_sprint_lbl.add_theme_font_size_override("font_size", 44)
 	_sprint_lbl.add_theme_color_override("font_color", Color(0.6, 1.0, 0.7))
 	layer.add_child(_sprint_lbl)
+	# time-trial timer shares the sprint countdown's screen slot — the two modes are
+	# mutually exclusive per run (see _reset_run_mode_state), so they never overlap.
+	_trial_lbl = Label.new()
+	_trial_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	_trial_lbl.position = Vector2(-120, 54)
+	_trial_lbl.custom_minimum_size = Vector2(240, 0)
+	_trial_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_trial_lbl.add_theme_font_size_override("font_size", 40)
+	_trial_lbl.add_theme_color_override("font_color", Color(1, 1, 1))
+	layer.add_child(_trial_lbl)
+	_trial_sub_lbl = Label.new()
+	_trial_sub_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	_trial_sub_lbl.position = Vector2(-200, 100)
+	_trial_sub_lbl.custom_minimum_size = Vector2(400, 0)
+	_trial_sub_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_trial_sub_lbl.add_theme_font_size_override("font_size", 14)
+	_trial_sub_lbl.add_theme_color_override("font_color", Color(0.75, 0.8, 0.88))
+	layer.add_child(_trial_sub_lbl)
 	_trick_lbl = Label.new()
 	_trick_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
 	_trick_lbl.position = Vector2(-240, 120)
@@ -2004,6 +2538,7 @@ func _update_hud() -> void:
 	_score_lbl.text = "SCORE %d" % int(_car.get("score"))
 	_trick_lbl.text = _car.get("trick_text")
 	_update_sprint_hud()
+	_update_trial_hud()
 	_update_gap_telegraph()
 
 ## Sprint-mode countdown: hidden on classic maps, big + red under 10s on sprint maps.
@@ -2013,6 +2548,29 @@ func _update_sprint_hud() -> void:
 		return
 	_sprint_lbl.text = "%d" % ceili(_sprint_time)
 	_sprint_lbl.add_theme_color_override("font_color", Color(1.0, 0.3, 0.3) if _sprint_time < 10.0 else Color(0.6, 1.0, 0.7))
+
+## Time-trial countdown-up: live timer + a small "to go / best / medals" readout.
+## Shares the sprint label's screen real estate (never both active on the same map)
+## so the top-center HUD zone never crowds two big timers at once.
+func _update_trial_hud() -> void:
+	if not _trial_active or _car == null:
+		_trial_lbl.text = ""
+		_trial_sub_lbl.text = ""
+		return
+	if bool(_car.get("dead")) and not _trial_finished:
+		return   # freeze the last live reading through the death/shop transition
+	_trial_lbl.text = HCTimeTrialScript.format_time(_trial_time)
+	var key := _trial_key(_map, _vehicle)
+	var best: float = float(_best_time.get(key, -1.0))
+	var best_txt: String = ("best " + HCTimeTrialScript.format_time(best)) if best >= 0.0 else "no record yet"
+	if _trial_finished:
+		var medal := HCTimeTrialScript.medal_for(_map, _trial_time)
+		_trial_lbl.add_theme_color_override("font_color", HCTimeTrialScript.medal_color(medal) if medal != "" else Color(0.6, 1.0, 0.7))
+		_trial_sub_lbl.text = "FINISHED  %s   %s" % [HCTimeTrialScript.medal_glyph(medal), best_txt]
+	else:
+		_trial_lbl.add_theme_color_override("font_color", Color(1, 1, 1))
+		var remain: float = maxf(HCTimeTrialScript.finish_distance(_map) - float(_car.get("distance")), 0.0)
+		_trial_sub_lbl.text = "%dm to go   %s   %s" % [int(remain), best_txt, HCTimeTrialScript.ladder_text(_map)]
 
 ## Warn the player to build speed on a gap run-up (green = you'll make it).
 func _update_gap_telegraph() -> void:

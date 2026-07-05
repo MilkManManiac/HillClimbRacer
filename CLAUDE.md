@@ -28,6 +28,8 @@ first so you can checkpoint and diff your own work.
 <console> --headless --path . tests/MapProbe.tscn       # all three maps boot + drive
 <console> --headless --path . tests/TitleFlowProbe.tscn # title → map click → START → alive
 <console> --headless --path . tests/CarBodyProbe.tscn   # GLB car bodies load/scale
+<console> --headless --path . tests/TrialProbe.tscn     # time-trial: timer/record/ghost/medals
+<console> --headless --path . tests/AudioProbe.tscn     # synth buffers non-silent, non-clipping
 ```
 
 Baseline SmoothProbe numbers (HC v5): `vert_accel rms=2.70` (worst ~26), `pitch_jerk
@@ -73,8 +75,11 @@ materials, UI) in code — no new scene/asset dependencies unless there's a real
 (GLBs live in `assets/`, loaded at runtime via `scripts/GlbUtil.gd`; car bodies via
 `scripts/hc/HCCarBody.gd`). Record licenses in `CREDITS.md` (CC-BY needs attribution).
 
-Audio is intentionally OFF (`_audio = null` in HCMain) until the user sources better
-sounds; keep every audio call guarded by `if _audio:`.
+Audio is ON as of HC v6 — the procedural HCAudio synth (per-vehicle engine, drift/boost
+loops, one-shot SFX; `master_volume` persisted, set from the pause menu). Keep every call
+guarded by `if _audio:` — nulling `_audio` in `HCMain._setup_terrain_and_car` silences
+the whole game if the owner rejects the mix. Owner audition still pending
+(`tests/AudioDemo.tscn`, run WITHOUT `--headless`, ~28 s labelled tour).
 
 ## Fan-out
 

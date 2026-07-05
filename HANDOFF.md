@@ -23,6 +23,33 @@ Design pillars (in priority order):
    all-drift sprint against the clock, big-air snow ridge. More flavors welcome.
 5. **Session-friendly.** Death → shop → retry in seconds. No friction.
 
+## Update (2026-07-04, fourth pass — "HC v6")
+
+- **Owner playtested the maps (finally!)**: Sunset Canyon APPROVED — favorite by far,
+  "challenging but super fun" with fast cars; its tuning is the feel reference. Midnight
+  Run: fun. Alpine: trees spawn ON the road (fix in flight). The **pop/hop bug survived
+  the v5 fix** — root-caused to nearest-segment projection branch flips where the track
+  self-approaches (canyon: road_half_turn 32 > turn_radius_min 26; the car collides with
+  nothing physically — HCCar mask=2 vs tiles layer 1), fix in flight with the loop-track
+  work. Fast cars overshoot jumps into curves / slide off landings — next tuning target.
+- **UI overhaul**: rebuilt title (logo, CLASSIC/TIME TRIAL toggle, per-map accent cards
+  with live stats, vehicle strip with lock states), ESC pause menu (resume/restart/menu/
+  fullscreen/volume), styled shop/wreck, all adaptive-container 720p-safe.
+- **Time-trial mode**: per-map finish lines (HCTimeTrial.FINISH_M), best times keyed
+  map|vehicle in the save, bronze/silver/gold medals (bot-calibrated), 20 Hz **ghost
+  record/playback** (HCGhost.gd, versioned float-array format — deliberately the seed
+  for async multiplayer). Canyon's sprint mode is untouched; trial composes with the
+  death→shop loop. `tests/TrialProbe.tscn` (22 checks) guards all of it.
+- **Audio is ON**: HCAudio rewritten — per-vehicle engine synth (van rumble → F1 scream),
+  drift squeal, boost roar, impact-scaled landing thuds, coin/cash/checkpoint/wreck/UI
+  one-shots, master volume from the pause menu. All calls stay `if _audio:` guarded;
+  owner audition pending (`tests/AudioDemo.tscn`).
+- **Multiplayer researched** (`docs/MULTIPLAYER.md`): recommended path is async — ghost
+  files → online leaderboard + ghost download (Cloudflare Worker or Talo) → realtime
+  non-collided ghost-cars (ENet). Collided racing: rejected (feel risk, determinism).
+- In flight: loops/corkscrew/over-under track tech + showcase map (multi-surface ground
+  queries with continuity — same machinery fixes the pop bug and alpine trees).
+
 ## Update (2026-07-03, third pass — "HC v5")
 
 - **Random pop/hop bug fixed** (anti-tunnel floor now per-corner with a 0.35 m dead-band);
