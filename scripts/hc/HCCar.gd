@@ -56,14 +56,12 @@ var terrain: Node3D   # set by HCMain; used to catch ground tunneling
 var _rays: Array[RayCast3D] = []
 var _wheel_meshes: Array[MeshInstance3D] = []
 var _wheel_positions: Array[Vector3] = []
+var _wheel_base_width: float = -1.0   # tyre WIDTH, frozen at first build (Bigger Wheels grows radius only)
 var _springs: Array[MeshInstance3D] = []   # visible coil-over per wheel (Suspension upgrade)
 var _spring_beef: float = 0.7              # coil thickness, grows with Suspension level
 var _wings: Array[Node3D] = []
 var _ailerons: Array[Node3D] = []
 var _rudder: Node3D
-var _engine: Node3D
-var _cage: Node3D
-var _cage_tiers: Array[Node3D] = []
 var _airbrake: Node3D
 var _cans: Array[MeshInstance3D] = []
 var _dust: GPUParticles3D        # small landing dust (soft touchdowns)
@@ -203,8 +201,6 @@ func _ready() -> void:
 	_build_springs()
 	_build_body()
 	_build_wings()
-	_build_engine()
-	_build_cage()
 	_build_airbrake()
 	_build_cans()
 	_build_dust()
@@ -864,16 +860,16 @@ func _build_springs() -> void:
 func apply_suspension(level: int) -> void:
 	_spring_beef = 0.55 + float(level) * 0.11
 
-## Raise/spread the bolt-on upgrade parts (wings, rudder, rockets, engine, cage,
-## cans, air-brake) so they sit on a bigger ride instead of clustering at hot-rod
-## scale near the wheels. Positions are multiplied by the monster hull's scale-up so
-## each part lands at the analogous spot; the scale itself comes from _part_scale
-## (baked into apply_wings/apply_rockets/apply_engine) or set directly here for the
-## visibility-only parts (cage / cans / air-brake) whose apply_* never touch scale.
+## Raise/spread the bolt-on upgrade parts (wings, rudder, rockets, cans, air-brake)
+## so they sit on a bigger ride instead of clustering at hot-rod scale near the
+## wheels. Positions are multiplied by the monster hull's scale-up so each part
+## lands at the analogous spot; the scale itself comes from _part_scale (baked
+## into apply_wings/apply_rockets) or set directly here for the visibility-only
+## parts (cans / air-brake) whose apply_* never touch scale.
 func _fit_parts() -> void:
 	# imported shell: only the HEIGHTS need refitting (footprint already matches the
 	# vehicle's collision box, but the roof can sit anywhere) — lift the bolt-ons so
-	# wings/rockets/cage land ON the model instead of inside it, then stop; the
+	# wings/rockets land ON the model instead of inside it, then stop; the
 	# monster's hand-tuned block below is for its procedural hull only.
 	if _glb_top > 0.0:
 		var ppy: float = clampf(_glb_top / 1.25, 0.85, 2.2)   # 1.25 = procedural hot-rod roofline
@@ -882,7 +878,7 @@ func _fit_parts() -> void:
 		gmove.append_array(_rockets)
 		for c in _cans:
 			gmove.append(c)
-		for n in [_rudder, _engine, _airbrake, _cage]:
+		for n in [_rudder, _airbrake]:
 			if n:
 				gmove.append(n)
 		for n in gmove:
@@ -896,15 +892,13 @@ func _fit_parts() -> void:
 	move.append_array(_rockets)
 	for c in _cans:
 		move.append(c)
-	for n in [_rudder, _engine, _airbrake, _cage]:
+	for n in [_rudder, _airbrake]:
 		if n:
 			move.append(n)
 	for n in move:
 		n.position = n.position * pp
 	# parts whose apply_* set only visibility must be enlarged here
 	var sc := Vector3(_part_scale, _part_scale, _part_scale)
-	if _cage:
-		_cage.scale = sc
 	if _airbrake:
 		_airbrake.scale = sc
 	for c in _cans:
@@ -981,14 +975,18 @@ func _build_rays() -> void:
 func apply_wheel_size() -> void:
 	for ray in _rays:
 		ray.target_position = Vector3(0, -(suspension_rest + wheel_radius + 0.35), 0)
+	# tyre WIDTH is fixed at this car's base radius the first time we ever size the
+	# wheels (before any Bigger Wheels level lands) and never touched again — the
+	# upgrade grows wheel_radius (taller wheels, more ride-height clearance; a real
+	# physics value other code depends on) but must NOT visually widen the tyre.
+	if _wheel_base_width < 0.0:
+		_wheel_base_width = clampf(wheel_radius * 1.15, 0.42, 2.6)
 	for i in range(_wheel_meshes.size()):
 		var wm := _wheel_meshes[i]
 		var cyl: CylinderMesh = wm.mesh
 		cyl.top_radius = wheel_radius
 		cyl.bottom_radius = wheel_radius
-		# wheels get noticeably WIDER as they grow with the Bigger Wheels upgrade
-		# (cyl height = tyre width, axle along X). Higher cap so maxed wheels read fat.
-		cyl.height = clampf(wheel_radius * 1.15, 0.42, 2.6)
+		cyl.height = _wheel_base_width
 		var base: Vector3 = _wheel_positions[i]
 		# bottom of wheel sits at the rest ground level (local y = 0.5 - suspension_rest)
 		wm.position = Vector3(base.x, 0.5 - suspension_rest + wheel_radius, base.z)
@@ -1155,6 +1153,22 @@ func _build_body() -> void:
 	for px in [-0.16, 0.0, 0.16]:
 		_chrome_cyl(_body, 0.035, 0.3, Vector3(px, 1.28, -0.9), Vector3(0, 0, 0), 0.15)
 
+	# --- SIDE PIPES: the hot-rod's signature exhaust, run along the rocker and
+	# exit ahead of the rear wheel with a flared chrome tip (instead of a quiet
+	# rear-bumper exit) ---------------------------------------------------------
+	for sxp in [-1.0, 1.0]:
+		_tube(_body, Vector3(0.99 * sxp, 0.3, -0.35), Vector3(0.99 * sxp, 0.3, 0.95), 0.055, _chrome(0.1))
+		_chrome_cyl(_body, 0.075, 0.16, Vector3(0.99 * sxp, 0.3, 1.03), Vector3(90, 0, 0), 0.08)
+	# a couple of weld-node clamps holding the pipe to the rocker
+	for sxp2 in [-1.0, 1.0]:
+		_weld_node(_body, Vector3(0.99 * sxp2, 0.3, -0.1), 0.06)
+		_weld_node(_body, Vector3(0.99 * sxp2, 0.3, 0.5), 0.06)
+
+	# --- flourishes: fuel filler, whip antenna, front tow hook ------------------
+	_fuel_cap(_body, 0.97, 0.86, 1.55)
+	_antenna(_body, -0.85, 1.62, -1.55, 0.5)
+	_chrome_cyl(_body, 0.03, 0.16, Vector3(0, 0.42, -1.98), Vector3(90, 0, 0), 0.2)
+
 ## A boxy lifted 4x4 — a deliberately different silhouette from the hot-rod so the
 ## Monster Truck reads at a glance: tall slab cab, roll bar with light pod, flat
 ## bed, chunky guards. The huge wheels + ride height come from its VEHICLES tuning
@@ -1192,6 +1206,10 @@ func _build_monster_body() -> void:
 	for sx in [-1.0, 1.0]:
 		var ws := _panel(hull, Vector3(0.06, 0.5, 1.6), Vector3(0.99 * sx, 1.98, -0.6), Color(1,1,1), 0.05)
 		ws.material_override = glass
+	# driver seat back + steering wheel hint, glimpsed through the side glass
+	# (the tall cab was the one body with an empty greenhouse)
+	_panel(hull, Vector3(0.5, 0.5, 0.4), Vector3(0.4, 1.55, -0.4), dark, 0.7)
+	_chrome_cyl(hull, 0.13, 0.03, Vector3(0.4, 1.65, -1.05), Vector3(70, 0, 0), 0.3)
 	_panel(hull, Vector3(2.0, 0.16, 1.8), Vector3(0, 2.34, -0.6), body_dk, 0.4)     # roof cap
 	# cab door seam + handle + a two-tone contrast panel (lower cab skirt)
 	for sx in [-1.0, 1.0]:
@@ -1249,6 +1267,25 @@ func _build_monster_body() -> void:
 	for sx in [-1.0, 1.0]:
 		_chrome_cyl(hull, 0.03, 0.3, Vector3(1.1 * sx, 1.75, -1.35), Vector3(0, 0, 65 * sx))
 		_panel(hull, Vector3(0.05, 0.2, 0.26), Vector3(1.26 * sx, 1.86, -1.35), dark, 0.3, 0.4)
+
+	# --- front winch: a drum sitting just above the bumper + a couple of taut
+	# cable lines (in _body space, not hull, so it lines up with the front bar
+	# which is a hull child pre-multiplied by hull.scale — offset UP and back a
+	# little so it doesn't co-locate/z-fight with the bumper bar itself)
+	var winch_pos := Vector3(0, 0.9 * 1.65 + 0.24, -2.95 * 1.4 + 0.2)
+	_chrome_cyl(_body, 0.13, 0.34, winch_pos, Vector3(0, 0, 90), 0.35)
+	for wc in [-0.1, 0.1]:
+		_tube(_body, winch_pos + Vector3(wc, -0.05, 0), winch_pos + Vector3(wc, -0.3, -0.45), 0.012, _metal(Color(0.15, 0.15, 0.16)))
+
+	# --- CB whip antenna off the cab A-pillar (off-road truck signature) -------
+	_antenna(_body, -1.05 * 1.45, 2.3 * 1.65, -1.35 * 1.4, 0.9)
+
+	# --- huge brake rotors, visible past the fenderless monster wheels ---------
+	var mfx: float = float(_vs.fx)
+	var mfz: float = float(_vs.fz)
+	for sxw in [-1.0, 1.0]:
+		for szw in [-mfz, mfz]:
+			_brake(_body, mfx * sxw + sxw * (_wheel_base_width * 0.5 + 0.05), 0.45, szw, 0.4, Color(0.85, 0.1, 0.08))
 
 # --- underglow (cosmetic) ----------------------------------------------------
 ## Emissive strips under the body + a tinted light that spills onto the road.
@@ -1392,6 +1429,22 @@ func _build_minivan_body() -> void:
 	wheel.rotation_degrees = Vector3(70, 0, 0)
 	_body.add_child(wheel)
 	_panel(_body, Vector3(0.5, 0.14, 0.42), Vector3(0.35, 0.85, -1.3), dark, 0.7)    # driver seat back, in silhouette
+	# second-row seat back, glimpsed through the rear side glass
+	_panel(_body, Vector3(0.5, 0.16, 0.4), Vector3(-0.3, 0.85, 0.15), dark, 0.7)
+
+	# --- van signature: ONE off-center tailpipe (not twin sports pipes) --------
+	_chrome_cyl(_body, 0.065, 0.5, Vector3(-0.55, 0.28, 2.15), Vector3(90, 0, 0), 0.15)
+
+	# --- flourishes: trailer hitch, roof antenna, fuel filler -------------------
+	_chrome_cyl(_body, 0.035, 0.14, Vector3(0, 0.3, 2.28), Vector3(90, 0, 0), 0.2)   # hitch shaft
+	var hitch_ball := MeshInstance3D.new()
+	var hbm := SphereMesh.new(); hbm.radius = 0.05; hbm.height = 0.1
+	hitch_ball.mesh = hbm
+	hitch_ball.material_override = _chrome(0.15)
+	hitch_ball.position = Vector3(0, 0.3, 2.35)
+	_body.add_child(hitch_ball)
+	_antenna(_body, 0.75, 1.78, -1.2, 0.55)
+	_fuel_cap(_body, 0.98, 0.95, 0.9)
 
 ## Low, wide, grippy sports car — the corner carver. Faces -Z.
 func _build_sports_body() -> void:
@@ -1436,6 +1489,17 @@ func _build_sports_body() -> void:
 	_panel(_body, Vector3(0.3, 0.02, 3.6), Vector3(0, 0.99, 0.0), Color(0.06, 0.06, 0.08), 0.4)
 	# a small driver seat glimpsed through the glass roof
 	_panel(_body, Vector3(0.44, 0.4, 0.12), Vector3(0.25, 0.98, 0.75), Color(0.08, 0.08, 0.09), 0.6)
+	# hood heat-extraction vents (twin recessed slots ahead of the windscreen)
+	for hx in [-0.35, 0.35]:
+		_panel(_body, Vector3(0.22, 0.03, 0.5), Vector3(hx, 0.77, -1.5), dark, 0.7)
+	# fuel filler flap on the sail panel, behind the door
+	_fuel_cap(_body, 0.99, 0.85, 0.55)
+	# performance brake rotors + contrast calipers, visible past the low open wheels
+	# (sports has no fender arch, so these read at gameplay distance without being
+	# buried behind bodywork)
+	for sxw in [-1.0, 1.0]:
+		for szw in [-1.55, 1.55]:
+			_brake(_body, 1.05 * sxw + sxw * (_wheel_base_width * 0.5 + 0.04), 0.42, szw, 0.32, Color(0.95, 0.65, 0.05))
 
 ## Open-wheel F1 — narrow tub, long nose, front & rear wings, airbox, halo, and
 ## sponsor-block wing endplates. Faces -Z.
@@ -1495,6 +1559,24 @@ func _build_f1_body() -> void:
 			hub.position = Vector3(hub_x * sx, 0.5, sz)
 			hub.rotation_degrees = Vector3(0, 0, 90 * sx)
 			_body.add_child(hub)
+
+	# --- brake rotors, visible through the fully-open wheels (past the hub cone) ---
+	for sxw in [-1.0, 1.0]:
+		for szw in [-hub_z, hub_z]:
+			_brake(_body, hub_x * sxw + sxw * (_wheel_base_width * 0.5 + 0.02), 0.5, szw, 0.22, sponsor)
+
+	# --- F1 CENTER-EXIT exhaust: a single pipe poking out just behind the airbox
+	# (the real F1 signature, unlike a road car's twin corner pipes) --------------
+	_chrome_cyl(_body, 0.05, 0.3, Vector3(0, 0.9, 1.55), Vector3(90, 0, 0), 0.1)
+	_emit_panel(_body, Vector3(0.08, 0.08, 0.03), Vector3(0, 0.9, 1.7), Color(1.0, 0.55, 0.15), 1.4)   # glowing tip
+
+	# --- small cockpit-side mirrors on thin stalks -------------------------------
+	for sx in [-1.0, 1.0]:
+		_chrome_cyl(_body, 0.015, 0.22, Vector3(0.42 * sx, 0.82, -0.55), Vector3(0, 0, 60 * sx))
+		_panel(_body, Vector3(0.03, 0.09, 0.14), Vector3(0.5 * sx, 0.9, -0.55), dark, 0.3, 0.5)
+
+	# --- short telemetry aerial on the airbox ------------------------------------
+	_antenna(_body, 0, 1.5, 1.0, 0.3)
 
 # --- body-detail helpers -----------------------------------------------------
 
@@ -1601,6 +1683,59 @@ func _door_handle(parent: Node3D, x: float, y: float, z: float) -> void:
 ## A license plate plaque (front or rear).
 func _plate(parent: Node3D, x: float, y: float, z: float) -> void:
 	_panel(parent, Vector3(0.32, 0.15, 0.02), Vector3(x, y, z), Color(0.86, 0.84, 0.72), 0.6)
+
+## A brake disc + caliper glimpsed through the wheel opening — STATIC relative to
+## the body (like the fenders; it does not track suspension bob or the Bigger
+## Wheels upgrade), so it reads as "real wheels" at gameplay camera distance
+## without any per-frame coupling. `r` is the disc radius (fit it a little inside
+## the vehicle's stock wheel_radius so it doesn't poke past the tyre).
+func _brake(parent: Node3D, x: float, y: float, z: float, r: float, caliper_col: Color) -> void:
+	var disc := MeshInstance3D.new()
+	var dm := CylinderMesh.new()
+	dm.top_radius = r; dm.bottom_radius = r; dm.height = 0.045
+	disc.mesh = dm
+	disc.material_override = _metal(Color(0.7, 0.7, 0.73), 0.28)
+	disc.rotation_degrees = Vector3(0, 0, 90)   # axle along X, same as the wheel it sits behind
+	disc.position = Vector3(x, y, z)
+	parent.add_child(disc)
+	var cal := MeshInstance3D.new()
+	var cb := BoxMesh.new()
+	cb.size = Vector3(0.05, r * 0.85, r * 0.5)
+	cal.mesh = cb
+	var cm := StandardMaterial3D.new()
+	cm.albedo_color = caliper_col
+	cm.roughness = 0.4
+	cal.material_override = cm
+	cal.position = Vector3(x, y + r * 0.35, z)
+	parent.add_child(cal)
+
+## A round flip-cap fuel filler on a rear quarter panel.
+func _fuel_cap(parent: Node3D, x: float, y: float, z: float) -> void:
+	var mi := MeshInstance3D.new()
+	var cm := CylinderMesh.new()
+	cm.top_radius = 0.09; cm.bottom_radius = 0.09; cm.height = 0.025
+	mi.mesh = cm
+	mi.material_override = _chrome(0.2)
+	mi.rotation_degrees = Vector3(90, 0, 0)
+	mi.position = Vector3(x, y, z)
+	parent.add_child(mi)
+
+## A thin whip antenna with a small tip ball.
+func _antenna(parent: Node3D, x: float, y: float, z: float, height: float) -> void:
+	var rod := MeshInstance3D.new()
+	var cm := CylinderMesh.new()
+	cm.top_radius = 0.012; cm.bottom_radius = 0.018; cm.height = height
+	rod.mesh = cm
+	rod.material_override = _metal(Color(0.1, 0.1, 0.11), 0.5)
+	rod.position = Vector3(x, y + height * 0.5, z)
+	parent.add_child(rod)
+	var tip := MeshInstance3D.new()
+	var sm := SphereMesh.new()
+	sm.radius = 0.02; sm.height = 0.04
+	tip.mesh = sm
+	tip.material_override = _metal(Color(0.1, 0.1, 0.11), 0.4)
+	tip.position = Vector3(x, y + height, z)
+	parent.add_child(tip)
 
 ## Rounded fenders / arches sitting above each of the four wheels (x≈±0.9, z≈±1.4).
 func _build_fenders(paint: Color, rubber: Color) -> void:
@@ -1849,49 +1984,7 @@ func _metal(col: Color, rough := 0.35) -> StandardMaterial3D:
 	m.roughness = rough
 	return m
 
-## A blower/supercharger + intake trumpets + side exhausts on the hood; grows with Engine.
-func _build_engine() -> void:
-	_engine = Node3D.new()
-	_engine.position = Vector3(0, 1.0, -1.4)
-	add_child(_engine)
-	var blk := MeshInstance3D.new()
-	var bm := BoxMesh.new()
-	bm.size = Vector3(0.62, 0.36, 0.72)
-	blk.mesh = bm
-	blk.material_override = _metal(Color(0.12, 0.12, 0.14))
-	blk.position = Vector3(0, 0.22, 0)
-	_engine.add_child(blk)
-	for sx in [-0.16, 0.16]:
-		var stk := MeshInstance3D.new()
-		var cm := CylinderMesh.new()
-		cm.top_radius = 0.1
-		cm.bottom_radius = 0.06
-		cm.height = 0.22
-		stk.mesh = cm
-		stk.material_override = _metal(Color(0.6, 0.6, 0.66), 0.25)
-		stk.position = Vector3(sx, 0.5, 0)
-		_engine.add_child(stk)
-	for sx2 in [-0.55, 0.55]:
-		var pipe := MeshInstance3D.new()
-		var pm := CylinderMesh.new()
-		pm.top_radius = 0.06
-		pm.bottom_radius = 0.07
-		pm.height = 1.3
-		pipe.mesh = pm
-		pipe.material_override = _metal(Color(0.72, 0.72, 0.74), 0.25)
-		pipe.rotation_degrees = Vector3(90, 0, 0)
-		pipe.position = Vector3(sx2, -0.05, 0.7)
-		_engine.add_child(pipe)
-	apply_engine(0)
-
-## Engine grows bigger/meaner with level.
-func apply_engine(level: int) -> void:
-	if _engine == null:
-		return
-	var s: float = (0.55 + float(level) * 0.16) * _part_scale
-	_engine.scale = Vector3(s, s, s)
-
-# --- roll cage (Durability upgrade) -----------------------------------------
+# --- generic tube/joint helpers (used by static per-vehicle body detail below) ---
 ## A chrome ball weld-node to hide/strengthen a tube joint.
 func _weld_node(parent: Node3D, pos: Vector3, r: float) -> void:
 	var mi := MeshInstance3D.new()
@@ -1903,7 +1996,7 @@ func _weld_node(parent: Node3D, pos: Vector3, r: float) -> void:
 	mi.position = pos
 	parent.add_child(mi)
 
-## Matte foam material (roll-cage padding).
+## Matte foam material (harness padding, grips).
 func _foam(col: Color) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()
 	m.albedo_color = col
@@ -1911,6 +2004,7 @@ func _foam(col: Color) -> StandardMaterial3D:
 	m.metallic = 0.0
 	return m
 
+## A cylinder mesh spanning two arbitrary points (pipe/bar/strut runs).
 func _tube(parent: Node3D, a: Vector3, b: Vector3, r: float, mat: Material) -> void:
 	var mi := MeshInstance3D.new()
 	var cm := CylinderMesh.new()
@@ -1926,75 +2020,6 @@ func _tube(parent: Node3D, a: Vector3, b: Vector3, r: float, mat: Material) -> v
 	elif absf(d.z) > absf(d.y):
 		mi.rotation_degrees = Vector3(90, 0, 0)
 	parent.add_child(mi)
-
-func _build_cage() -> void:
-	_cage = Node3D.new()
-	add_child(_cage)
-	for _i in range(6):
-		var t := Node3D.new()
-		_cage.add_child(t)
-		_cage_tiers.append(t)
-	var mat := _metal(Color(0.56, 0.58, 0.64), 0.32)   # bare chromoly steel tube (bright, not black)
-	var hx := 1.32
-	var zf := -1.75
-	var zr := 1.75
-	var yb := 0.35
-	var yt := 2.3
-	var bot := [Vector3(-hx, yb, zf), Vector3(hx, yb, zf), Vector3(-hx, yb, zr), Vector3(hx, yb, zr)]
-	var top := [Vector3(-hx, yt, zf), Vector3(hx, yt, zf), Vector3(-hx, yt, zr), Vector3(hx, yt, zr)]
-	# tier 0 (Lv1): base cage
-	for i in range(4):
-		_tube(_cage_tiers[0], bot[i], top[i], 0.06, mat)
-	_tube(_cage_tiers[0], top[0], top[1], 0.06, mat)
-	_tube(_cage_tiers[0], top[2], top[3], 0.06, mat)
-	_tube(_cage_tiers[0], top[0], top[2], 0.06, mat)
-	_tube(_cage_tiers[0], top[1], top[3], 0.06, mat)
-	_tube(_cage_tiers[0], bot[0], bot[2], 0.06, mat)
-	_tube(_cage_tiers[0], bot[1], bot[3], 0.06, mat)
-	# chrome weld nodes at every corner so the joints read welded, not floating
-	for p in (bot + top):
-		_weld_node(_cage_tiers[0], p, 0.085)
-	# bright foam padding on the front uprights (the bars beside the driver's head)
-	var pad := _foam(Color(0.92, 0.16, 0.1))
-	_tube(_cage_tiers[0], Vector3(-hx, 1.15, zf), Vector3(-hx, 1.95, zf), 0.1, pad)
-	_tube(_cage_tiers[0], Vector3(hx, 1.15, zf), Vector3(hx, 1.95, zf), 0.1, pad)
-	# tier 1 (Lv2): side diagonal braces
-	_tube(_cage_tiers[1], bot[0], top[2], 0.05, mat)
-	_tube(_cage_tiers[1], bot[1], top[3], 0.05, mat)
-	# tier 2 (Lv3): rear harness bar + rear X
-	_tube(_cage_tiers[2], Vector3(-hx, yt - 0.5, zr), Vector3(hx, yt - 0.5, zr), 0.05, mat)
-	_tube(_cage_tiers[2], bot[2], top[3], 0.05, mat)
-	_tube(_cage_tiers[2], bot[3], top[2], 0.05, mat)
-	# tier 3 (Lv4): roof X-brace
-	_tube(_cage_tiers[3], top[0], top[3], 0.05, mat)
-	_tube(_cage_tiers[3], top[1], top[2], 0.05, mat)
-	# tier 4 (Lv5): roof light bar
-	var lby := yt + 0.16
-	_tube(_cage_tiers[4], Vector3(-0.9, lby, -0.25), Vector3(0.9, lby, -0.25), 0.05, _metal(Color(0.08, 0.08, 0.09)))
-	for lx in [-0.62, -0.21, 0.21, 0.62]:
-		var light := MeshInstance3D.new()
-		var lbm := BoxMesh.new()
-		lbm.size = Vector3(0.18, 0.13, 0.1)
-		light.mesh = lbm
-		var lm := StandardMaterial3D.new()
-		lm.albedo_color = Color(1, 0.95, 0.6)
-		lm.emission_enabled = true
-		lm.emission = Color(1, 0.95, 0.6)
-		lm.emission_energy_multiplier = 1.6
-		light.material_override = lm
-		light.position = Vector3(lx, lby, -0.25)
-		_cage_tiers[4].add_child(light)
-	# tier 5 (Lv6): chunky front bar + front harness
-	_tube(_cage_tiers[5], bot[0], bot[1], 0.075, mat)
-	_tube(_cage_tiers[5], Vector3(-hx, yt - 0.5, zf), Vector3(hx, yt - 0.5, zf), 0.06, mat)
-	apply_cage(0)
-
-func apply_cage(level: int) -> void:
-	if _cage == null:
-		return
-	_cage.visible = level > 0
-	for i in range(_cage_tiers.size()):
-		_cage_tiers[i].visible = level > i
 
 # --- air-brake flap (Dive upgrade) ------------------------------------------
 func _build_airbrake() -> void:
