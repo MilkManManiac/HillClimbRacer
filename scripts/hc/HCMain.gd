@@ -541,6 +541,7 @@ func _ready() -> void:
 	_setup_speed_lines()
 	_build_shop()
 	_build_pause_menu()
+	_build_volume_toast()
 	_apply_upgrades()
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 	_build_start_menu()   # title + how-to-play; pauses the game until you hit START
@@ -575,6 +576,15 @@ func _input(event: InputEvent) -> void:
 	if event.is_action_pressed("pause_menu"):
 		_toggle_pause_menu()
 		return
+	if event.is_action_pressed("mute_toggle"):
+		_toggle_mute()
+		return
+	if event.is_action_pressed("volume_up"):
+		_adjust_volume(0.1)
+		return
+	if event.is_action_pressed("volume_down"):
+		_adjust_volume(-0.1)
+		return
 	# works for keyboard (Enter/Tab) AND gamepad (Back / Start) via the input actions
 	if event.is_action_pressed("restart"):
 		_restart()
@@ -608,6 +618,11 @@ func _setup_input() -> void:
 	_new_action("toggle_shop", 0.5, [_key(KEY_TAB), _btn(JOY_BUTTON_START)])
 	_new_action("restart", 0.5, [_key(KEY_ENTER), _btn(JOY_BUTTON_BACK)])
 	_new_action("pause_menu", 0.5, [_key(KEY_ESCAPE)])
+	# volume: adjustable anywhere, anytime — no need to open the pause menu. Minus/Equal
+	# (the "-/+" pair) step by 10%; M toggles mute. Handled in _input below.
+	_new_action("volume_down", 0.5, [_key(KEY_MINUS)])
+	_new_action("volume_up", 0.5, [_key(KEY_EQUAL)])
+	_new_action("mute_toggle", 0.5, [_key(KEY_M)])
 	# shop tab switching (bumpers on a pad, Q/E on the keyboard — only read while the
 	# shop is open, so they can safely double as the in-game roll/dive/boost keys)
 	_new_action("shop_tab_left", 0.5, [_key(KEY_Q), _btn(JOY_BUTTON_LEFT_SHOULDER)])
@@ -1974,6 +1989,8 @@ var _pause_layer: CanvasLayer
 var _pause_resume_btn: Button
 var _fullscreen_btn: Button
 var master_volume := 1.0   # linear 0-1, persisted; pushed onto _audio (see _apply_volume)
+var _pre_mute_volume := 1.0   # level to restore when un-muting (M brings sound back to here)
+var _vol_slider: HSlider   # the pause-menu slider, kept in sync when hotkeys change volume
 
 ## Build the pause overlay once (hidden) — same "build hidden, toggle .visible" shape
 ## as the shop, and the same PROCESS_MODE_ALWAYS + get_tree().paused pattern the title
@@ -2029,13 +2046,13 @@ func _build_pause_menu() -> void:
 	vol_lbl.add_theme_color_override("font_color", Color(0.5, 0.52, 0.58))
 	vol_lbl.custom_minimum_size = Vector2(70, 0)
 	vol_row.add_child(vol_lbl)
-	var vol_slider := HSlider.new()
-	vol_slider.min_value = 0; vol_slider.max_value = 100
-	vol_slider.value = master_volume * 100.0
-	vol_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	vol_slider.value_changed.connect(_on_volume_changed)
-	vol_row.add_child(vol_slider)
-	var vol_note := _shop_label(box, "(no audio yet — the setting persists and applies when sound lands)", 11, Color(0.45, 0.47, 0.52))
+	_vol_slider = HSlider.new()
+	_vol_slider.min_value = 0; _vol_slider.max_value = 100
+	_vol_slider.value = master_volume * 100.0
+	_vol_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_vol_slider.value_changed.connect(_on_volume_changed)
+	vol_row.add_child(_vol_slider)
+	var vol_note := _shop_label(box, "or press  −  /  =  to adjust,  M  to mute — anytime, no menu needed", 11, Color(0.45, 0.47, 0.52))
 	vol_note.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 
 ## Volume slider → persisted setting, pushed onto _audio when audio finally lands.
@@ -2049,6 +2066,70 @@ func _on_volume_changed(v: float) -> void:
 func _apply_volume() -> void:
 	if _audio:
 		_audio.set("master_volume", master_volume)
+
+## Hotkey volume step (±0.1). Clamps, applies to the live synth, persists, syncs the
+## pause-menu slider (no_signal so we don't loop back through _on_volume_changed), and
+## flashes the on-screen readout. Any positive level also arms un-mute restore.
+func _adjust_volume(delta: float) -> void:
+	master_volume = clampf(master_volume + delta, 0.0, 1.0)
+	if master_volume > 0.0:
+		_pre_mute_volume = master_volume
+	_apply_volume()
+	_save_game()
+	if _vol_slider:
+		_vol_slider.set_value_no_signal(master_volume * 100.0)
+	_flash_volume_toast()
+
+## M toggles between silent and the last audible level (defaults to full if muted from 0).
+func _toggle_mute() -> void:
+	if master_volume > 0.0:
+		_pre_mute_volume = master_volume
+		master_volume = 0.0
+	else:
+		master_volume = _pre_mute_volume if _pre_mute_volume > 0.0 else 1.0
+	_apply_volume()
+	_save_game()
+	if _vol_slider:
+		_vol_slider.set_value_no_signal(master_volume * 100.0)
+	_flash_volume_toast()
+
+## Small top-center "🔊 70%" readout that fades after any volume/mute change. Lives on its
+## own ALWAYS-mode layer + tween so it still animates while the tree is paused.
+func _build_volume_toast() -> void:
+	_vol_toast_layer = CanvasLayer.new()
+	_vol_toast_layer.layer = 16   # above the pause menu (15), below the title (20)
+	_vol_toast_layer.process_mode = Node.PROCESS_MODE_ALWAYS
+	add_child(_vol_toast_layer)
+	_vol_toast = Label.new()
+	_vol_toast.anchor_left = 0.5; _vol_toast.anchor_right = 0.5
+	_vol_toast.anchor_top = 0.0; _vol_toast.anchor_bottom = 0.0
+	_vol_toast.offset_left = -110; _vol_toast.offset_right = 110
+	_vol_toast.offset_top = 24; _vol_toast.offset_bottom = 64
+	_vol_toast.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_vol_toast.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_vol_toast.add_theme_font_size_override("font_size", 22)
+	_vol_toast.add_theme_color_override("font_color", Color(1, 0.9, 0.55))
+	_vol_toast.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.8))
+	_vol_toast.add_theme_constant_override("outline_size", 6)
+	_vol_toast.modulate.a = 0.0
+	_vol_toast_layer.add_child(_vol_toast)
+
+var _vol_toast_layer: CanvasLayer
+var _vol_toast: Label
+var _vol_toast_tween: Tween
+
+func _flash_volume_toast() -> void:
+	if _vol_toast == null:
+		return
+	var pct: int = int(round(master_volume * 100.0))
+	_vol_toast.text = ("🔇  Muted" if master_volume <= 0.0 else "🔊  %d%%" % pct)
+	_vol_toast.modulate.a = 1.0
+	if _vol_toast_tween and _vol_toast_tween.is_valid():
+		_vol_toast_tween.kill()
+	# bind the tween to the ALWAYS-mode layer so the fade runs even while paused
+	_vol_toast_tween = _vol_toast_layer.create_tween()
+	_vol_toast_tween.tween_interval(0.9)
+	_vol_toast_tween.tween_property(_vol_toast, "modulate:a", 0.0, 0.5)
 
 ## Continuous audio: engine follows speed/throttle every frame; drift/boost loops
 ## start/stop on state EDGES (the synth manages its own envelopes, so re-calling
