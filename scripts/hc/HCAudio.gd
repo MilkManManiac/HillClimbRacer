@@ -226,6 +226,30 @@ func play_checkpoint() -> PackedVector2Array:
 	_emit(buf)
 	return buf
 
+## Escalating combo blip — pitch climbs with the chain length so a growing combo
+## audibly winds up (capped so a monster chain stays musical, not shrill).
+func play_combo(chain: int) -> PackedVector2Array:
+	var f := 740.0 * pow(1.122, float(clampi(chain, 1, 8)))   # ~a semitone per step
+	var buf := _make_tone(f, 0.09, 0.42, 0.35, 3.0)
+	_emit(buf)
+	return buf
+
+## Bright ascending triad for banking a combo pot — bigger than the cash blip,
+## smaller than a checkpoint chime.
+func play_bank() -> PackedVector2Array:
+	var buf := _make_tone(659.25, 0.07, 0.40, 0.4, 3.0)    # E5
+	buf.append_array(_make_tone(880.0, 0.07, 0.44, 0.4, 3.0))    # A5
+	buf.append_array(_make_tone(1174.66, 0.16, 0.48, 0.45, 2.6)) # D6 — payout lands here
+	_emit(buf)
+	return buf
+
+## Descending two-note womp for a dropped combo pot (wreck / flat slam).
+func play_combo_lost() -> PackedVector2Array:
+	var buf := _make_tone(520.0, 0.09, 0.40, 0.3, 2.6)
+	buf.append_array(_make_tone(392.0, 0.20, 0.42, 0.3, 2.2))
+	_emit(buf)
+	return buf
+
 ## Noisy crunch/thud burst for a wreck (car death).
 func play_wreck() -> PackedVector2Array:
 	var buf := _make_wreck()

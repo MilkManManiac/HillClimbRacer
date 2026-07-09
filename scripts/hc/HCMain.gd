@@ -177,6 +177,11 @@ var _info: Label
 var _big: Label
 var _score_lbl: Label
 var _trick_lbl: Label
+var _combo_lbl: Label            # combo pot + multiplier readout (under the score)
+var _combo_bar: ColorRect        # grace-window drain bar
+var _combo_bar_bg: ColorRect
+var _combo_pulse_tween: Tween    # per-trick thump on the combo label
+var _score_flash_tween: Tween    # gold flash on the score when a pot banks
 
 # --- economy / upgrades ------------------------------------------------------
 const UP_KEYS := ["engine", "fuel", "fueleff", "cashmult", "suspension", "durability", "wheels", "wings", "dive", "rockets", "stretch", "wide"]
@@ -878,6 +883,7 @@ func _setup_terrain_and_car() -> void:
 	_terrain.call("set_target", _car)
 	_car.connect("gap_failed", _on_car_gap_failed)
 	_car.connect("landed", _on_car_landed)
+	_car.connect("combo_event", _on_car_combo)
 	_terrain.connect("pickup_collected", _on_pickup_collected)
 	_apply_headlights()
 	_reset_run_mode_state()   # NOTE: this was missing at boot before trial mode landed —
@@ -1240,6 +1246,35 @@ func _on_car_landed(impact: float, _air_time: float) -> void:
 ## shows the end screen. Just add a jolt here for feel.
 func _on_car_gap_failed(_can_respawn: bool) -> void:
 	_shake = maxf(_shake, 0.5)
+
+## Combo juice: every chained trick thumps the combo label with an escalating blip,
+## a bank flashes the score gold, a drop stings. All audio stays _audio-guarded.
+func _on_car_combo(kind: String, _amount: int, chain: int) -> void:
+	if _audio:
+		match kind:
+			"trick":
+				_audio.call("play_combo", chain)
+			"bank":
+				_audio.call("play_bank")
+			"drop":
+				_audio.call("play_combo_lost")
+	if kind == "trick" and _combo_lbl:
+		# scale-thump the readout so each chained trick lands visibly
+		_combo_lbl.pivot_offset = _combo_lbl.size * 0.5
+		_combo_lbl.scale = Vector2(1.3, 1.3)
+		if _combo_pulse_tween and _combo_pulse_tween.is_valid():
+			_combo_pulse_tween.kill()
+		_combo_pulse_tween = create_tween()
+		_combo_pulse_tween.tween_property(_combo_lbl, "scale", Vector2.ONE, 0.22)\
+				.set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+	elif kind == "bank" and _score_lbl:
+		_score_lbl.modulate = Color(1.6, 1.4, 0.7)
+		if _score_flash_tween and _score_flash_tween.is_valid():
+			_score_flash_tween.kill()
+		_score_flash_tween = create_tween()
+		_score_flash_tween.tween_property(_score_lbl, "modulate", Color.WHITE, 0.5)
+	elif kind == "drop":
+		_shake = maxf(_shake, 0.25)   # losing the pot should physically sting a little
 
 # --- sprint mode: race the clock on "sprint"-mode maps (currently: canyon) --------
 
@@ -2699,6 +2734,7 @@ func _swap_vehicle(vk: String) -> void:
 	_terrain.call("set_target", _car)
 	_car.connect("gap_failed", _on_car_gap_failed)
 	_car.connect("landed", _on_car_landed)
+	_car.connect("combo_event", _on_car_combo)
 	_terrain.connect("pickup_collected", _on_pickup_collected)
 	if _audio:
 		_audio.call("setup", _car)   # re-point the engine synth at the new body
@@ -2943,6 +2979,29 @@ func _setup_hud() -> void:
 	_score_lbl.add_theme_font_size_override("font_size", 24)
 	_score_lbl.add_theme_color_override("font_color", Color(1, 0.95, 0.5))
 	layer.add_child(_score_lbl)
+	# combo readout under the score: unbanked pot + multiplier, with a thin drain
+	# bar showing the grace window. Hidden whenever no combo is open.
+	_combo_lbl = Label.new()
+	_combo_lbl.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	_combo_lbl.position = Vector2(-200, 58)
+	_combo_lbl.add_theme_font_size_override("font_size", 17)
+	_combo_lbl.add_theme_color_override("font_color", Color(1.0, 0.62, 0.25))
+	_combo_lbl.visible = false
+	layer.add_child(_combo_lbl)
+	_combo_bar_bg = ColorRect.new()
+	_combo_bar_bg.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	_combo_bar_bg.position = Vector2(-200, 82)
+	_combo_bar_bg.size = Vector2(172, 5)
+	_combo_bar_bg.color = Color(0.16, 0.12, 0.08, 0.85)
+	_combo_bar_bg.visible = false
+	layer.add_child(_combo_bar_bg)
+	_combo_bar = ColorRect.new()
+	_combo_bar.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	_combo_bar.position = Vector2(-200, 82)
+	_combo_bar.size = Vector2(172, 5)
+	_combo_bar.color = Color(1.0, 0.62, 0.25)
+	_combo_bar.visible = false
+	layer.add_child(_combo_bar)
 	_sprint_lbl = Label.new()
 	_sprint_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
 	_sprint_lbl.position = Vector2(-120, 60)
@@ -3012,6 +3071,15 @@ func _update_hud() -> void:
 	_info.text = "%d m    %d km/h%s" % [int(dist), int(_car.call("get_speed_kmh")), air]
 	_score_lbl.text = "SCORE %d" % int(_car.get("score"))
 	_trick_lbl.text = _car.get("trick_text")
+	# combo readout: pot + multiplier, thin drain bar for the grace window
+	var pot := float(_car.get("combo_pot"))
+	var combo_open := pot > 0.5
+	_combo_lbl.visible = combo_open
+	_combo_bar.visible = combo_open
+	_combo_bar_bg.visible = combo_open
+	if combo_open:
+		_combo_lbl.text = "COMBO +%d   x%.1f" % [int(pot), float(_car.call("combo_mult"))]
+		_combo_bar.size.x = 172.0 * float(_car.call("combo_grace_frac"))
 	_update_sprint_hud()
 	_update_trial_hud()
 	_update_gap_telegraph()

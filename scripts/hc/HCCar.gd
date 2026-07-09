@@ -51,6 +51,21 @@ var dead: bool = false
 var score: float = 0.0
 var trick_text: String = ""
 var _trick_timer: float = 0.0
+
+# --- combo v2: tricks chain into an UNBANKED pot while the combo is "open" -------
+# (airborne, mid-drift, or within a short grace window). Each chained trick bumps
+# the multiplier; a clean return to plain driving BANKS the pot into score, a wreck
+# or flat slam DROPS it. HCMain draws the pot/multiplier/grace-drain HUD and plays
+# the escalating audio off combo_event.
+signal combo_event(kind: String, amount: int, chain: int)   # kind: trick|bank|drop
+const COMBO_GRACE := 1.5            # seconds of plain driving before the pot banks
+const COMBO_MULT_STEP := 0.5        # +x0.5 per chained trick…
+const COMBO_MULT_CAP := 5.0         # …capped so a monster chain can't print money
+var combo_pot: float = 0.0          # unbanked points (display + bank amount)
+var combo_chain: int = 0            # tricks in the current chain (drives the mult)
+var _combo_time: float = 0.0        # grace remaining once the combo goes idle
+var _drift_seg_pts: float = 0.0     # style points accrued across ONE drift segment
+var _nearmiss_cd: float = 0.0       # per-event cooldown so one rail-hug fires once
 var terrain: Node3D   # set by HCMain; used to catch ground tunneling
 
 var _rays: Array[RayCast3D] = []
@@ -241,6 +256,10 @@ func apply_com() -> void:
 
 func _physics_process(delta: float) -> void:
 	if dead:
+		# any death path (health, off-map, gap fall, fuel) reaches this guard on the
+		# next tick — the one place a still-open combo pot reliably drops
+		if combo_pot > 0.0 or _drift_seg_pts > 0.0:
+			_combo_drop()
 		# park the wreck so it can't keep falling/bouncing behind the shop
 		if not freeze:
 			linear_velocity = Vector3.ZERO
@@ -402,9 +421,10 @@ func _physics_process(delta: float) -> void:
 			var t: float = clamp(align_rate * delta * 0.5, 0.0, 1.0)
 			var nhv := hv.normalized().slerp(dir, t) * hspeed
 			linear_velocity = Vector3(nhv.x, vel.y, nhv.z)
-			# reward holding a slide: a little style score for a proper drift
+			# reward holding a slide: style points accrue across the WHOLE segment and
+			# feed the combo as one DRIFT trick when the slide ends (see _update_combo)
 			if drifting:
-				score += hspeed * delta * 1.5
+				_drift_seg_pts += hspeed * delta * 1.5
 				# per-vehicle scrub: a drift bleeds forward speed (tight-but-slow rides
 				# scrub hard; low-scrub rides skate through corners keeping momentum)
 				var scrub: float = drift_scrub * _grip_break * absf(_steer) * delta
@@ -557,6 +577,9 @@ func _physics_process(delta: float) -> void:
 		if _trick_timer <= 0.0:
 			trick_text = ""
 
+	# combo chain: close drift segments, sniff near-misses, bank/expire the pot
+	_update_combo(delta)
+
 	# gap / checkpoint resolution (jump cleared, or fell in)
 	_check_gap()
 
@@ -680,21 +703,31 @@ func _on_land(vel: Vector3) -> void:
 	var dmg: float = impact * 2.1 + flat_pen * 42.0 * clamp(_air_time, 0.0, 1.5)
 	if dmg > 1.0:
 		health -= dmg
-	# trick scoring: a clean landing confirms the combo (airtime + flips)
+	# trick scoring: a clean landing feeds the combo chain (airtime + flips); the pot
+	# banks after the grace window if nothing else chains (see _update_combo)
 	var off_road := _road_off() > _road_half_here()
 	if _air_time > 0.45 and not off_road:
 		if uprightness > 0.45:
 			var flips := int(_flip_accum / 320.0)
 			var bonus: float = _air_time * 60.0 + float(flips) * 250.0
-			score += bonus
 			var label := ""
 			if flips >= 1:
 				label = "%dx FLIP  " % flips
-			trick_text = "%s%.1fs AIR   +%d" % [label, _air_time, int(bonus)]
-			_trick_timer = 2.2
+			_combo_add(bonus, "%s%.1fs AIR" % [label, _air_time])
+			# PERFECT landing: attitude matched the slope AND almost no slam into it —
+			# extra style points plus a small feel-safe exit-speed reward along the
+			# direction you're already travelling (never enough to read as a boost pad)
+			if uprightness > 0.93 and into < 6.0:
+				_combo_add(120.0, "PERFECT LANDING")
+				var hv := Vector3(linear_velocity.x, 0.0, linear_velocity.z)
+				if hv.length() > 2.0:
+					linear_velocity += hv.normalized() * 1.5
 		else:
 			trick_text = "SLOPPY LANDING!"
 			_trick_timer = 1.4
+			# pancaking flat out of a chain is the juicy failure — the pot dies with it
+			if combo_pot > 0.0:
+				_combo_drop()
 	# kick up dust on a real landing — scaled by impact severity. Amount can't change
 	# live cheaply on a GPUParticles3D, so two pre-built emitters (small/big) cover the
 	# range; a really hard hit (impact > ~8, i.e. well past the damage threshold) also
@@ -713,6 +746,95 @@ func _on_land(vel: Vector3) -> void:
 	landed.emit(into, _air_time)   # drives camera shake / FOV punch (surface-relative)
 	_air_time = 0.0
 	_flip_accum = 0.0
+
+# --- combo v2 core -------------------------------------------------------------
+
+## Current chain multiplier: x1 for the first trick, +0.5 per chained trick, capped.
+func combo_mult() -> float:
+	return minf(1.0 + COMBO_MULT_STEP * float(maxi(combo_chain - 1, 0)), COMBO_MULT_CAP)
+
+## 0..1 grace remaining for the HUD drain bar. Pinned to 1 while the combo is held
+## open (airborne / mid-drift) — the bar only drains during plain driving.
+func combo_grace_frac() -> float:
+	if combo_pot <= 0.0:
+		return 0.0
+	if airborne or drifting:
+		return 1.0
+	return clampf(_combo_time / COMBO_GRACE, 0.0, 1.0)
+
+## Per-tick combo bookkeeping (called from _physics_process, never while dead —
+## the dead guard drops the pot itself so every death path is covered).
+func _update_combo(delta: float) -> void:
+	_nearmiss_cd = maxf(_nearmiss_cd - delta, 0.0)
+	# a drift segment just ended -> the whole slide becomes ONE chained trick.
+	# Tiny scrubs (parking-lot wiggles) stay plain score so they can't spam the chain.
+	if not drifting and _drift_seg_pts > 0.0:
+		if _drift_seg_pts >= 15.0:
+			_combo_add(_drift_seg_pts, "DRIFT")
+		else:
+			score += _drift_seg_pts
+		_drift_seg_pts = 0.0
+	_check_near_miss()
+	# the chain stays open while airborne or sliding; grace only drains on plain road
+	if airborne or drifting:
+		return
+	if _combo_time > 0.0:
+		_combo_time -= delta
+		if _combo_time <= 0.0 and combo_pot > 0.0:
+			_combo_bank()
+
+## Add one trick to the chain: bump the multiplier, grow the pot, refresh grace.
+func _combo_add(pts: float, label: String) -> void:
+	combo_chain += 1
+	var m := combo_mult()
+	var add := pts * m
+	combo_pot += add
+	_combo_time = COMBO_GRACE
+	var mult_txt := ("   x%.1f" % m) if combo_chain > 1 else ""
+	trick_text = "%s  +%d%s" % [label, int(add), mult_txt]
+	_trick_timer = 1.8
+	combo_event.emit("trick", int(add), combo_chain)
+
+## Grace expired on plain road: the pot pays out into score.
+func _combo_bank() -> void:
+	var amt := int(combo_pot)
+	score += combo_pot
+	if combo_chain >= 2:
+		trick_text = "%d-TRICK COMBO BANKED  +%d" % [combo_chain, amt]
+	else:
+		trick_text = "BANKED  +%d" % amt
+	_trick_timer = 2.0
+	combo_event.emit("bank", amt, combo_chain)
+	combo_pot = 0.0
+	combo_chain = 0
+	_combo_time = 0.0
+
+## Wreck / flat slam: the pot is gone. The sting IS the feature — risk the bank.
+func _combo_drop() -> void:
+	var amt := int(combo_pot)
+	combo_pot = 0.0
+	combo_chain = 0
+	_combo_time = 0.0
+	_drift_seg_pts = 0.0
+	if amt > 0:
+		trick_text = "COMBO LOST  -%d" % amt
+		_trick_timer = 1.8
+	combo_event.emit("drop", amt, 0)
+
+## Hugging the outside rail at speed = a chained NEAR MISS. Pure car-local math
+## (lateral offset vs drivable half-width) — no new terrain API needed. The window
+## sits just inside the wreck line (rh + 1.5), so it's a genuine gamble.
+func _check_near_miss() -> void:
+	if _nearmiss_cd > 0.0 or not _grounded or dead or not _loop.is_empty():
+		return
+	var spd := linear_velocity.length()
+	if spd < 18.0:
+		return
+	var rh := _road_half_here()
+	var off := _road_off()
+	if off > rh - 1.2 and off < rh + 0.5:
+		_nearmiss_cd = 2.0
+		_combo_add(40.0 + spd, "NEAR MISS")
 
 ## Road centre-line X at our forward position (0 if the terrain has no curves).
 func _road_cx() -> float:
@@ -745,6 +867,11 @@ func reset_run(start: Vector3) -> void:
 	_trick_timer = 0.0
 	_air_time = 0.0
 	_flip_accum = 0.0
+	combo_pot = 0.0
+	combo_chain = 0
+	_combo_time = 0.0
+	_drift_seg_pts = 0.0
+	_nearmiss_cd = 0.0
 	gaps_cleared = 0
 	checkpoint_z = 0.0
 	_gap_armed = false
@@ -860,6 +987,12 @@ func respawn_at(z: float) -> void:
 	_loop_cd = 0.0
 	_air_time = 0.0
 	_flip_accum = 0.0
+	# a wipeout already dropped the pot via the dead guard; clear silently in case
+	# the respawn raced a freshly-opened chain (no "COMBO LOST" sting on top of one)
+	combo_pot = 0.0
+	combo_chain = 0
+	_combo_time = 0.0
+	_drift_seg_pts = 0.0
 	reset_physics_interpolation()
 	# NOTE: health is NOT restored on a checkpoint respawn (only reset_run does that),
 	# so shed panels intentionally stay off — the car should still look as beat-up as
