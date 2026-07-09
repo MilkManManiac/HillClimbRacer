@@ -44,7 +44,7 @@ var _star_from := Vector3.ZERO
 var _star_to := Vector3.ZERO
 
 ## Rebuild every band for the given map. cfg (from HCMain._scenery_config()):
-##   style: String   -- one of hills/canyon/alpine/midnight/gravity (matches HCMain.MAPS keys)
+##   style: String   -- one of hills/canyon/alpine/midnight/gravity/dunes (matches HCMain.MAPS keys)
 ##   accent: Color    -- the map's UI accent, folded into the palette for a bit of unity
 ##   night: bool      -- true only for midnight; kept for any future night-flagged map
 func configure(cfg: Dictionary) -> void:
@@ -71,6 +71,8 @@ func configure(cfg: Dictionary) -> void:
 			_build_midnight(accent)
 		"gravity":
 			_build_gravity(accent)
+		"dunes":
+			_build_dunes(accent)
 		_:
 			_build_hills(accent)
 	# per-map near/mid-field ambient life layer -- keyed off the same `style` HCMain
@@ -86,6 +88,8 @@ func configure(cfg: Dictionary) -> void:
 			_build_fireflies(accent)
 		"gravity":
 			_build_embers(accent)
+		"dunes":
+			_build_sand(accent)
 		_:
 			_build_birds(accent)
 
@@ -162,6 +166,19 @@ func _build_midnight(accent: Color) -> void:
 	var window_col := accent.lerp(Color(1.0, 0.85, 0.5), 0.6)
 	_windows(0, h0, window_col, 140)
 	_windows(1, h1, window_col, 100)
+
+## Dune Drift: long low dune swells warming toward a hazy golden horizon, anchored by
+## a far band of flat mesas so the mid rings read as dunes (all-rolling rings looked
+## like "hills but yellow" — the mesa band is what says desert).
+func _build_dunes(accent: Color) -> void:
+	var rng := RandomNumberGenerator.new(); rng.seed = 5006
+	var haze := Color(0.95, 0.82, 0.62)
+	var near := Color(0.58, 0.43, 0.22).lerp(accent, 0.15)
+	var mid := near.lerp(haze, 0.45)
+	var far := near.lerp(haze, 0.78)
+	_ring(0, _rolling(rng, 28.0, 55.0, 0.55), near)
+	_ring(1, _rolling(rng, 42.0, 80.0, 0.4), mid)
+	_ring(2, _mesas(rng, 55.0, 100.0, 4), far)
 
 ## Gravity Works: an industrial horizon — low ridgeline plus scattered crane/stack silhouettes.
 func _build_gravity(accent: Color) -> void:
@@ -282,6 +299,14 @@ func _build_embers(accent: Color) -> void:
 	var warm := accent.lerp(Color(1.0, 0.45, 0.1), 0.8)
 	_add_motes(Vector3(0, 10.0, -14.0), Vector3(28.0, 5.0, 28.0), Vector3(0, 1, 0), 25.0,
 			1.4, 5.0, 40, Vector2(0.34, 0.34), warm, true)
+
+## Dune Drift: wind-carried golden sand motes streaming gently ACROSS the view (the
+## sideways direction is what sells "wind over dunes" vs canyon's rising thermal dust).
+func _build_sand(accent: Color) -> void:
+	var gold := accent.lerp(Color(1.0, 0.85, 0.55), 0.5)
+	gold.a = 0.32
+	_add_motes(Vector3(0, 9.0, -14.0), Vector3(30.0, 4.0, 30.0), Vector3(1.0, 0.12, 0.0), 16.0,
+			2.4, 7.0, 34, Vector2(0.3, 0.3), gold, false)
 
 ## Tiny procedurally-generated radial falloff dot (white RGB, alpha 1 at centre -> 0
 ## at the rim) -- built once per call (16x16, trivial) so mote billboards read as

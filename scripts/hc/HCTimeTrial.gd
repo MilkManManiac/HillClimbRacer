@@ -17,6 +17,7 @@ const FINISH_M := {
 	"alpine": 900.0,
 	"midnight": 1000.0,
 	"gravity": 1800.0,   # past the first overpass (650) AND the 2-coil corkscrew (~1500-1700)
+	"dunes": 1100.0,     # fast flowing rollers — a touch longer than hills at higher pace
 }
 
 ## Fractions of the finish distance where a split call-out fires (elapsed time only —
@@ -38,6 +39,10 @@ const MEDALS := {
 	# gravity: longer line (1800 m) but the corkscrew descent is fast once learned;
 	# NOT bot-calibrated (the bot can't judge stunt pacing) — human tuning pass wanted
 	"gravity":  {"gold": 95.0, "silver": 125.0, "bronze": 170.0},
+	# dunes: bot-calibrated 2026-07-09 — stock minivan 14.1 m/s over the rollers
+	# (1100 m ≈ 78 s at bot pace); sports bot cruises it at ~40 m/s (~28 s), so gold
+	# demands a fast ride, silver ≈ stock-bot pace. Human calibration pass wanted.
+	"dunes":    {"gold": 45.0, "silver": 80.0, "bronze": 115.0},
 }
 
 const MEDAL_EMOJI := {"gold": "🥇", "silver": "🥈", "bronze": "🥉"}
