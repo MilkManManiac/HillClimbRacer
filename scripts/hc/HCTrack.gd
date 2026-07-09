@@ -127,10 +127,12 @@ var _gap_idx := 0         # gaps placed so far this generation
 const LOOP_HALF := 4.5                 # loop ribbon half-width (m) — a narrow stunt deck
 const LOOP_GAP := 4.0                  # lateral daylight between the wrap's entry & exit ramps
 var _has_loop := false                 # fast-path gate for loop_state()
-var _creep_xing := 0                   # boxed-in creeps that ran inside branch-gather
-                                       # range of DISTANT road (detect-only tripwire —
-                                       # such a layout has an at-grade self-crossing and
-                                       # must be rejected by moving the stunt plan)
+var _creep_total := 0                  # all boxed-in creep fallbacks (diagnostic only)
+var _creep_xing := 0                   # boxed-in creeps that stayed on the unchecked
+                                       # straight because `_escape_turn` found no clear
+                                       # candidate — should be 0 for every shipped map;
+                                       # feeds stunt_report so probes/sweeps can reject
+                                       # a layout instead of shipping a broken road
 var _plan: Array = []                  # parsed plan tokens, sorted by s
 var _plan_idx := 0
 var _plan_placed := 0
@@ -268,17 +270,59 @@ func _next_segment(rng: RandomNumberGenerator, x: float, z: float, th: float, i:
 	for o in opts:
 		if not _seg_overlaps(x, z, th, o.kappa, int(o.len), i):
 			return o
-	# Boxed in — creep straight, re-decide next boundary (CLASSIC behavior, kept
-	# bit-identical: every legacy map's layout depends on these unchecked creeps).
-	# Detect-only tripwire: a creep whose samples run inside branch-gather range
-	# (55 m) of DISTANT road (index gap > 120) is chain-tunnelling toward an
-	# at-grade crossing that no reconcile/blend can disambiguate — the with-loop
-	# gravity seed produced exactly that (s~1840 crossing s~144 at 1.8 m). The
-	# counter feeds stunt_report so probes and stunt-placement sweeps can REJECT
-	# such a layout and move the stunt instead of shipping a broken road.
-	if _seg_min_clear(x, z, th, 0.0, 14, i - 75, 0) <= 55.0:
-		_creep_xing += 1
+	# Boxed in — normally creep straight and re-decide next boundary (CLASSIC
+	# behavior, kept bit-identical: every legacy map's layout depends on these
+	# unchecked creeps, and the vast majority of boxed-in moments are benign —
+	# the next boundary finds daylight again within a sample or two).
+	#
+	# A rare chain of these creeps is NOT benign: a creep whose samples run inside
+	# branch-gather range (55 m) of DISTANT road (index gap > 120) is chain-
+	# tunnelling toward an at-grade crossing that no reconcile/blend can
+	# disambiguate (canyon's own generator produced exactly this ~s=27.4-27.8 km,
+	# closing to 18.9 m centre-to-centre against road half-width 20 m — a literal
+	# self-eating road). Gate the escape search on that same 55 m danger radius so
+	# every OTHER boxed-in creep (including all of canyon's first 6 km, where the
+	# owner's tuning is the feel reference) takes the identical unchecked straight
+	# it always has — only genuinely converging creeps get steered.
+	_creep_total += 1
+	var mc := _seg_min_clear(x, z, th, 0.0, 14, i - 75, 0)
+	if mc <= 55.0:
+		var esc := _escape_turn(x, z, th, i)
+		if not esc.is_empty():
+			return esc
+		_creep_xing += 1   # no candidate improved on the straight — still flagged
 	return {"len": 14, "kappa": 0.0, "widen": 0.0}
+
+## Steer away from a converging branch instead of creeping straight into it. Sweeps
+## a small deterministic set of sharper turns (radii/angles/directions the random
+## draw never reaches) and greedily keeps whichever candidate raises minimum
+## clearance the most — even a partial gain beats holding a heading that's actively
+## closing the distance, and the next segment boundary (14 samples later) re-scores
+## from the new, now-diverging heading, so a single-instant escape compounds across
+## the danger zone instead of needing to solve it in one shot. Consumes no RNG (so
+## it never perturbs a seed's later draws unless it actually improves on straight)
+## and only runs from the danger gate above, so it is silent on every map that
+## never chain-tunnels. Returns {} if nothing beats the straight clearance.
+func _escape_turn(x: float, z: float, th: float, i: int) -> Dictionary:
+	var d0 := _dir_toward_zero(th)
+	var best := {}
+	var bestmc := _seg_min_clear(x, z, th, 0.0, 14, i, 12)
+	for radius in [turn_radius_min * 0.6, turn_radius_min, lerpf(turn_radius_min, turn_radius_max, 0.5), turn_radius_max]:
+		for mag_deg in [70.0, 100.0, 140.0, max_turn_deg]:
+			for dir in [d0, -d0]:
+				var seg := _mk_turn_fixed(dir, radius, mag_deg)
+				var candmc := _seg_min_clear(x, z, th, seg.kappa, int(seg.len), i, 12)
+				if candmc > bestmc:
+					bestmc = candmc
+					best = seg
+	return best
+
+## Same shape as `_mk_turn` but with explicit radius/angle instead of an rng draw
+## (the escape sweep needs to try several fixed candidates in a known order).
+func _mk_turn_fixed(dir: float, radius: float, mag_deg: float) -> Dictionary:
+	var mag := deg_to_rad(mag_deg)
+	var seglen := clampi(int(round(radius * mag / STEP)), 10, 300)
+	return {"len": seglen, "kappa": dir * (STEP / radius), "widen": 1.0}
 
 ## Minimum distance from a simulated segment (+pad lookahead samples) to any
 ## earlier sample with index <= i - 45, capped at the overlap clearance (cap
@@ -909,6 +953,7 @@ func stunt_report() -> Dictionary:
 		"overlap_residual": _ovl_resid,
 		"partner_tiles": _tile_partners.size(),
 		"creep_xing": _creep_xing,
+		"creep_total": _creep_total,
 	}
 
 ## Debug/probe: world centre-line point at arc-length s (top of the drivable deck).

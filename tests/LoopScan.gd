@@ -59,8 +59,8 @@ func _report(name: String, cfg: Dictionary, _s: int) -> void:
 			wrap = float((f as Dictionary).wrapclear)
 	var near := _self_clearance(trk, 184.0)
 	var far := _self_clearance(trk, 480.0)
-	print("[scan] %-12s placed=%d/%d xing=%d near=%.1f far=%.1f wrap=%.1f" %
-		[name, int(rep.placed), int(rep.planned), int(rep.creep_xing), near, far, wrap])
+	print("[scan] %-12s placed=%d/%d xing=%d creep_total=%d near=%.1f far=%.1f wrap=%.1f" %
+		[name, int(rep.placed), int(rep.planned), int(rep.creep_xing), int(rep.get("creep_total", -1)), near, far, wrap])
 	trk.queue_free()
 
 ## Min centre-line distance between samples at least `gap_m` apart in s that are
