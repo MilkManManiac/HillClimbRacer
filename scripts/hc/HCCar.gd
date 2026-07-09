@@ -142,14 +142,14 @@ var _damage_smoke: GPUParticles3D          # engine smoke when HP is low
 var _backfire: Array[GPUParticles3D] = []  # flame pops on throttle lift
 var _prev_drive: float = 0.0
 var _backfire_cd: float = 0.0
-# skid marks: a world-space pool of dark quads laid under the rear wheels while drifting
-const SKID_POOL := 120
-const SKID_LIFE := 2.8
-var _skid_marks: Array[MeshInstance3D] = []
-var _skid_life: Array[float] = []
-var _skid_idx: int = 0
-var _skid_last: Array[Vector3] = [Vector3.ZERO, Vector3.ZERO]
-var _skid_root: Node3D
+# skid marks: world-space rubber ribbons (HCSkid.gd) fed from the SAME analytic
+# wheel contacts the suspension computed this tick — never a second terrain query
+const HCSkidPool := preload("res://scripts/hc/HCSkid.gd")
+var _skid: Node3D
+var _skid_scuff: float = 0.0   # short post-hard-landing scuff window (s)
+var _wheel_ground: Array[bool] = [false, false, false, false]
+var _wheel_gpos: Array[Vector3] = [Vector3.ZERO, Vector3.ZERO, Vector3.ZERO, Vector3.ZERO]
+var _wheel_gn: Array[Vector3] = [Vector3.UP, Vector3.UP, Vector3.UP, Vector3.UP]
 var _underglow: Node3D
 var _ug_strips: Array[MeshInstance3D] = []
 var _ug_light: OmniLight3D
@@ -340,7 +340,11 @@ func _physics_process(delta: float) -> void:
 		vel = linear_velocity
 	for i in range(_rays.size()):
 		var d := -1.0   # contact distance from the wheel-ray origin (-1 = in the air)
+		if i < 4:
+			_wheel_ground[i] = false   # skid feed: refreshed below on real contact
 		if not _loop.is_empty():
+			# loop-ribbon contacts are deliberately NOT cached for skids: marks on
+			# the wrap would need wrap-aware placement — skipping beats wrong-deck streaks
 			var c := _suspend_loop(i, up, vel)
 			if not c.is_empty():
 				_grounded = true
@@ -352,12 +356,20 @@ func _physics_process(delta: float) -> void:
 				_grounded = true
 				gnormal += c.n
 				d = c.d
+				if i < 4:
+					_wheel_ground[i] = true
+					_wheel_gn[i] = c.n
+					_wheel_gpos[i] = to_global(_wheel_positions[i]) - up * d
 		else:
 			var ray := _rays[i]
 			if _suspend(ray, up, vel):
 				_grounded = true
 				gnormal += ray.get_collision_normal()
 				d = ray.global_position.distance_to(ray.get_collision_point())
+				if i < 4:
+					_wheel_ground[i] = true
+					_wheel_gn[i] = ray.get_collision_normal()
+					_wheel_gpos[i] = ray.get_collision_point()
 		_update_wheel_visual(i, d)   # keep the visible wheel on the ground (no sinking)
 	if _sidecar_on and _sidecar_ray and _suspend(_sidecar_ray, up, vel):
 		_grounded = true
@@ -627,8 +639,8 @@ func _physics_process(delta: float) -> void:
 			bf.restart()
 		_backfire_cd = 0.5
 	_prev_drive = drive
-	# skid marks under the rear wheels while drifting
-	_update_skids(delta)
+	# skid marks: rear ribbons while drifting, all four under a brake-lock or landing scuff
+	_update_skids(delta, braking)
 
 	# --- air-time + flip tracking (for later trick scoring) ----------------
 	if airborne:
@@ -774,6 +786,9 @@ func _on_land(vel: Vector3) -> void:
 	# (the visible-count tracker in _update_balloons turns the loss into staggered pops)
 	if _balloon_infl > 0.3 and into > 8.0:
 		balloon_time = maxf(balloon_time - balloon_cap * 0.25, 0.0)
+	# hard touchdowns scuff rubber for a beat — the road reads the impact back
+	if into > 6.0:
+		_skid_scuff = 0.3
 	# trick scoring: a clean landing feeds the combo chain (airtime + flips); the pot
 	# banks after the grace window if nothing else chains (see _update_combo)
 	var off_road := _road_off() > _road_half_here()
@@ -974,6 +989,9 @@ func reset_run(start: Vector3) -> void:
 	reset_physics_interpolation()
 	_restore_shed_panels()   # full health again -> put the panels back on
 	_expl_reset()            # no smoke column hanging over the fresh run
+	_skid_scuff = 0.0
+	if _skid:
+		_skid.call("clear_all")   # fresh road, fresh rubber
 
 ## Un-hide every panel shedding hid, clear the shed-tracking list, drop the
 ## threshold memory back to full health, and free any clones still tumbling
@@ -1090,6 +1108,9 @@ func respawn_at(z: float) -> void:
 	_drift_seg_pts = 0.0
 	reset_physics_interpolation()
 	_expl_reset()   # a pit-fall respawn must not leave a fireball animating below
+	_skid_scuff = 0.0
+	if _skid:
+		_skid.call("clear_all")   # marks behind a teleport read as someone else's
 	# NOTE: health is NOT restored on a checkpoint respawn (only reset_run does that),
 	# so shed panels intentionally stay off — the car should still look as beat-up as
 	# its HP says. Any clones still tumbling from the wipeout keep animating/self-free
@@ -1831,13 +1852,11 @@ func apply_smoke_color(color: Color) -> void:
 	for ts in _tire_smoke:
 		_retint(ts, core, edge)
 
-## Drift skid-streak colour (the marks laid under the rear wheels). Alpha is still
-## animated per-mark in _update_skids; we only set the RGB here.
+## Drift skid-streak colour. Tints the rubber laid from NOW ON (each ribbon
+## segment bakes its color at lay time); existing marks keep theirs and fade out.
 func apply_streak_color(color: Color) -> void:
-	for mi in _skid_marks:
-		var m := mi.material_override as StandardMaterial3D
-		if m:
-			m.albedo_color = Color(color.r, color.g, color.b, m.albedo_color.a)
+	if _skid:
+		_skid.set("tint", Color(color.r, color.g, color.b))
 
 ## Boost flame colour (the rocket jets). Core is pushed toward white so it still
 ## reads as hot; the tint shows through the body and trailing edge of the jet.
@@ -3174,67 +3193,32 @@ func _make_backfire() -> GPUParticles3D:
 
 # --- skid marks --------------------------------------------------------------
 func _build_skids() -> void:
-	_skid_root = Node3D.new()
-	_skid_root.name = "HCSkidRoot"
-	for _i in range(SKID_POOL):
-		var mi := MeshInstance3D.new()
-		var qm := QuadMesh.new()
-		qm.size = Vector2(0.55, 0.95)
-		mi.mesh = qm
-		var m := StandardMaterial3D.new()
-		m.albedo_color = Color(0.05, 0.05, 0.06, 0.0)
-		m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-		m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-		mi.material_override = m
-		mi.visible = false
-		_skid_root.add_child(mi)
-		_skid_marks.append(mi)
-		_skid_life.append(0.0)
-	# park the pool in WORLD space (under the scene, not the car) so the marks stay
-	# on the ground as we drive on. Clear any leftover root from a previous car.
-	var host: Node = get_parent()
-	if host:
-		var ex: Node = host.get_node_or_null("HCSkidRoot")
-		if ex:
-			ex.queue_free()
-		host.add_child.call_deferred(_skid_root)
+	_skid = HCSkidPool.new()
+	_skid.name = "HCSkid"
+	# child of the car (dies with the car on rebuild/map switch) but top_level
+	# inside HCSkid keeps the laid marks parked in world space
+	add_child(_skid)
 
-## Lay one flat skid quad at a ground point, long axis along the travel heading.
-func _stamp_skid(pos: Vector3, heading: Vector3) -> void:
-	var mi := _skid_marks[_skid_idx]
-	_skid_life[_skid_idx] = SKID_LIFE
-	_skid_idx = (_skid_idx + 1) % SKID_POOL
-	var fwd := Vector3(heading.x, 0.0, heading.z)
-	if fwd.length() < 0.1:
-		fwd = Vector3.FORWARD
-	fwd = fwd.normalized()
-	var right := fwd.cross(Vector3.UP).normalized()
-	mi.visible = true
-	mi.global_transform = Transform3D(Basis(right, fwd, Vector3.UP), pos + Vector3(0, 0.04, 0))
-
-func _update_skids(delta: float) -> void:
-	for i in range(_skid_marks.size()):
-		if _skid_life[i] > 0.0:
-			_skid_life[i] -= delta
-			var mi := _skid_marks[i]
-			if _skid_life[i] <= 0.0:
-				mi.visible = false
-			else:
-				(mi.material_override as StandardMaterial3D).albedo_color.a = clampf(_skid_life[i] / SKID_LIFE, 0.0, 1.0) * 0.72
-	if not (drifting and _grounded):
+## Feed the skid ribbons from this tick's cached wheel contacts. Rear wheels mark
+## while drifting; all four mark under a brake-lock at speed or during the short
+## scuff window after a hard landing. Never marks while riding a loop (contacts
+## aren't cached there — see the suspension loop).
+func _update_skids(delta: float, braking: float) -> void:
+	if not _skid:
 		return
-	for jj in range(2):
-		var wj: int = jj + 2   # rear wheels are indices 2, 3
-		if wj >= _rays.size():
-			continue
-		var ray := _rays[wj]
-		if not ray.is_colliding():
-			continue
-		var cp := ray.get_collision_point()
-		if _skid_last[jj] != Vector3.ZERO and cp.distance_to(_skid_last[jj]) < 0.4:
-			continue
-		_skid_last[jj] = cp
-		_stamp_skid(cp, linear_velocity)
+	_skid_scuff = maxf(_skid_scuff - delta, 0.0)
+	var drift: bool = drifting and _grounded
+	var lock: bool = braking > 0.7 and linear_velocity.length() > 15.0 and _grounded
+	var scuff: bool = _skid_scuff > 0.0 and _grounded
+	var w: float = clampf(_wheel_base_width * 0.85, 0.3, 0.9)
+	for i in range(4):
+		var wants: bool = not dead and ((drift and i >= 2) or lock or scuff)
+		if wants and _wheel_ground[i]:
+			# brake-locks burn darkest; drift ribbons a touch lighter; scuffs lightest
+			var s: float = 0.95 if lock else (0.8 if drift else 0.6)
+			_skid.call("lay", i, _wheel_gpos[i], _wheel_gn[i], w, s)
+		else:
+			_skid.call("break_track", i)
 
 # --- rocket boosters (Rockets upgrade) --------------------------------------
 ## Twin nozzles on the tail (+Z, the rear) with a glowing throat and a flame jet.
