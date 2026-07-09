@@ -296,7 +296,14 @@ var _respawning := false
 var _shake := 0.0           # camera shake magnitude (decays)
 var _shake_off := Vector3.ZERO
 var _fov_punch := 0.0       # transient FOV kick on hard landings
+## --- menu polish (HC v7.6): one shared Theme so every screen's plain buttons ------
+## (menu buttons, shop buy/sell, retry, reset, ghost row...) share one rounded,
+## bordered, drop-shadowed look; per-instance StyleBox overrides (map cards, vehicle
+## strip, cosmetic swatches) still win over the theme, so this is additive, not a
+## replacement for the bespoke accent-tinted looks those already have.
+var _ui_theme: Theme
 var _shop: Control
+var _shop_panel: PanelContainer   # the shop/wreck screen's card — animated in on open (see _animate_panel_in)
 var _shop_header: Label
 var _shop_money: Label
 var _shop_tabs: TabContainer   # Garage / Upgrades / Cosmetics
@@ -306,6 +313,8 @@ var _reset_btn: Button
 var _restart_btn: Button
 var _money_btn: Button
 var _start_layer: CanvasLayer   # one-time title / how-to-play screen (pauses until dismissed)
+var _start_dim: ColorRect       # title screen dim backdrop — faded out (not just freed) on START
+var _start_center: CenterContainer   # title screen root Control — scaled/faded out on START
 var _start_btn: Button
 var _reset_armed := false   # fresh-start needs a confirm click so it's not a mis-tap
 var _first_veh_btn: Button   # focus target when the garage opens (gamepad nav)
@@ -548,12 +557,16 @@ func _ready() -> void:
 	_setup_camera()
 	_setup_hud()
 	_setup_speed_lines()
+	_ui_theme = _build_ui_theme()   # shared button/panel look — built before any screen below
 	_build_shop()
+	_juice_buttons_in(_shop)
 	_build_pause_menu()
+	_juice_buttons_in(_pause_layer)
 	_build_volume_toast()
 	_apply_upgrades()
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 	_build_start_menu()   # title + how-to-play; pauses the game until you hit START
+	_juice_buttons_in(_start_layer)
 
 ## Find every .glb in assets/car/ for the Garage's body-kit picker. Runtime-loaded
 ## (GlbUtil), so files just dropped in the folder work without an editor import pass.
@@ -1608,10 +1621,16 @@ func _build_start_menu() -> void:
 	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
 	dim.color = Color(0.03, 0.03, 0.05, 0.93)
 	_start_layer.add_child(dim)
+	_start_dim = dim
+	_setup_title_vignette(_start_layer)   # soft radial darkening behind the panel
+	_setup_title_dots(_start_layer)       # slow drifting motes — cheap parallax dressing
 
 	var center := CenterContainer.new()
 	center.set_anchors_preset(Control.PRESET_FULL_RECT)
+	center.theme = _ui_theme
+	center.pivot_offset = Vector2(640, 360)   # window is locked 1280x720 (CLAUDE.md invariant 4)
 	_start_layer.add_child(center)
+	_start_center = center
 	var panel := PanelContainer.new()
 	panel.custom_minimum_size = Vector2(760, 0)
 	_style_panel(panel, Color(0.07, 0.075, 0.1, 0.97), Color(0.32, 0.34, 0.42), 1, 16)
@@ -1627,6 +1646,9 @@ func _build_start_menu() -> void:
 	# --- logo -----------------------------------------------------------------
 	var title_lbl := _shop_label(box, "🏎  HILL CLIMB RACER", 36, Color(1, 0.82, 0.42))
 	title_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title_lbl.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.6))
+	title_lbl.add_theme_constant_override("outline_size", 6)
+	_bob_logo(title_lbl)   # slow bob/tilt flourish — purely cosmetic, tied to the ALWAYS-mode layer
 	var sub_lbl := _shop_label(box, "Drive as far as you can — or race the clock. Fuel is your timer.", 14, Color(0.68, 0.74, 0.86))
 	sub_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	box.add_child(HSeparator.new())
@@ -2025,16 +2047,35 @@ func _refresh_title_vehicle_buttons() -> void:
 func _begin_game() -> void:
 	if _audio:
 		_audio.call("play_click")
-	get_tree().paused = false
+	get_tree().paused = false   # the state change is immediate — everything below is cosmetic
 	if _start_layer:
-		_start_layer.queue_free()
+		var layer := _start_layer
+		var dim := _start_dim
+		var center := _start_center
 		_start_layer = null
-	_ghost_file_dialog = null   # was a child of _start_layer — freed with it above
-	_ghost_status_lbl = null
+		_start_dim = null
+		_start_center = null
+		_ghost_file_dialog = null   # was a child of _start_layer — freed with the fade below
+		_ghost_status_lbl = null
+		if is_instance_valid(center) and is_instance_valid(dim):
+			# quick fade + a touch of zoom-out so START doesn't just vanish — the game is
+			# already running underneath by the time this finishes (paused flag cleared above)
+			var tw := layer.create_tween()
+			tw.set_parallel(true)
+			tw.tween_property(dim, "modulate:a", 0.0, 0.18)
+			tw.tween_property(center, "modulate:a", 0.0, 0.16)
+			tw.tween_property(center, "scale", Vector2(1.04, 1.04), 0.18).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+			tw.chain().tween_callback(layer.queue_free)
+		else:
+			layer.queue_free()
+	else:
+		_ghost_file_dialog = null
+		_ghost_status_lbl = null
 
 # --- pause menu: ESC during a live run (not the title, not the garage) -------------
 
 var _pause_layer: CanvasLayer
+var _pause_panel: PanelContainer   # pause card — scaled/faded in on open (see _animate_panel_in)
 var _pause_resume_btn: Button
 var _fullscreen_btn: Button
 var master_volume := 1.0   # linear 0-1, persisted; pushed onto _audio (see _apply_volume)
@@ -2057,11 +2098,13 @@ func _build_pause_menu() -> void:
 	_pause_layer.add_child(dim)
 	var center := CenterContainer.new()
 	center.set_anchors_preset(Control.PRESET_FULL_RECT)
+	center.theme = _ui_theme
 	_pause_layer.add_child(center)
 	var panel := PanelContainer.new()
 	panel.custom_minimum_size = Vector2(380, 0)
 	_style_panel(panel, Color(0.08, 0.09, 0.12, 0.97), Color(0.4, 0.44, 0.55), 1, 14)
 	center.add_child(panel)
+	_pause_panel = panel
 	var pad := MarginContainer.new()
 	for m in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
 		pad.add_theme_constant_override(m, 22)
@@ -2232,6 +2275,7 @@ func _toggle_pause_menu() -> void:
 		_refresh_fullscreen_btn()
 		_pause_layer.visible = true
 		get_tree().paused = true
+		_animate_panel_in(_pause_panel, false)   # cosmetic scale/fade-in; visible flip above is instant
 		if _pause_resume_btn:
 			_pause_resume_btn.call_deferred("grab_focus")
 
@@ -2268,6 +2312,7 @@ func _build_shop() -> void:
 	_shop = Control.new()
 	_shop.set_anchors_preset(Control.PRESET_FULL_RECT)
 	_shop.visible = false
+	_shop.theme = _ui_theme
 	layer.add_child(_shop)
 	var dim := ColorRect.new()
 	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
@@ -2282,6 +2327,7 @@ func _build_shop() -> void:
 	panel.position = Vector2(-336, -350)
 	_style_panel(panel, Color(0.07, 0.075, 0.1, 0.97), Color(0.32, 0.34, 0.42), 1, 16)   # same look as the title/pause overlays
 	_shop.add_child(panel)
+	_shop_panel = panel
 	var pad := MarginContainer.new()
 	for m in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
 		pad.add_theme_constant_override(m, 18)
@@ -2670,11 +2716,171 @@ func _panel_style(bg: Color, border: Color, border_w: int = 1, radius: int = 12)
 	sb.set_corner_radius_all(radius)
 	sb.content_margin_left = 14; sb.content_margin_right = 14
 	sb.content_margin_top = 10; sb.content_margin_bottom = 10
+	sb.anti_aliasing = true
+	sb.shadow_color = Color(0, 0, 0, 0.4)   # droplet shadow — every panel/card shares this now
+	sb.shadow_size = 8
+	sb.shadow_offset = Vector2(0, 3)
 	return sb
 
 ## Apply the shared panel look to an existing PanelContainer.
 func _style_panel(p: PanelContainer, bg: Color, border: Color, border_w: int = 1, radius: int = 12) -> void:
 	p.add_theme_stylebox_override("panel", _panel_style(bg, border, border_w, radius))
+
+## --- menu polish helpers (HC v7.6) ------------------------------------------------
+## One Theme resource giving every plain Button (menu buttons, shop buy/sell, retry,
+## reset, ghost row, mode toggle...) a consistent rounded/bordered/drop-shadowed look
+## in all 5 states. Applied to the root Control of each screen (title/pause/shop) in
+## their _build_* functions; any button with its OWN stylebox override (map cards,
+## vehicle strip, cosmetic swatches) keeps that bespoke look — overrides win over
+## theme lookups per-state, so this is purely additive.
+func _build_ui_theme() -> Theme:
+	var th := Theme.new()
+	var mk := func(bg: Color, brd: Color, bw: int) -> StyleBoxFlat:
+		var sb := StyleBoxFlat.new()
+		sb.bg_color = bg
+		sb.border_color = brd
+		sb.set_border_width_all(bw)
+		sb.set_corner_radius_all(9)
+		sb.content_margin_left = 14; sb.content_margin_right = 14
+		sb.content_margin_top = 8; sb.content_margin_bottom = 8
+		sb.shadow_color = Color(0, 0, 0, 0.35)
+		sb.shadow_size = 4
+		sb.anti_aliasing = true
+		return sb
+	th.set_stylebox("normal", "Button", mk.call(Color(0.16, 0.17, 0.22, 0.96), Color(0.34, 0.36, 0.44), 1))
+	th.set_stylebox("hover", "Button", mk.call(Color(0.21, 0.22, 0.29, 0.98), Color(1.0, 0.82, 0.42, 0.9), 2))
+	th.set_stylebox("pressed", "Button", mk.call(Color(0.11, 0.12, 0.16, 0.98), Color(0.85, 0.65, 0.3), 2))
+	th.set_stylebox("disabled", "Button", mk.call(Color(0.1, 0.1, 0.12, 0.55), Color(0.22, 0.22, 0.26), 1))
+	th.set_stylebox("focus", "Button", mk.call(Color(0.19, 0.2, 0.26, 0.97), Color(1.0, 0.82, 0.42), 2))
+	th.set_color("font_color", "Button", Color(0.92, 0.93, 0.96))
+	th.set_color("font_hover_color", "Button", Color(1, 0.95, 0.8))
+	th.set_color("font_pressed_color", "Button", Color(1, 0.88, 0.55))
+	th.set_color("font_disabled_color", "Button", Color(0.45, 0.46, 0.5))
+	th.set_color("font_focus_color", "Button", Color(1, 0.95, 0.8))
+	return th
+
+## Recursively wire hover/press micro-interactions onto every Button under `root` —
+## called once per screen right after it's built (screens are built once at _ready and
+## never torn down/recreated, so this never needs to run twice on the same button).
+func _juice_buttons_in(root: Node) -> void:
+	if root == null:
+		return
+	for c in root.get_children():
+		if c is Button:
+			_wire_button_juice(c as Button)
+		if c.get_child_count() > 0:
+			_juice_buttons_in(c)
+
+## Short (~0.1s) hover-scale / press-dip tween per button — purely cosmetic, never
+## gates any state change. Pivot is recentred whenever the button resizes so the
+## scale reads as a pop rather than a slide.
+func _wire_button_juice(b: Button) -> void:
+	b.pivot_offset = b.size * 0.5
+	b.resized.connect(func(): b.pivot_offset = b.size * 0.5)
+	b.mouse_entered.connect(_on_juice_hover.bind(b, true))
+	b.mouse_exited.connect(_on_juice_hover.bind(b, false))
+	b.button_down.connect(_on_juice_press.bind(b))
+	b.button_up.connect(_on_juice_release.bind(b))
+
+func _on_juice_hover(b: Button, entered: bool) -> void:
+	if not is_instance_valid(b) or b.disabled:
+		return
+	b.set_meta("_hovered", entered)
+	_tween_btn_scale(b, 1.045 if entered else 1.0, 0.1)
+
+func _on_juice_press(b: Button) -> void:
+	if not is_instance_valid(b) or b.disabled:
+		return
+	_tween_btn_scale(b, 0.94, 0.06)
+
+func _on_juice_release(b: Button) -> void:
+	if not is_instance_valid(b):
+		return
+	var target := 1.045 if bool(b.get_meta("_hovered", false)) else 1.0
+	_tween_btn_scale(b, target, 0.1)
+
+func _tween_btn_scale(b: Button, target: float, dur: float) -> void:
+	var tw := b.create_tween()
+	tw.tween_property(b, "scale", Vector2(target, target), dur).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+
+## Scale/fade a panel in from slightly-small-and-transparent to full size — used for
+## opening the pause menu and the shop/garage/wreck screen. `slam` = TRANS_BACK gives
+## a natural little overshoot-then-settle for the wreck screen; a plain ease-out for
+## everything else. The panel is ALREADY fully visible/interactable the instant this
+## is called (callers flip .visible synchronously first) — this only animates its
+## presentation, so it can never desync from what a probe expects to click next.
+func _animate_panel_in(panel: Control, slam: bool) -> void:
+	if panel == null:
+		return
+	panel.pivot_offset = panel.size * 0.5
+	panel.modulate.a = 0.0
+	panel.scale = Vector2(0.82, 0.82) if slam else Vector2(0.94, 0.94)
+	var tw := panel.create_tween()
+	tw.set_ease(Tween.EASE_OUT)
+	tw.set_trans(Tween.TRANS_BACK if slam else Tween.TRANS_QUAD)
+	tw.tween_property(panel, "scale", Vector2.ONE, 0.22 if slam else 0.15)
+	tw.parallel().tween_property(panel, "modulate:a", 1.0, 0.12)
+
+## Slow logo bob/tilt flourish on the title screen — a small looping rotation tween
+## bound to the (ALWAYS-mode) title layer so it keeps animating while the tree is
+## paused, same pattern as the volume toast's fade tween.
+func _bob_logo(lbl: Label) -> void:
+	lbl.pivot_offset = lbl.size * 0.5
+	lbl.resized.connect(func(): lbl.pivot_offset = lbl.size * 0.5)
+	var tw := lbl.create_tween()
+	tw.set_loops()
+	tw.tween_property(lbl, "rotation_degrees", 1.4, 1.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+	tw.tween_property(lbl, "rotation_degrees", -1.4, 1.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+
+## Soft radial vignette behind the title panel — cheap atmosphere, procedural
+## (GradientTexture2D generated at runtime, no asset file).
+func _setup_title_vignette(parent: Node) -> void:
+	var grad := Gradient.new()
+	grad.set_color(0, Color(0, 0, 0, 0))
+	grad.set_color(1, Color(0, 0, 0, 0.5))
+	var tex := GradientTexture2D.new()
+	tex.gradient = grad
+	tex.fill = GradientTexture2D.FILL_RADIAL
+	tex.fill_from = Vector2(0.5, 0.5)
+	tex.fill_to = Vector2(1.0, 0.5)
+	tex.width = 256
+	tex.height = 256
+	var rect := TextureRect.new()
+	rect.texture = tex
+	rect.set_anchors_preset(Control.PRESET_FULL_RECT)
+	rect.stretch_mode = TextureRect.STRETCH_SCALE
+	rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	parent.add_child(rect)
+
+## Slow drifting motes behind the title panel — each is a tiny translucent dot,
+## ping-ponged between two points by its own looping tween (bound to `parent`, the
+## ALWAYS-mode title layer, so they keep drifting while the tree is paused). Cheap:
+## no per-frame processing at all, just Tween-driven position.
+func _setup_title_dots(parent: Node) -> void:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 7
+	for i in range(16):
+		var dot := ColorRect.new()
+		var r: float = rng.randf_range(2.0, 4.0)
+		dot.size = Vector2(r, r)
+		dot.color = Color(1, 1, 1, rng.randf_range(0.05, 0.16))
+		dot.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		var start_pos := Vector2(rng.randf_range(20.0, 1260.0), rng.randf_range(20.0, 700.0))
+		dot.position = start_pos
+		parent.add_child(dot)
+		var drift := Vector2(rng.randf_range(-40.0, 40.0), rng.randf_range(-70.0, -20.0))
+		var dur: float = rng.randf_range(9.0, 16.0)
+		var tw := dot.create_tween()
+		tw.set_loops()
+		tw.tween_property(dot, "position", start_pos + drift, dur).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+		tw.tween_property(dot, "position", start_pos, dur).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+
+## Subtle black outline on a HUD label — readability + one consistent look across the
+## fuel/health readout, score, combo, trick text, sprint/trial timers. Never touches
+## position/size, only font styling (CLAUDE.md: don't move gameplay HUD elements).
+func _hud_outline(lbl: Label, size: int = 4) -> void:
+	lbl.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.75))
+	lbl.add_theme_constant_override("outline_size", size)
 
 var _shop_summary := ""
 
@@ -2686,6 +2892,7 @@ func _show_shop() -> void:
 		_shop_summary += "\n" + _trial_result   # trial finish recap, if this run crossed the line
 	_shop.visible = true
 	_refresh_shop()
+	_animate_panel_in(_shop_panel, true)   # wreck: slam-in with a slight overshoot (cosmetic only)
 	# focus RETRY so a gamepad can just press A to go again (d-pad to browse upgrades)
 	if _restart_btn:
 		_restart_btn.call_deferred("grab_focus")
@@ -2700,6 +2907,7 @@ func _toggle_shop() -> void:
 		if _shop_tabs:
 			_shop_tabs.current_tab = 0
 		_refresh_shop()
+		_animate_panel_in(_shop_panel, false)   # garage: plain scale/fade-in (no overshoot)
 		_relink_active_chain()
 		if _first_veh_btn:
 			_first_veh_btn.call_deferred("grab_focus")
@@ -2998,6 +3206,7 @@ func _setup_hud() -> void:
 	_info = Label.new()
 	_info.position = Vector2(28, 90)   # below the (optional) balloon strip
 	_info.add_theme_font_size_override("font_size", 18)
+	_hud_outline(_info)
 	layer.add_child(_info)
 	_big = Label.new()
 	_big.set_anchors_preset(Control.PRESET_CENTER)
@@ -3006,12 +3215,14 @@ func _setup_hud() -> void:
 	_big.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_big.add_theme_font_size_override("font_size", 26)
 	_big.add_theme_color_override("font_color", Color(1, 1, 0.7))
+	_hud_outline(_big)
 	layer.add_child(_big)
 	_score_lbl = Label.new()
 	_score_lbl.set_anchors_preset(Control.PRESET_TOP_RIGHT)
 	_score_lbl.position = Vector2(-200, 28)
 	_score_lbl.add_theme_font_size_override("font_size", 24)
 	_score_lbl.add_theme_color_override("font_color", Color(1, 0.95, 0.5))
+	_hud_outline(_score_lbl)
 	layer.add_child(_score_lbl)
 	# combo readout under the score: unbanked pot + multiplier, with a thin drain
 	# bar showing the grace window. Hidden whenever no combo is open.
@@ -3021,6 +3232,7 @@ func _setup_hud() -> void:
 	_combo_lbl.add_theme_font_size_override("font_size", 17)
 	_combo_lbl.add_theme_color_override("font_color", Color(1.0, 0.62, 0.25))
 	_combo_lbl.visible = false
+	_hud_outline(_combo_lbl)
 	layer.add_child(_combo_lbl)
 	_combo_bar_bg = ColorRect.new()
 	_combo_bar_bg.set_anchors_preset(Control.PRESET_TOP_RIGHT)
@@ -3043,6 +3255,7 @@ func _setup_hud() -> void:
 	_sprint_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_sprint_lbl.add_theme_font_size_override("font_size", 44)
 	_sprint_lbl.add_theme_color_override("font_color", Color(0.6, 1.0, 0.7))
+	_hud_outline(_sprint_lbl, 6)
 	layer.add_child(_sprint_lbl)
 	# time-trial timer shares the sprint countdown's screen slot — the two modes are
 	# mutually exclusive per run (see _reset_run_mode_state), so they never overlap.
@@ -3053,6 +3266,7 @@ func _setup_hud() -> void:
 	_trial_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_trial_lbl.add_theme_font_size_override("font_size", 40)
 	_trial_lbl.add_theme_color_override("font_color", Color(1, 1, 1))
+	_hud_outline(_trial_lbl, 6)
 	layer.add_child(_trial_lbl)
 	_trial_sub_lbl = Label.new()
 	_trial_sub_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
@@ -3061,6 +3275,7 @@ func _setup_hud() -> void:
 	_trial_sub_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_trial_sub_lbl.add_theme_font_size_override("font_size", 14)
 	_trial_sub_lbl.add_theme_color_override("font_color", Color(0.75, 0.8, 0.88))
+	_hud_outline(_trial_sub_lbl, 3)
 	layer.add_child(_trial_sub_lbl)
 	_trick_lbl = Label.new()
 	_trick_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
@@ -3069,6 +3284,7 @@ func _setup_hud() -> void:
 	_trick_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_trick_lbl.add_theme_font_size_override("font_size", 32)
 	_trick_lbl.add_theme_color_override("font_color", Color(0.6, 1.0, 0.7))
+	_hud_outline(_trick_lbl, 5)
 	layer.add_child(_trick_lbl)
 	var hint := Label.new()
 	hint.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
