@@ -23,6 +23,25 @@ Design pillars (in priority order):
    all-drift sprint against the clock, big-air snow ridge. More flavors welcome.
 5. **Session-friendly.** Death → shop → retry in seconds. No friction.
 
+## Update (2026-07-09, tenth pass — "HC v7.9", same session)
+
+- **Drift skid marks** (`HCSkid.gd`): 600-segment MultiMesh ring buffer of ribbon
+  quads laid between consecutive wheel contacts (reuses the suspension's own
+  analytic ground data — zero extra terrain queries). Rear wheels while drifting,
+  all four under brake-lock >15 m/s, 0.3 s scuff after hard landings; shader age
+  fade; strips break across gaps/teleports; loop zones never mark; reset wipes.
+  `tests/SkidProbe.tscn` in the battery (12 probes now), SkidShot harness kept.
+- **Ambient life per map** (HCScenery): hills birds, alpine snowfall, canyon warm
+  dust (subtle — favorite map untinted), midnight fireflies + rare shooting star,
+  gravity-works embers + breathing beacon pulse. All car-following, ≤70 particles
+  per map, AmbientShot harness kept.
+- **Smoke fix**: `_make_smoke`'s untextured BILLBOARD_ENABLED quad rendered every
+  tire/exhaust/damage puff as a 1 m hard-edged square AND discarded per-particle
+  scale; now routed through the explosion pass's `_fx_puff_mat` (soft radial
+  sprite, BILLBOARD_PARTICLES + keep_scale). If you add particles, use that
+  helper — plain BILLBOARD_ENABLED on code-built particle quads is a trap.
+- Baselines unchanged through the whole session: SmoothProbe 2.78/0.17.
+
 ## Update (2026-07-09, ninth pass — "HC v7.7–7.8", same session as v7.6)
 
 - **Balloon float shipped** (roadmap item 8's first absurd contraption, end-to-end):
