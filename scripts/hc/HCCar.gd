@@ -3063,13 +3063,10 @@ func _make_smoke(col: Color, smin: float, smax: float, vmin: float, vmax: float,
 	pm.scale_curve = ct
 	g.process_material = pm
 	var qm := QuadMesh.new(); qm.size = Vector2(1, 1)
-	var m := StandardMaterial3D.new()
-	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	m.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
-	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	m.vertex_color_use_as_albedo = true
-	m.albedo_color = Color(1, 1, 1)
-	qm.material = m
+	# soft radial puff sprite; BILLBOARD_ENABLED here silently discarded the
+	# per-particle scale set above, so every puff rendered as a 1 m hard-edged
+	# square — _fx_puff_mat (BILLBOARD_PARTICLES + keep_scale) honors it
+	qm.material = _fx_puff_mat(Color(1, 1, 1, 1), false)
 	g.draw_pass_1 = qm
 	return g
 
