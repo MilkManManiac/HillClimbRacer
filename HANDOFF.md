@@ -23,6 +23,28 @@ Design pillars (in priority order):
    all-drift sprint against the clock, big-air snow ridge. More flavors welcome.
 5. **Session-friendly.** Death → shop → retry in seconds. No friction.
 
+## Update (2026-07-09, eighth pass — "HC v7.6")
+
+- **Trick & combo system v2 shipped** (roadmap item 4): tricks (air/flips, drift
+  segments, near-misses, perfect landings) chain into an unbanked pot with an
+  escalating multiplier (+x0.5/trick, cap x5) that BANKS on clean settle and DROPS on
+  wreck/flat-slam. Combo HUD (pot + mult + grace drain bar, top-right), escalating
+  combo/bank/lost synth one-shots. `tests/ComboProbe.tscn` (19 checks) is in the
+  battery; `tests/ComboShot.tscn` renders the HUD for eyeballing. Deliberately
+  skipped: slow-mo apex beat (time-scale is the riskiest juice — feel is sacred).
+- **Canyon creep_xing FIXED** (was detect-only): root cause — `_next_segment`'s
+  boxed-in fallback creeps a blind straight; on canyon seed it chain-tunneled two
+  branches to 18.9 m apart near s≈27.5 km. Fix: `_escape_turn` sweeps deterministic
+  sharper turns only when the tripwire's own 55 m danger gate fires — zero RNG
+  consumed, first 6 km of canyon (the feel reference) byte-identical. LoopScan: 7→0.
+- **Loop detach containment** (v7.3 known cosmetic): mid-loop detach now rides a
+  one-sided analytic wall rail down the INSIDE of the ring (no more mesh clipping);
+  sub-3 m/s crawlers get a gentle lip bumper and can't nose through the mouth.
+  LoopProbe grew phases C (fall containment) and D (crawler pin).
+- Battery is now 10 probes (ComboProbe added). Baselines unchanged: SmoothProbe
+  2.78/0.17, StuntProbe rms 1.92 lifts=0.
+- In flight: balloon-float contraption prototype (roadmap item 8, first absurd part).
+
 ## Update (2026-07-04, fifth pass — "HC v7")
 
 - **The road can now cross OVER itself.** Multi-surface analytic ground: `ground_info_y /
