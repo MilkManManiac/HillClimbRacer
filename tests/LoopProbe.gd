@@ -42,6 +42,7 @@ func _ready() -> void:
 	var trk := _phase_a_static()
 	await _phase_b_fast(trk)
 	await _phase_c_slow(trk)
+	await _phase_d_crawler(trk)
 	trk.queue_free()
 	print("[loop] %s in %d ms" % ["ALL PASS" if _fails == 0 else "%d FAILURES" % _fails, Time.get_ticks_msec() - t0])
 	get_tree().quit(0 if _fails == 0 else 1)
@@ -243,6 +244,14 @@ func _phase_c_slow(trk: Node3D) -> void:
 	var min_y := 1e9
 	var prev_y: float = car.global_position.y
 	var settled := 0
+	# ring-containment watch: while the detached fall is inside the ribbon's
+	# lateral band and above road level, the car's ring radius must never cross
+	# the ribbon outward (that WAS the v7.3 mesh clip)
+	var worst_rout := -99.0
+	var cc: Vector3 = (f.lp_e as Vector3) + Vector3.UP * lR
+	var fv: Vector3 = f.lp_f
+	var rv: Vector3 = f.lp_r
+	var half: float = f.lp_half
 	var t := 0
 	while t < 9000:
 		_drive_step(car, trk)
@@ -263,18 +272,56 @@ func _phase_c_slow(trk: Node3D) -> void:
 		if detached:
 			worst_dy = maxf(worst_dy, absf(y - prev_y))
 			min_y = minf(min_y, y)
+			if y > lvl + 1.5:
+				var q: Vector3 = car.global_position - cc
+				var lat: float = q.dot(rv)
+				if lat > -half - 0.5 and lat < float(f.lp_shift) + half + 0.5:
+					var qf: float = q.dot(fv)
+					worst_rout = maxf(worst_rout, sqrt(qf * qf + q.y * q.y) - lR)
 			if bool(car.get("dead")) or not bool(car.get("airborne")):
 				settled += 1
 				if settled > 90:   # grounded (or a settled wreck) for ~0.75 s = landed
 					break
 		prev_y = y
 	_release_all()
-	print("[loop] C end: t=%.1fs max_th=%.2f (%.0f deg) detached=%s dead=%s dy=%.2f min_y=%.1f (lvl=%.1f)" %
-		[t / 120.0, max_th, rad_to_deg(max_th), detached, bool(car.get("dead")), worst_dy, min_y, lvl])
+	print("[loop] C end: t=%.1fs max_th=%.2f (%.0f deg) detached=%s dead=%s dy=%.2f min_y=%.1f (lvl=%.1f) rout=%.2f" %
+		[t / 120.0, max_th, rad_to_deg(max_th), detached, bool(car.get("dead")), worst_dy, min_y, lvl, worst_rout])
 	_check(mounted, "slow car mounted the loop")
 	_check(max_th > 1.2, "climbed past ~70 deg before stalling (max th %.2f)" % max_th)
 	_check(detached and max_th < TAU - 0.5, "detached below adhesion speed (never completed the wrap)")
 	_check(worst_dy < 1.2, "ballistic fall, no teleports: worst per-tick dy %.2fm < 1.2m" % worst_dy)
+	_check(worst_rout < 0.35, "fall stayed INSIDE the ring, no ribbon clip (worst r-R %+.2fm < 0.35m)" % worst_rout)
 	_check(min_y > lvl - 10.0 and min_y < lvl + 2.0 * lR, "fell back inside the loop to the road (min_y %.1f)" % min_y)
 	_check(settled > 90 or bool(car.get("dead")), "came to rest on the ground below (landed or wrecked)")
+	car.queue_free()
+
+# --- D: sub-mount-speed crawler gets a soft bumper, never noses through -----------
+func _phase_d_crawler(trk: Node3D) -> void:
+	var f := _loop_feature(trk)
+	if f.is_empty():
+		return
+	var ent: float = f.lp_ent
+	var e: Vector3 = f.lp_e
+	var fv: Vector3 = f.lp_f
+	# 2.5 m/s cap is below the 3 m/s mount gate; the strong engine makes sure the
+	# bumper is beating the MOTOR, not a weak throttle
+	var car := _make_car(trk, 2.5, 8000.0, ent - 15.0)
+	print("[loop] D: crawler (2.5 m/s cap) full throttle at the mouth — expecting a soft stop at the lip...")
+	var max_dfwd := -1e9
+	var mounted := false
+	var t := 0
+	while t < 3600 and not bool(car.get("dead")):
+		Input.action_press("accelerate")
+		await get_tree().physics_frame
+		t += 1
+		max_dfwd = maxf(max_dfwd, (car.global_position - e).dot(fv))
+		if not (car.get("_loop") as Dictionary).is_empty():
+			mounted = true
+	_release_all()
+	print("[loop] D end: t=%.1fs max_dfwd=%.2fm mounted=%s dead=%s v=%.1f" %
+		[t / 120.0, max_dfwd, mounted, bool(car.get("dead")), car.linear_velocity.length()])
+	_check(max_dfwd > -6.0, "crawler actually reached the lip (max dfwd %.2fm > -6m)" % max_dfwd)
+	_check(max_dfwd < 0.5, "crawler never nosed into the ring (max dfwd %.2fm < 0.5m)" % max_dfwd)
+	_check(not mounted, "crawler never mounted (below the 3 m/s gate)")
+	_check(not bool(car.get("dead")), "the bumper is gentle: crawler survives it")
 	car.queue_free()

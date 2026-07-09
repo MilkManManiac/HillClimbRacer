@@ -140,6 +140,7 @@ var tunnel_lifts: int = 0       # anti-tunnel floor activations (probes assert 0
 var _loop: Dictionary = {}      # cached loop frame while riding ({} = normal ground physics)
 var _loop_th := 0.0             # unwrapped wrap angle across the current ride (0 -> TAU)
 var _loop_cd := 0.0             # re-mount cooldown after any dismount (s)
+var _loop_fall: Dictionary = {} # frame kept after a mid-wrap release: the ribbon stays a one-sided wall until the fall clears the ring
 
 # --- gap / checkpoint state --------------------------------------------------
 signal gap_cleared(idx: int)
@@ -878,6 +879,7 @@ func reset_run(start: Vector3) -> void:
 	_falling_out = false
 	tunnel_lifts = 0
 	_loop = {}
+	_loop_fall = {}
 	_loop_cd = 0.0
 	linear_velocity = Vector3.ZERO
 	angular_velocity = Vector3.ZERO
@@ -984,6 +986,7 @@ func respawn_at(z: float) -> void:
 	_gap_armed = false
 	_falling_out = false
 	_loop = {}
+	_loop_fall = {}
 	_loop_cd = 0.0
 	_air_time = 0.0
 	_flip_accum = 0.0
@@ -1171,6 +1174,8 @@ const LOOP_STICK := 2.5
 func _loop_update(delta: float, was_grounded: bool, up: Vector3) -> Vector3:
 	if _loop.is_empty():
 		_loop_cd = maxf(_loop_cd - delta, 0.0)
+		if not _loop_fall.is_empty():
+			_loop_fall_contain()
 		if dead or _falling_out or not was_grounded or _loop_cd > 0.0:
 			return Vector3.ZERO
 		var st: Dictionary = terrain.call("loop_state", global_position)
@@ -1179,7 +1184,25 @@ func _loop_update(delta: float, was_grounded: bool, up: Vector3) -> Vector3:
 		# mount gate: aimed at the ribbon, upright, and actually rolling forward
 		if absf(float(st.lat)) > float(st.half) - 0.2 or up.dot(Vector3.UP) < 0.5:
 			return Vector3.ZERO
-		if linear_velocity.dot(st.fwd) < 3.0:
+		var vfwd: float = linear_velocity.dot(st.fwd)
+		if vfwd < 3.0:
+			# Below mount speed nothing catches the car and nothing stops it (the
+			# ribbon carries no collision by design, car mask 2) — a crawler noses
+			# straight through the mouth. Give the lip a soft analytic bumper: a
+			# gentle spring toward a stop line just short of the tangent, plus a
+			# velocity rail AT the line (an engine can out-push any feel-safe
+			# spring; the rail is what guarantees no nose-through, exactly like
+			# the ride's radial rail). Never fights a car backing away.
+			var dfwd: float = (global_position - (st.e as Vector3)).dot(st.fwd)
+			if vfwd > -0.1 and dfwd > -1.2 and dfwd < 2.5:
+				linear_velocity -= (st.fwd as Vector3) * (clampf((dfwd + 1.2) * 4.0, 0.0, 6.0) * delta)
+				if dfwd > -0.2 and vfwd > 0.0:
+					linear_velocity -= (st.fwd as Vector3) * vfwd
+				if dfwd > -0.2:
+					# the rail alone still lets the engine creep centimetres per
+					# second past the line (zeroed velocity is re-added every
+					# tick) — pin the position too, gently
+					global_position -= (st.fwd as Vector3) * minf(dfwd + 0.2, 0.05)
 			return Vector3.ZERO
 		_loop = {"e": st.e, "fwd": st.fwd, "right": st.right,
 				"R": float(st.R), "half": float(st.half), "shift": float(st.shift)}
@@ -1216,6 +1239,12 @@ func _loop_update(delta: float, was_grounded: bool, up: Vector3) -> Vector3:
 			# (that fired the anti-tunnel floor). Detaches KEEP their spin: a
 			# falling car should tumble.
 			angular_velocity -= rt * angular_velocity.dot(rt)
+		else:
+			# a mid-wrap release falls INSIDE the ring, but above 90 deg gravity's
+			# radial component points OUT — pure ballistics carries the car through
+			# the ribbon mesh (the v7.3 clip). Keep the frame: the fall treats the
+			# ribbon as the one-sided wall it visually is.
+			_loop_fall = _loop
 		_loop = {}
 		_loop_cd = 0.6
 		return Vector3.ZERO
@@ -1241,6 +1270,34 @@ func _loop_update(delta: float, was_grounded: bool, up: Vector3) -> Vector3:
 	var ease_in: float = smoothstep(0.05, 0.5, th)
 	linear_velocity += rt * (clampf(drift - lat * 3.0 - vlat, -0.5, 0.5) * ease_in)
 	return rt * (vt / lR)   # the frame's spin (about the loop plane's axis)
+
+## One-sided wall rail for a detached-inside fall: the same absorb as the ride's
+## radial rail, but only when the fall reaches the ribbon radius from inside —
+## a fall that never touches the wall stays pure ballistics (C1 at the release:
+## the car detaches AT the wall with ~zero radial speed, so the first absorbs are
+## millimetric). Lets go near the ground (the ribbon is at road level there — the
+## plain landing owns it), off the ribbon's lateral band, or once landed.
+func _loop_fall_contain() -> void:
+	var f: Vector3 = _loop_fall.fwd
+	var rt: Vector3 = _loop_fall.right
+	var lR: float = _loop_fall.R
+	var q := global_position - ((_loop_fall.e as Vector3) + Vector3.UP * lR)
+	var qf := q.dot(f)
+	var r := sqrt(qf * qf + q.y * q.y)
+	var th := fposmod(atan2(qf, -q.y), TAU)
+	var sh: float = float(_loop_fall.shift) * smoothstep(0.0, 1.0, clampf(th / TAU, 0.0, 1.0))
+	if dead or _falling_out or _grounded or q.y < -lR + 1.4 or r > lR + 2.0 \
+			or absf(q.dot(rt) - sh) > float(_loop_fall.half) + 1.5:
+		_loop_fall = {}
+		return
+	var r_wall := lR - 0.06
+	if r <= r_wall:
+		return
+	var nin := (-f * qf - Vector3.UP * q.y) / maxf(r, 0.001)
+	global_position += nin * minf(r - r_wall, 0.25)
+	var vout := -linear_velocity.dot(nin)
+	if vout > 0.0:
+		linear_velocity += nin * vout
 
 ## Loop-ribbon suspension: the same spring as _suspend_analytic, but the "ground"
 ## is the vertical-circle ribbon — the gap is measured along the wheel's own
