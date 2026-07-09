@@ -176,6 +176,13 @@ var _road_mat: StandardMaterial3D
 var _rail_mat: StandardMaterial3D
 var _rail_cap_mat: StandardMaterial3D
 var _post_mat: StandardMaterial3D
+var _reflector_mat: StandardMaterial3D
+## Auto-detected "is this a night map" flag, derived from grass_color luminance rather
+## than a dedicated export — maps push overrides onto HCTrack via terrain.set(k,v) from
+## a dict HCTrack doesn't own, so we key off a palette value every map already sets
+## instead of requiring a plumbing change elsewhere. Midnight's dark grass reads well
+## below any daytime map's (incl. alpine's bright snow); see _mats().
+var _night := false
 
 # --- roadside scatter (trees/rocks) — meshes loaded ONCE and reused per-tile via
 # MultiMesh, so streaming a tile never touches disk. Keyed by the GLB path in
@@ -183,7 +190,8 @@ var _post_mat: StandardMaterial3D
 var _scatter_meshes_loaded := false
 var _scatter_kind_mesh := {}    # glb path -> Mesh
 var _scatter_kind_scale := {}   # glb path -> base scale (normalises native mesh size)
-var _post_mesh: BoxMesh         # shared guardrail-post mesh
+var _post_mesh: Mesh            # shared guardrail-post mesh (slightly tapered)
+var _reflector_mesh: Mesh       # shared tiny reflector-dot mesh sat on each post
 
 # --- chevron turn-warning signs (outside of bends) — one shared mesh (red panel +
 # emissive white arrow), built once and reused via a MeshInstance3D per placement -----
@@ -1642,6 +1650,9 @@ func _update_tiles() -> void:
 			built += 1
 
 func _mats() -> void:
+	# cheap (3 adds) so recomputing every call is fine; catches a map override that
+	# lands after the first tile build.
+	_night = (grass_color.r + grass_color.g + grass_color.b) / 3.0 < 0.18
 	if _road_mat == null:
 		_road_mat = StandardMaterial3D.new()
 		_road_mat.vertex_color_use_as_albedo = true
@@ -1673,8 +1684,17 @@ func _mats() -> void:
 		_rail_cap_mat.emission_energy_multiplier = 0.6
 	if _post_mat == null:
 		_post_mat = StandardMaterial3D.new()
-		_post_mat.albedo_color = rail_post_color
-		_post_mat.roughness = 0.85
+		# darker than the rail band's post-color stop — reads as dull steel, not paint
+		_post_mat.albedo_color = rail_post_color.darkened(0.35)
+		_post_mat.roughness = 0.75
+		_post_mat.metallic = 0.25
+	if _reflector_mat == null:
+		_reflector_mat = StandardMaterial3D.new()
+		_reflector_mat.albedo_color = rail_band_color
+		_reflector_mat.emission_enabled = true
+		_reflector_mat.emission = rail_band_color
+		# subtle catch-the-light dot by day, a real glow once night auto-detects
+		_reflector_mat.emission_energy_multiplier = 1.8 if _night else 0.2
 
 # lateral cross-section offsets (fractions of the meshed half-width) for the ribbon.
 const LAT_FR := [-1.0, -0.8, -0.62, -0.5, -0.32, -0.12, 0.0, 0.12, 0.32, 0.5, 0.62, 0.8, 1.0]
@@ -1935,49 +1955,98 @@ func _varied_asphalt(vh: float) -> Color:
 	var av := 1.0 + vh * 0.04
 	return Color(asphalt_color.r * av, asphalt_color.g * av, asphalt_color.b * av)
 
-## Builds one side's guardrail into `container`: the grey->red gradient band strip
-## (as before), PLUS a thin emissive cap along the very top edge (so the "rail glows"
-## reads as a deliberate top band, not a uniformly-lit strip), PLUS short vertical
-## posts every couple of rows so it reads as a guardrail rather than a floating ribbon.
+## W-beam cross-section profile: (height above the ground-contact point, lateral
+## "bulge" toward the road) pairs tracing the classic corrugated guardrail silhouette
+## bottom-to-top — a ridge, a valley, and a second ridge instead of one flat band.
+## Cheap: 3 quads per row-pair instead of 1, still O(rows), no per-tile cost blowup.
+const RAIL_PROFILE: Array[Vector2] = [
+	Vector2(0.0, 0.0),
+	Vector2(0.55, 0.22),
+	Vector2(1.05, -0.16),
+	Vector2(1.6, 0.12),
+]
+const RAIL_TOP_H := 1.6
+const RAIL_FLARE_ROWS := 3   # rows of taper approaching a gap void's edge
+
+## Per-profile-point vertex color: baked highlight on the ridge (index 1), baked
+## shadow in the valley (index 2), dark steel base (0) rising to the bright accent
+## band at the top (3, matching the emissive cap).
+func _rail_band_color(profile_index: int) -> Color:
+	match profile_index:
+		0:
+			return rail_post_color.darkened(0.15)
+		1:
+			return rail_post_color.lerp(rail_band_color, 0.6).lightened(0.4)
+		2:
+			return rail_post_color.darkened(0.55)
+		_:
+			return rail_band_color
+
+## Builds one side's guardrail into `container`: a W-beam profile band (bottom-to-top
+## gradient, grey posts to the glowing red/accent band), a thin emissive cap along the
+## very top edge, tapered steel posts every couple of rows with small reflector dots
+## (emissive at night), and a flare-to-ground taper approaching any gap void so the
+## rail doesn't just stop mid-air at a jump's edge.
 func _build_rail_side(container: Node3D, rows: Array, side: float) -> void:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var cap := SurfaceTool.new()
 	cap.begin(Mesh.PRIMITIVE_TRIANGLES)
-	var prev_lo := Vector3.ZERO
-	var prev_hi := Vector3.ZERO
-	var prev_cap := Vector3.ZERO
+	var prev_pts: Array[Vector3] = []
+	var prev_cols: Array[Color] = []
+	var prev_cap_top := Vector3.ZERO
 	var have := false
 	var post_xforms: Array[Transform3D] = []
+	var reflector_xforms: Array[Transform3D] = []
 	var row_idx := 0
-	for r in rows:
+	var n_rows: int = rows.size()
+	for ri in range(n_rows):
+		var r: Dictionary = rows[ri]
 		var rh: float = r.rh
-		var lat := side * rh
-		var lo := Vector3(r.cx + r.rx * lat, _height_lat(r.d, lat, rh) - 0.3, r.cz + r.rz * lat)
-		var hi := lo + Vector3(0, 1.6, 0)
-		var cap_top := hi + Vector3(0, 0.25, 0)   # thin sliver above hi = the glowing cap rail
+		var lat0 := side * rh
+		var flare := _rail_flare(rows, ri)
+		var base_y := _height_lat(r.d, lat0, rh) - 0.3
+		var pts: Array[Vector3] = []
+		var cols: Array[Color] = []
+		for pi in range(RAIL_PROFILE.size()):
+			var pe: Vector2 = RAIL_PROFILE[pi]
+			var h: float = pe.x * flare
+			var lat: float = lat0 - side * pe.y * flare
+			pts.append(Vector3(r.cx + r.rx * lat, base_y + h, r.cz + r.rz * lat))
+			# Baked highlight/shadow banding (not a smooth height gradient): the ridge
+			# facet is lightened as if catching light, the valley darkened as if in its
+			# own shadow — this reads as corrugated metal even under flat/overcast
+			# lighting, where the real geometry's shading alone would be too subtle.
+			cols.append(_rail_band_color(pi))
+		var cap_top := pts[pts.size() - 1] + Vector3(0, 0.25 * flare, 0)
 		if have:
-			st.set_color(rail_post_color); st.add_vertex(prev_lo)
-			st.set_color(rail_band_color); st.add_vertex(prev_hi)
-			st.set_color(rail_band_color); st.add_vertex(hi)
-			st.set_color(rail_post_color); st.add_vertex(prev_lo)
-			st.set_color(rail_band_color); st.add_vertex(hi)
-			st.set_color(rail_post_color); st.add_vertex(lo)
-			cap.set_color(rail_band_color); cap.add_vertex(prev_hi)
-			cap.set_color(rail_band_color); cap.add_vertex(prev_cap)
+			for k in range(pts.size() - 1):
+				_quad(st, prev_pts[k], prev_pts[k + 1], pts[k], pts[k + 1], prev_cols[k], prev_cols[k + 1], cols[k], cols[k + 1])
+			var prev_top := prev_pts[prev_pts.size() - 1]
+			var top := pts[pts.size() - 1]
+			cap.set_color(rail_band_color); cap.add_vertex(prev_top)
+			cap.set_color(rail_band_color); cap.add_vertex(prev_cap_top)
 			cap.set_color(rail_band_color); cap.add_vertex(cap_top)
-			cap.set_color(rail_band_color); cap.add_vertex(prev_hi)
+			cap.set_color(rail_band_color); cap.add_vertex(prev_top)
 			cap.set_color(rail_band_color); cap.add_vertex(cap_top)
-			cap.set_color(rail_band_color); cap.add_vertex(hi)
-		if row_idx % 2 == 0:   # a post every other row (~8 m) — enough to read as a guardrail
+			cap.set_color(rail_band_color); cap.add_vertex(top)
+		if row_idx % 2 == 0 and flare > 0.5:   # a post every other row (~8 m); skip near a flare-out
 			_ensure_post_mesh()
 			var yaw := atan2(r.rx, r.rz)   # align the post's thin axis across the road
 			var pb := Basis(Vector3.UP, yaw)
-			post_xforms.append(Transform3D(pb, lo + Vector3(0, 0.5, 0)))
-		prev_lo = lo; prev_hi = hi; prev_cap = cap_top; have = true
+			var post_base := Vector3(r.cx + r.rx * lat0, base_y, r.cz + r.rz * lat0)
+			post_xforms.append(Transform3D(pb, post_base + Vector3(0, 0.5, 0)))
+			# reflector dot nudged slightly toward the road so it isn't swallowed by the post
+			var inward := Vector3(r.rx, 0, r.rz) * (-side) * 0.1
+			reflector_xforms.append(Transform3D(Basis.IDENTITY, post_base + Vector3(0, 0.55, 0) + inward))
+		prev_pts = pts; prev_cols = cols; prev_cap_top = cap_top; have = true
 		row_idx += 1
-	st.generate_normals()
-	cap.generate_normals()
+	# FLAT (unsmoothed) normals: smooth normals would average away the exact crease
+	# between profile segments (they share exact vertex positions at each seam),
+	# erasing the W-beam's ridge/valley read — flat facets are also consistent with
+	# this game's low-poly look elsewhere (road ribbon aside).
+	st.generate_normals(false)
+	cap.generate_normals(false)
 	var mi := MeshInstance3D.new()
 	mi.mesh = st.commit()
 	mi.material_override = _rail_mat
@@ -1998,13 +2067,55 @@ func _build_rail_side(container: Node3D, rows: Array, side: float) -> void:
 		mmi.material_override = _post_mat
 		mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		container.add_child(mmi)
+		var rm := MultiMesh.new()
+		rm.transform_format = MultiMesh.TRANSFORM_3D
+		rm.mesh = _reflector_mesh
+		rm.instance_count = reflector_xforms.size()
+		for i in range(reflector_xforms.size()):
+			rm.set_instance_transform(i, reflector_xforms[i])
+		var rmi := MultiMeshInstance3D.new()
+		rmi.multimesh = rm
+		rmi.material_override = _reflector_mat
+		rmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		container.add_child(rmi)
 
-## Shared post mesh, built once — a short dark box that sits at the rail base.
+## Tapers a rail cross-section toward 0 (flat, at ground level) as it approaches a gap
+## void's edge within RAIL_FLARE_ROWS rows, and pins it to exactly 0 inside the void —
+## so the guardrail visually flares down into the ground at a jump instead of floating
+## over open air. 1.0 = full-height rail, unaffected almost everywhere on the track.
+func _rail_flare(rows: Array, ri: int) -> float:
+	var r: Dictionary = rows[ri]
+	if bool(r.void):
+		return 0.0
+	var dist := RAIL_FLARE_ROWS + 1
+	for k in range(1, RAIL_FLARE_ROWS + 1):
+		var lo_i := ri - k
+		var hi_i := ri + k
+		if (lo_i >= 0 and bool(rows[lo_i].void)) or (hi_i < rows.size() and bool(rows[hi_i].void)):
+			dist = k
+			break
+	if dist > RAIL_FLARE_ROWS:
+		return 1.0
+	return float(dist) / float(RAIL_FLARE_ROWS + 1)
+
+## Shared post + reflector meshes, built once. The post is a 4-sided CylinderMesh
+## (a square prism from 4 radial segments) with a smaller top radius than bottom —
+## a cheap taper that reads as a rolled-steel guardrail post instead of a fencepost.
 func _ensure_post_mesh() -> void:
 	if _post_mesh != null:
 		return
-	_post_mesh = BoxMesh.new()
-	_post_mesh.size = Vector3(0.18, 1.0, 0.18)
+	var post := CylinderMesh.new()
+	post.top_radius = 0.075
+	post.bottom_radius = 0.11
+	post.height = 1.1
+	post.radial_segments = 4
+	_post_mesh = post
+	var refl := SphereMesh.new()
+	refl.radius = 0.055
+	refl.height = 0.11
+	refl.radial_segments = 6
+	refl.rings = 3
+	_reflector_mesh = refl
 
 # --- roadside scatter (trees/rocks) -------------------------------------------
 
