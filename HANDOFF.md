@@ -23,6 +23,32 @@ Design pillars (in priority order):
    all-drift sprint against the clock, big-air snow ridge. More flavors welcome.
 5. **Session-friendly.** Death → shop → retry in seconds. No friction.
 
+## Update (2026-07-09, ninth pass — "HC v7.7–7.8", same session as v7.6)
+
+- **Balloon float shipped** (roadmap item 8's first absurd contraption, end-to-end):
+  "Party Balloons" 6-tier shop part; hold F (pad-X) airborne → buoyant ~5 m/s fall,
+  C1 engage, roof balloon cluster inflates/sways/pops as the charge drains, hard
+  slams burst 25%, floats >2 s feed the combo. `tests/BalloonProbe.tscn` (24 checks)
+  + BalloonShot harness. Owner-playtest asks: should higher tiers fall SLOWER (one
+  constant); should rails pop balloons on contact?
+- **Visual wave (owner ask "coins, guard rails, explosions, menus")**:
+  - Pickups redesigned (chamfered gold coin, jerry-can fuel, nitro bottle; periodic
+    glints, richer collect bursts + ground ring). W-beam guardrail profile, tapered
+    posts, night reflector dots (night derived from grass_color luminance), rails
+    flare into the ground at gap edges. `tests/PickupRailShot` harness.
+  - Wreck explosions (health deaths only): core flash, ground shockwave ring, debris
+    + panel shed, fire licks/embers, 4 s smoke, camera kick, sub-thump audio layer;
+    landings speak an impact language (directional dirt spray vs clean white streak
+    on perfect landings). `tests/WreckShot` harness (has a --diag flag).
+  - Menu polish: one procedural UI theme (rounded, shadows, amber focus), hover/press
+    tweens on all buttons, panel slide/slam transitions, title vignette + drifting
+    motes + logo bob, outlined HUD fonts. All cosmetic — probe-visible state stays
+    synchronous.
+  - Violent deaths wait 0.9 s before the shop so the fireball reads (headless keeps
+    the synchronous open).
+- Battery is 11 probes now (+BalloonProbe). Baselines still 2.78/0.17, StuntProbe
+  rms 1.92 lifts=0, LoopScan canyon xing=0.
+
 ## Update (2026-07-09, eighth pass — "HC v7.6")
 
 - **Trick & combo system v2 shipped** (roadmap item 4): tricks (air/flips, drift
