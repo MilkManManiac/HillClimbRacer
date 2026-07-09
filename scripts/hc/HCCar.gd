@@ -82,6 +82,19 @@ var _cans: Array[MeshInstance3D] = []
 var _dust: GPUParticles3D        # small landing dust (soft touchdowns)
 var _dust_big: GPUParticles3D    # bigger landing dust (hard impacts)
 var _ring_puff: GPUParticles3D   # ground-hugging ring puff (really hard landings)
+var _dust_dir: GPUParticles3D    # directional dirt spray along travel (big landings)
+var _perfect_ring: GPUParticles3D  # clean white shockwave — the PERFECT-landing read
+# --- wreck explosion rig (pre-built once; a wreck only restarts/pokes it) ------
+var _expl_root: Node3D           # top_level holder so the fireball ignores body tilt
+var _expl_flash: MeshInstance3D  # emissive core sphere: expands + fades in ~0.25 s
+var _expl_ring: MeshInstance3D   # ground shockwave torus: expands + fades in ~0.6 s
+var _expl_light: OmniLight3D     # orange flicker over the first ~0.7 s
+var _expl_smoke: GPUParticles3D  # thick column that rises/disperses ~3.5 s
+var _expl_fire: GPUParticles3D   # flame licks smoldering at the wreck ~2 s
+var _expl_embers: GPUParticles3D # sparks lofting off the fire
+var _expl_debris: GPUParticles3D # tumbling low-poly chunks (covers GLB bodies too)
+var _expl_t: float = -1.0        # explosion timeline clock (-1 = idle)
+var _exploded: bool = false      # one fireball per death
 var _rockets: Array[Node3D] = []
 var _rocket_flames: Array[GPUParticles3D] = []
 var _rocket_cores: Array[GPUParticles3D] = []   # bright inner core of the boost jets
@@ -260,6 +273,7 @@ func _ready() -> void:
 	_build_airbrake()
 	_build_cans()
 	_build_dust()
+	_build_explosion()
 	_build_rockets()
 	_build_balloons()
 	_build_smoke()
@@ -275,6 +289,10 @@ func apply_com() -> void:
 	center_of_mass = Vector3(0, com_height, 0)
 
 func _physics_process(delta: float) -> void:
+	# the explosion timeline must keep animating regardless of alive/dead/frozen —
+	# a retry can race a mid-anim fireball and would otherwise freeze it on screen
+	if _expl_t >= 0.0:
+		_update_explosion(delta)
 	if dead:
 		# any death path (health, off-map, gap fall, fuel) reaches this guard on the
 		# next tick — the one place a still-open combo pot reliably drops
@@ -285,6 +303,11 @@ func _physics_process(delta: float) -> void:
 			linear_velocity = Vector3.ZERO
 			angular_velocity = Vector3.ZERO
 			freeze = true
+			# the fireball is for VIOLENT deaths only — coasting to a stop on an
+			# empty tank parks quietly; health deaths (crash/off-road/off-map) blow
+			if not _exploded and health <= 0.0:
+				_exploded = true
+				_explode()
 		return
 	var up := global_transform.basis.y
 	var fwd := -global_transform.basis.z
@@ -770,6 +793,10 @@ func _on_land(vel: Vector3) -> void:
 				var hv := Vector3(linear_velocity.x, 0.0, linear_velocity.z)
 				if hv.length() > 2.0:
 					linear_velocity += hv.normalized() * 1.5
+				# the skill read: a clean white shockwave instead of dirt
+				if _perfect_ring:
+					_perfect_ring.global_position = global_position + Vector3(0, -0.3, 0)
+					_perfect_ring.restart()
 		else:
 			trick_text = "SLOPPY LANDING!"
 			_trick_timer = 1.4
@@ -788,6 +815,13 @@ func _on_land(vel: Vector3) -> void:
 			if _ring_puff:
 				_ring_puff.global_position = puff_pos
 				_ring_puff.restart()
+			# plough a dirt spray FORWARD along travel — a big hit should visibly
+			# throw ground where you're going, not just puff in place
+			var hvel := Vector3(vel.x, 0.0, vel.z)
+			if _dust_dir and hvel.length() > 4.0:
+				_dust_dir.global_transform = Transform3D(
+						Basis.looking_at(hvel.normalized(), Vector3.UP), puff_pos)
+				_dust_dir.restart()
 		elif _dust:
 			_dust.global_position = puff_pos
 			_dust.restart()
@@ -939,6 +973,7 @@ func reset_run(start: Vector3) -> void:
 	global_transform = Transform3D(Basis(), start)
 	reset_physics_interpolation()
 	_restore_shed_panels()   # full health again -> put the panels back on
+	_expl_reset()            # no smoke column hanging over the fresh run
 
 ## Un-hide every panel shedding hid, clear the shed-tracking list, drop the
 ## threshold memory back to full health, and free any clones still tumbling
@@ -1054,6 +1089,7 @@ func respawn_at(z: float) -> void:
 	_combo_time = 0.0
 	_drift_seg_pts = 0.0
 	reset_physics_interpolation()
+	_expl_reset()   # a pit-fall respawn must not leave a fireball animating below
 	# NOTE: health is NOT restored on a checkpoint respawn (only reset_run does that),
 	# so shed panels intentionally stay off — the car should still look as beat-up as
 	# its HP says. Any clones still tumbling from the wipeout keep animating/self-free
@@ -2542,6 +2578,44 @@ func _build_dust() -> void:
 	# small, subtle pop at a panel's spot the instant it detaches — reuses the same
 	# dust-puff shape/material as landings, just tiny, so it doesn't need its own asset.
 	_panel_pop = _make_dust(10, 0.4, 1.0, 2.4, 55.0, 0.12, 0.3, 0.5)
+	# directional dirt spray for BIG landings: fired aimed along travel so the hit
+	# visibly ploughs forward instead of only puffing straight up
+	_dust_dir = _make_dust(30, 0.7, 8.0, 14.0, 14.0, 0.5, 1.2, 0.66)
+	var ddm := _dust_dir.process_material as ParticleProcessMaterial
+	ddm.direction = Vector3(0, 0.35, -1.0)   # forward-and-slightly-up in emitter space
+	ddm.gravity = Vector3(0, -9.0, 0)
+	# PERFECT landings answer with a clean white shockwave instead of dirt — the
+	# reward has to read at a glance as "that was skill", not "that was a crash"
+	_perfect_ring = GPUParticles3D.new()
+	_perfect_ring.amount = 26
+	_perfect_ring.lifetime = 0.45
+	_perfect_ring.one_shot = true
+	_perfect_ring.emitting = false
+	_perfect_ring.explosiveness = 1.0
+	_perfect_ring.local_coords = false
+	var ppm := ParticleProcessMaterial.new()
+	ppm.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_RING
+	ppm.emission_ring_axis = Vector3.UP
+	ppm.emission_ring_radius = 0.5
+	ppm.emission_ring_inner_radius = 0.3
+	ppm.emission_ring_height = 0.05
+	ppm.direction = Vector3(0, 0.05, 0)
+	ppm.spread = 4.0
+	ppm.initial_velocity_min = 0.4
+	ppm.initial_velocity_max = 0.9
+	ppm.radial_accel_min = 14.0
+	ppm.radial_accel_max = 19.0
+	ppm.gravity = Vector3.ZERO
+	ppm.scale_min = 0.5
+	ppm.scale_max = 0.9
+	_perfect_ring.process_material = ppm
+	var pqm := QuadMesh.new()
+	pqm.size = Vector2(0.4, 0.4)
+	# soft scale-respecting sprite — the shared dust billboard would render these
+	# as hard 0.5 m squares (see _fx_puff_mat)
+	pqm.material = _fx_puff_mat(Color(0.95, 0.98, 1.0, 0.8), true)
+	_perfect_ring.draw_pass_1 = pqm
+	add_child(_perfect_ring)
 
 ## A brief expanding ring of dust that hugs the ground — only fires on the really
 ## hard landings. Uses an emission RING (flat, at ground level) with radial
@@ -2580,6 +2654,237 @@ func _build_ring_puff() -> void:
 	qm.material = dm
 	_ring_puff.draw_pass_1 = qm
 	add_child(_ring_puff)
+
+# --- wreck explosion -----------------------------------------------------------
+
+## Soft radial sprite (white core fading to clear) shared by the explosion emitters.
+## Without a texture, particle quads read as HARD-EDGED SQUARES the instant they get
+## big — fine for the tiny legacy dust puffs, ruinous for a 6 m smoke billow.
+static var _puff_tex: GradientTexture2D
+
+static func _soft_puff_tex() -> GradientTexture2D:
+	if _puff_tex == null:
+		var g := Gradient.new()
+		# assign both arrays wholesale — add_point/set_color index games left the
+		# endpoint opaque once (the square-rim/ring artifact)
+		g.offsets = PackedFloat32Array([0.0, 0.55, 1.0])
+		g.colors = PackedColorArray([Color(1, 1, 1, 1), Color(1, 1, 1, 0.55), Color(1, 1, 1, 0)])
+		_puff_tex = GradientTexture2D.new()
+		_puff_tex.gradient = g
+		_puff_tex.fill = GradientTexture2D.FILL_RADIAL
+		_puff_tex.fill_from = Vector2(0.5, 0.5)
+		_puff_tex.fill_to = Vector2(0.5, 0.0)
+		_puff_tex.width = 64
+		_puff_tex.height = 64
+	return _puff_tex
+
+## Particle billboard that RESPECTS per-particle scale (BILLBOARD_PARTICLES +
+## keep_scale) — the legacy dust material's plain BILLBOARD_ENABLED silently
+## discards it, which is why its emitters tune size via mesh size instead.
+func _fx_puff_mat(col: Color, additive: bool) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = col
+	m.albedo_texture = _soft_puff_tex()
+	m.vertex_color_use_as_albedo = true   # lets a color_ramp fade ride on top
+	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	if additive:
+		m.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	m.billboard_mode = BaseMaterial3D.BILLBOARD_PARTICLES
+	m.billboard_keep_scale = true
+	# BILLBOARD_PARTICLES drives UVs from the anim-frame grid; the code-path default
+	# of 0 frames degenerates the UVs into square/ring artifacts — 1x1 = whole texture
+	m.particles_anim_h_frames = 1
+	m.particles_anim_v_frames = 1
+	m.particles_anim_loop = false
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	return m
+
+## Everything the fireball needs, built ONCE at spawn and parked invisible. A wreck
+## only restarts emitters and pokes scales/energies — probes kill cars constantly
+## (StuntProbe/MapProbe/TrialProbe), so death must never allocate.
+func _build_explosion() -> void:
+	_expl_root = Node3D.new()
+	_expl_root.top_level = true   # the fireball sits in the WORLD; a tipped-over body must not tilt it
+	_expl_root.visible = false
+	add_child(_expl_root)
+	# core flash: emissive sphere that balloons out and burns off in a quarter second
+	_expl_flash = MeshInstance3D.new()
+	var fm := SphereMesh.new()
+	fm.radius = 1.0
+	fm.height = 2.0
+	var fmat := StandardMaterial3D.new()
+	fmat.albedo_color = Color(1.0, 0.5, 0.12, 0.85)   # HOT orange — pale washed to butter
+	fmat.emission_enabled = true
+	fmat.emission = Color(1.0, 0.42, 0.08)
+	fmat.emission_energy_multiplier = 8.0
+	fmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	fmat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	fmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	fm.material = fmat
+	_expl_flash.mesh = fm
+	_expl_flash.visible = false
+	_expl_root.add_child(_expl_flash)
+	# ground shockwave: flat torus that races outward (TorusMesh already lies in XZ —
+	# the pickup ring's 90° rotation bug is exactly what NOT to do here)
+	_expl_ring = MeshInstance3D.new()
+	var tm := TorusMesh.new()
+	# thin tube: uniform scaling fattens the tube with the ring — at 11x a fat torus
+	# reads as a giant mud donut, a 0.04 tube stays a crisp racing shockwave
+	tm.inner_radius = 0.92
+	tm.outer_radius = 1.0
+	var tmat := StandardMaterial3D.new()
+	tmat.albedo_color = Color(1.0, 0.85, 0.55, 0.85)
+	tmat.emission_enabled = true
+	tmat.emission = Color(1.0, 0.6, 0.2)
+	tmat.emission_energy_multiplier = 3.4
+	tmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	tmat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	tmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	tm.material = tmat
+	_expl_ring.mesh = tm
+	_expl_ring.visible = false
+	_expl_root.add_child(_expl_ring)
+	# orange flicker light — sells the flash on the surrounding road/rails at night
+	_expl_light = OmniLight3D.new()
+	_expl_light.light_color = Color(1.0, 0.58, 0.2)
+	_expl_light.omni_range = 20.0
+	_expl_light.light_energy = 0.0
+	_expl_light.shadow_enabled = false
+	_expl_root.add_child(_expl_light)
+	# smoke column: dark, slow, billows fat (growth 2.4) and drifts up for seconds
+	_expl_smoke = _make_smoke(Color(0.10, 0.10, 0.11, 0.8), 1.2, 2.6, 2.2, 4.2, Vector3(0, 1, 0), 56, 3.2, 0.5, 2.4)
+	_expl_smoke.one_shot = true
+	_expl_smoke.explosiveness = 0.25   # staggered spawn -> a rising COLUMN, not one blob
+	# soft particle-billboard material so the big scales + growth curve actually apply
+	(_expl_smoke.draw_pass_1 as QuadMesh).material = _fx_puff_mat(Color(1, 1, 1, 1), false)
+	_expl_root.add_child(_expl_smoke)
+	# flame licks that smolder at the wreck for a couple of seconds after the flash
+	_expl_fire = _make_smoke(Color(1.0, 0.45, 0.1, 0.85), 0.5, 1.1, 1.6, 3.2, Vector3(0, 1, 0), 44, 1.0, 1.2, 0.55)
+	_expl_fire.one_shot = true
+	_expl_fire.explosiveness = 0.0     # spread across the window = licking, not bursting
+	(_expl_fire.draw_pass_1 as QuadMesh).material = _fx_puff_mat(Color(1, 1, 1, 1), true)
+	_expl_root.add_child(_expl_fire)
+	# embers: tiny additive sparks lofting off the fire — own small quad + a material
+	# that keeps particle scale (the shared dust material would render 0.5 m squares)
+	_expl_embers = _make_dust(30, 1.6, 3.0, 7.0, 70.0, 0.6, 1.0, 0.9)
+	remove_child(_expl_embers)   # _make_dust parents to the car; the rig owns it
+	_expl_root.add_child(_expl_embers)
+	var eq := QuadMesh.new()
+	eq.size = Vector2(0.09, 0.09)
+	eq.material = _fx_puff_mat(Color(1.0, 0.6, 0.15, 0.95), true)
+	_expl_embers.draw_pass_1 = eq
+	(_expl_embers.process_material as ParticleProcessMaterial).gravity = Vector3(0, -2.0, 0)
+	# debris: tumbling low-poly chunks — covers imported GLB bodies, which have no
+	# small panels for the shed machinery to throw
+	_expl_debris = GPUParticles3D.new()
+	_expl_debris.amount = 26
+	_expl_debris.lifetime = 1.5
+	_expl_debris.one_shot = true
+	_expl_debris.emitting = false
+	_expl_debris.explosiveness = 1.0
+	_expl_debris.local_coords = false
+	var dpm := ParticleProcessMaterial.new()
+	dpm.direction = Vector3(0, 1, 0)
+	dpm.spread = 70.0
+	dpm.initial_velocity_min = 6.0
+	dpm.initial_velocity_max = 13.0
+	dpm.gravity = Vector3(0, -14.0, 0)
+	dpm.angle_min = 0.0
+	dpm.angle_max = 360.0
+	dpm.angular_velocity_min = -360.0
+	dpm.angular_velocity_max = 360.0
+	dpm.scale_min = 0.5
+	dpm.scale_max = 1.3
+	_expl_debris.process_material = dpm
+	var dbm := BoxMesh.new()
+	dbm.size = Vector3(0.22, 0.1, 0.26)
+	var dmat := StandardMaterial3D.new()
+	dmat.albedo_color = Color(0.22, 0.21, 0.2)
+	dmat.roughness = 0.8
+	dbm.material = dmat
+	_expl_debris.draw_pass_1 = dbm
+	_expl_root.add_child(_expl_debris)
+
+## Light the fireball at the wreck's resting spot. Only health deaths reach here
+## (see the dead guard) — a dry tank parks quietly.
+func _explode() -> void:
+	if _expl_root == null:
+		return
+	var pos := global_position + Vector3(0, 0.4, 0)
+	_expl_root.visible = true
+	_expl_root.global_position = pos
+	# the shockwave hugs the GROUND under the wreck, not the (possibly airborne) body
+	var gy := pos.y - 0.6
+	if terrain:
+		gy = (float(terrain.call("height_at_y", pos.x, pos.z, pos.y)) if _ter_hint
+				else float(terrain.call("height_at", pos.x, pos.z)))
+	_expl_ring.global_position = Vector3(pos.x, gy + 0.15, pos.z)
+	_expl_flash.visible = true
+	_expl_flash.scale = Vector3.ONE * 0.6
+	_expl_ring.visible = true
+	_expl_ring.scale = Vector3.ONE
+	_expl_light.light_energy = 7.0
+	_expl_smoke.restart()
+	_expl_fire.restart()
+	_expl_embers.restart()
+	_expl_debris.restart()
+	_expl_t = 0.0
+	# procedural bodies also throw their REAL remaining panels — far juicier than
+	# generic chunks (GLB shells are one mesh, nothing to shed — the debris covers them)
+	if _glb_top == 0.0 and _body != null:
+		_shed_n_panels(4)
+	# one strong synthetic "landing": HCMain turns it into the camera kick/FOV punch
+	# and HCAudio into a hard body thud layered under play_wreck — both connect to
+	# this signal already, so the explosion needs no new cross-file plumbing
+	landed.emit(26.0, 0.0)
+
+## Park the rig instantly (retry/respawn) — no lingering smoke over a fresh run.
+func _expl_reset() -> void:
+	_exploded = false
+	_expl_t = -1.0
+	if _expl_root == null:
+		return
+	_expl_root.visible = false
+	_expl_flash.visible = false
+	_expl_ring.visible = false
+	_expl_light.light_energy = 0.0
+	for p in [_expl_smoke, _expl_fire, _expl_embers, _expl_debris]:
+		if p:
+			p.emitting = false
+
+## Drive the flash/ring/light timeline. Runs from _physics_process whenever the
+## clock is live — including after a respawn raced a mid-anim fireball.
+func _update_explosion(delta: float) -> void:
+	_expl_t += delta
+	var t := _expl_t
+	# flash: balloon 0.6 -> ~4.5 with a fast ease-out, alpha burns off by 0.25 s
+	if t < 0.25:
+		var k := 1.0 - pow(1.0 - t / 0.25, 2.0)
+		_expl_flash.scale = Vector3.ONE * lerpf(0.6, 3.6, k)
+		var fmat := (_expl_flash.mesh as SphereMesh).material as StandardMaterial3D
+		fmat.albedo_color.a = 0.9 * (1.0 - t / 0.25)
+	elif _expl_flash.visible:
+		_expl_flash.visible = false
+	# ring: races out to ~9 m and thins away by 0.5 s (Y stays 1 — the tube must
+	# not fatten vertically as the ring grows; alpha dies on a steeper curve so the
+	# late wide ring never lingers as a tan band across the road)
+	if t < 0.5:
+		var rk := 1.0 - pow(1.0 - t / 0.5, 2.4)
+		var rs := lerpf(1.0, 9.0, rk)
+		_expl_ring.scale = Vector3(rs, 1.0, rs)
+		var tmat := (_expl_ring.mesh as TorusMesh).material as StandardMaterial3D
+		tmat.albedo_color.a = 0.85 * pow(1.0 - t / 0.5, 1.6)
+	elif _expl_ring.visible:
+		_expl_ring.visible = false
+	# light: flickers while it decays over 0.7 s (deterministic wobble, no randf cost)
+	if t < 0.7:
+		_expl_light.light_energy = 7.0 * (1.0 - t / 0.7) * (0.75 + 0.25 * sin(t * 47.0))
+	else:
+		_expl_light.light_energy = 0.0
+	# all emitters are one-shot and done by ~4 s — park the clock
+	if t > 4.0:
+		_expl_t = -1.0
+		_expl_root.visible = false
 
 # --- damage panel-shedding ----------------------------------------------------
 ## Health-threshold panel pops: 2 panels fly off crossing below 70% HP, 3 more

@@ -444,21 +444,36 @@ func _make_tone(freq: float, dur: float, vol: float, harmonic2 := 0.0, decay_pow
 
 ## A noisy crunch (low-passed noise) over a low sine thud — the wreck sound.
 func _make_wreck() -> PackedVector2Array:
-	var dur := 0.45
+	# three layers: the original metal crunch (front-loaded), a 42 Hz sub thump so the
+	# explosion lands in the chest, and a sparse crackle tail (debris settling) that
+	# rises after the hit and dies with the buffer
+	var dur := 0.9
 	var n := int(dur * MIX_RATE)
 	var buf := PackedVector2Array()
 	buf.resize(n)
 	var lp := 0.0
 	var ph := 0.0
+	var sph := 0.0
+	var crk := 0.0
 	var inc := TAU * 70.0 / MIX_RATE
+	var sinc := TAU * 42.0 / MIX_RATE
 	for i in range(n):
 		var t := float(i) / float(maxi(n, 1))
-		var env := pow(1.0 - t, 2.2)
+		# the crunch occupies the first half of the (now longer) buffer at its old feel
+		var tc := minf(t * 2.0, 1.0)
+		var env := pow(1.0 - tc, 2.2)
 		lp = lerpf(lp, randf() * 2.0 - 1.0, 0.4)
-		var thud := sin(ph) * pow(1.0 - t, 4.0)
-		var v := clampf((lp * 0.5 + thud * 0.4) * env * 0.85, -0.95, 0.95)
+		var thud := sin(ph) * pow(1.0 - tc, 4.0)
+		var sub := sin(sph) * pow(1.0 - t, 2.6) * 0.5
+		# crackle: rare impulses smeared through a one-pole low-pass, fading over the tail
+		if randf() < 0.015:
+			crk = randf() * 2.0 - 1.0
+		crk *= 0.994
+		var tail := crk * clampf(t * 6.0, 0.0, 1.0) * pow(1.0 - t, 1.6) * 0.55
+		var v := clampf((lp * 0.5 + thud * 0.4) * env * 0.85 + sub + tail, -0.95, 0.95)
 		buf[i] = Vector2(v, v)
 		ph = fmod(ph + inc, TAU)
+		sph = fmod(sph + sinc, TAU)
 	return buf
 
 ## Low thud for landings. strength 0-1 scales both loudness and how boomy/long it is —
