@@ -1130,7 +1130,14 @@ func _process(delta: float) -> void:
 		_save_game()   # persist the bank + best BEFORE the shop even opens
 		if _audio:
 			_audio.call("play_wreck")
-		_show_shop()
+		# Violent deaths get a beat before the shop slams in so the explosion can
+		# actually be seen (fuel-out parks quietly and keeps the instant shop).
+		# Headless probes keep the synchronous open so wreck->shop assertions
+		# never race a cosmetic timer.
+		if float(_car.get("health")) <= 0.0 and DisplayServer.get_name() != "headless":
+			get_tree().create_timer(0.9).timeout.connect(_show_shop)
+		else:
+			_show_shop()
 
 func _update_camera(delta: float) -> void:
 	# remove last frame's shake offset so it doesn't accumulate into the smoothing
