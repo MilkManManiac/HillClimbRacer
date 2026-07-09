@@ -33,6 +33,7 @@ first so you can checkpoint and diff your own work.
 <console> --headless --path . tests/StuntProbe.tscn     # overpass/corkscrew surfaces + canyon pop regression
 <console> --headless --path . tests/LoopProbe.tscn      # vertical loop: fast car inverts, slow car detaches
 <console> --headless --path . tests/ComboProbe.tscn     # combo v2: chain math, bank/drop, near-miss, HUD
+<console> --headless --path . tests/BalloonProbe.tscn   # Party Balloons: fall cap, drain/pops, save round-trip
 ```
 When editing a map's `stunts` string, run `tests/LoopScan.tscn` first — it sweeps
 anchor placements against generator collisions (the `creep_xing` tripwire).

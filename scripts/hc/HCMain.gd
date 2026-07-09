@@ -172,6 +172,8 @@ var _ghost_file_dialog: FileDialog
 
 # HUD
 var _fuel_bar: ColorRect
+var _balloon_bar: ColorRect      # slim charge bar, hidden until Party Balloons is owned
+var _balloon_bar_bg: ColorRect
 var _health_bar: ColorRect
 var _info: Label
 var _big: Label
@@ -184,8 +186,8 @@ var _combo_pulse_tween: Tween    # per-trick thump on the combo label
 var _score_flash_tween: Tween    # gold flash on the score when a pot banks
 
 # --- economy / upgrades ------------------------------------------------------
-const UP_KEYS := ["engine", "fuel", "fueleff", "cashmult", "suspension", "durability", "wheels", "wings", "dive", "rockets", "stretch", "wide"]
-const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "fueleff": "Fuel Economy", "cashmult": "Sponsor Decals", "suspension": "Suspension", "durability": "Durability", "wheels": "Bigger Wheels", "wings": "Wings", "dive": "Dive Power", "rockets": "Rockets", "stretch": "Aerodynamics", "wide": "Downforce"}
+const UP_KEYS := ["engine", "fuel", "fueleff", "cashmult", "suspension", "durability", "wheels", "wings", "dive", "rockets", "stretch", "wide", "balloons"]
+const UP_NAME := {"engine": "Engine", "fuel": "Fuel Tank", "fueleff": "Fuel Economy", "cashmult": "Sponsor Decals", "suspension": "Suspension", "durability": "Durability", "wheels": "Bigger Wheels", "wings": "Wings", "dive": "Dive Power", "rockets": "Rockets", "stretch": "Aerodynamics", "wide": "Downforce", "balloons": "Party Balloons"}
 const UP_DESC := {
 	"engine": "More power & higher top speed",
 	"fuel": "Bigger tank — more total fuel",
@@ -199,8 +201,9 @@ const UP_DESC := {
 	"rockets": "Hold Ctrl: a little air boost (chugs fuel)",
 	"stretch": "Slippier body — higher top speed & carries momentum",
 	"wide": "Presses you into the road — roll over far less",
+	"balloons": "Hold F in the air: float down soft (they pop as they spend)",
 }
-const UP_BASECOST := {"engine": 320, "fuel": 260, "fueleff": 240, "cashmult": 400, "suspension": 300, "durability": 300, "wheels": 280, "wings": 380, "dive": 300, "rockets": 420, "stretch": 360, "wide": 320}
+const UP_BASECOST := {"engine": 320, "fuel": 260, "fueleff": 240, "cashmult": 400, "suspension": 300, "durability": 300, "wheels": 280, "wings": 380, "dive": 300, "rockets": 420, "stretch": 360, "wide": 320, "balloons": 340}
 const UP_COSTMULT := 1.9   # each level costs 1.9x the last — costs ramp hard
 const UP_MAX := 6
 const MONEY_PER_M := 1.0    # money earned = metres travelled down the track
@@ -288,6 +291,7 @@ var _owned := {"minivan": true, "hotrod": false, "monster": false, "sports": fal
 var _was_dead := false
 var _was_drifting := false   # edge-detectors for the continuous drift/boost loops
 var _was_boosting := false
+var _was_floating := false
 var _respawning := false
 var _shake := 0.0           # camera shake magnitude (decays)
 var _shake_off := Vector3.ZERO
@@ -616,6 +620,7 @@ func _setup_input() -> void:
 	_new_action("boost", 0.5, [_key(KEY_CTRL), _btn(JOY_BUTTON_RIGHT_SHOULDER)])
 	_new_action("dive", 0.5, [_key(KEY_SPACE), _btn(JOY_BUTTON_LEFT_SHOULDER)])
 	_new_action("recover", 0.5, [_key(KEY_R), _btn(JOY_BUTTON_Y)])
+	_new_action("float", 0.5, [_key(KEY_F), _btn(JOY_BUTTON_X)])   # Party Balloons deploy
 	_new_action("pitch_down", 0.2, [_key(KEY_W), _axis(JOY_AXIS_LEFT_Y, -1.0)])
 	_new_action("pitch_up", 0.2, [_key(KEY_S), _axis(JOY_AXIS_LEFT_Y, 1.0)])
 	_new_action("roll_left", 0.2, [_key(KEY_Q), _axis(JOY_AXIS_RIGHT_X, -1.0)])
@@ -884,6 +889,7 @@ func _setup_terrain_and_car() -> void:
 	_car.connect("gap_failed", _on_car_gap_failed)
 	_car.connect("landed", _on_car_landed)
 	_car.connect("combo_event", _on_car_combo)
+	_car.connect("balloon_pop", _on_balloon_pop)
 	_terrain.connect("pickup_collected", _on_pickup_collected)
 	_apply_headlights()
 	_reset_run_mode_state()   # NOTE: this was missing at boot before trial mode landed —
@@ -1247,6 +1253,11 @@ func _on_car_landed(impact: float, _air_time: float) -> void:
 func _on_car_gap_failed(_can_respawn: bool) -> void:
 	_shake = maxf(_shake, 0.5)
 
+## One balloon burst (charge drained past a whole balloon / hard-landing chunk loss).
+func _on_balloon_pop() -> void:
+	if _audio:
+		_audio.call("play_balloon_pop")
+
 ## Combo juice: every chained trick thumps the combo label with an escalating blip,
 ## a bank flashes the score gold, a drop stings. All audio stays _audio-guarded.
 func _on_car_combo(kind: String, _amount: int, chain: int) -> void:
@@ -1573,6 +1584,9 @@ func _apply_upgrades() -> void:
 	# Rockets: rear nozzles + boost thrust (hold Ctrl)
 	if _car.has_method("apply_rockets"):
 		_car.call("apply_rockets", _levels.rockets)
+	# Party Balloons: roof bundle + airborne float (hold F)
+	if _car.has_method("apply_balloons"):
+		_car.call("apply_balloons", _levels.balloons)
 	# (Downforce/Aerodynamics are pure mechanical tuning now — no chassis resize.)
 	_apply_cosmetics()   # cosmetics, re-applied on every rebuild/swap
 
@@ -2185,6 +2199,11 @@ func _update_audio(_delta: float) -> void:
 	if is_boosting != _was_boosting:
 		_audio.call("start_boost" if is_boosting else "stop_boost")
 		_was_boosting = is_boosting
+	# balloon deploy: squeaky inflate on the rising edge only (pops arrive via signal)
+	var is_floating: bool = not car_dead and bool(_car.get("floating"))
+	if is_floating and not _was_floating:
+		_audio.call("play_balloon_inflate")
+	_was_floating = is_floating
 
 ## One consistently-styled full-width menu button; returns it so callers can keep a ref.
 func _menu_button(parent: Node, text: String, on_press: Callable) -> Button:
@@ -2735,6 +2754,7 @@ func _swap_vehicle(vk: String) -> void:
 	_car.connect("gap_failed", _on_car_gap_failed)
 	_car.connect("landed", _on_car_landed)
 	_car.connect("combo_event", _on_car_combo)
+	_car.connect("balloon_pop", _on_balloon_pop)
 	_terrain.connect("pickup_collected", _on_pickup_collected)
 	if _audio:
 		_audio.call("setup", _car)   # re-point the engine synth at the new body
@@ -2961,8 +2981,22 @@ func _setup_hud() -> void:
 	_fuel_bar = _bar(layer, Vector2(30, 30), Color(0.95, 0.8, 0.2))
 	_bar_bg(layer, Vector2(28, 56), Color(0, 0, 0, 0.5))
 	_health_bar = _bar(layer, Vector2(30, 58), Color(0.9, 0.3, 0.3))
+	# balloon float charge: a slim strip tucked under health, shown only once the
+	# Party Balloons upgrade is owned (the roof bundle itself is the primary meter)
+	_balloon_bar_bg = ColorRect.new()
+	_balloon_bar_bg.position = Vector2(28, 76)
+	_balloon_bar_bg.size = Vector2(224, 8)
+	_balloon_bar_bg.color = Color(0, 0, 0, 0.5)
+	_balloon_bar_bg.visible = false
+	layer.add_child(_balloon_bar_bg)
+	_balloon_bar = ColorRect.new()
+	_balloon_bar.position = Vector2(30, 77.5)
+	_balloon_bar.size = Vector2(220, 5)
+	_balloon_bar.color = Color(1.0, 0.45, 0.62)
+	_balloon_bar.visible = false
+	layer.add_child(_balloon_bar)
 	_info = Label.new()
-	_info.position = Vector2(28, 84)
+	_info.position = Vector2(28, 90)   # below the (optional) balloon strip
 	_info.add_theme_font_size_override("font_size", 18)
 	layer.add_child(_info)
 	_big = Label.new()
@@ -3041,7 +3075,7 @@ func _setup_hud() -> void:
 	hint.position = Vector2(28, -34)
 	hint.add_theme_font_size_override("font_size", 13)
 	hint.add_theme_color_override("font_color", Color(0.8, 0.8, 0.85))
-	hint.text = "KB: Shift/W drive • S brake • A/D steer • Ctrl boost • Space dive • R recover • air W/S pitch, Q/E roll • Tab garage • Enter retry\nPad: RT throttle • LT brake • L-stick steer/pitch • R-stick roll • RB boost • LB dive • Y recover • Start garage • Ⓑ retry"
+	hint.text = "KB: Shift/W drive • S brake • A/D steer • Ctrl boost • Space dive • F balloons • R recover • air W/S pitch, Q/E roll • Tab garage • Enter retry\nPad: RT throttle • LT brake • L-stick steer/pitch • R-stick roll • RB boost • LB dive • Ⓧ balloons • Y recover • Start garage • Ⓑ retry"
 	layer.add_child(hint)
 
 func _bar_bg(layer: CanvasLayer, pos: Vector2, col: Color) -> void:
@@ -3067,6 +3101,13 @@ func _update_hud() -> void:
 	var maxhp: float = _car.get("max_health")
 	_fuel_bar.size.x = 220.0 * clamp(fuel / maxf(maxfuel, 1.0), 0.0, 1.0)
 	_health_bar.size.x = 220.0 * clamp(health / maxf(maxhp, 1.0), 0.0, 1.0)
+	# balloon charge strip: only exists on screen once the upgrade is owned
+	var blv := int(_car.get("balloon_level"))
+	_balloon_bar_bg.visible = blv > 0
+	_balloon_bar.visible = blv > 0
+	if blv > 0:
+		var bcap := maxf(float(_car.get("balloon_cap")), 0.001)
+		_balloon_bar.size.x = 220.0 * clampf(float(_car.get("balloon_time")) / bcap, 0.0, 1.0)
 	var air: String = "  ✈ AIR" if _car.get("airborne") else ""
 	_info.text = "%d m    %d km/h%s" % [int(dist), int(_car.call("get_speed_kmh")), air]
 	_score_lbl.text = "SCORE %d" % int(_car.get("score"))

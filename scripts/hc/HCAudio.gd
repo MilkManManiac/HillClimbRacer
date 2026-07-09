@@ -250,6 +250,24 @@ func play_combo_lost() -> PackedVector2Array:
 	_emit(buf)
 	return buf
 
+## Squeaky rising chirp for the balloon bundle inflating (float deploy). Three fast
+## ascending tones with a strong 2nd harmonic read as rubber stretching, not music.
+func play_balloon_inflate() -> PackedVector2Array:
+	var buf := _make_tone(620.0, 0.07, 0.34, 0.8, 2.2)
+	buf.append_array(_make_tone(910.0, 0.07, 0.36, 0.8, 2.2))
+	buf.append_array(_make_tone(1340.0, 0.12, 0.38, 0.7, 2.6))
+	_emit(buf)
+	return buf
+
+## One balloon bursting: a very short bright snap over a tiny low thump. Randomly
+## detuned a little so a staggered chain of pops doesn't sound machine-gun identical.
+func play_balloon_pop() -> PackedVector2Array:
+	var f := 2200.0 * randf_range(0.9, 1.15)
+	var buf := _make_tone(f, 0.035, 0.5, 0.5, 7.0)
+	buf.append_array(_make_tone(180.0, 0.06, 0.3, 0.0, 5.0))
+	_emit(buf)
+	return buf
+
 ## Noisy crunch/thud burst for a wreck (car death).
 func play_wreck() -> PackedVector2Array:
 	var buf := _make_wreck()

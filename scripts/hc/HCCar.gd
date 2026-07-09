@@ -105,6 +105,23 @@ const AIR_GUIDE_MAX := 1.5          # hard cap on the guidance accel (m/s^2)
 const AIR_GUIDE_POS_GAIN := 0.045   # accel per metre of lateral offset
 const AIR_GUIDE_VEL_GAIN := 0.12    # accel per (m/s) of lateral velocity (damping)
 var wing_lift: float = 0.0          # lift from Wings upgrade (air time)
+# --- balloon float (Party Balloons contraption): hold the float input while airborne
+# and a roof bundle of balloons inflates and turns the fall into a gentle drift down.
+# balloon_time (seconds of float) is THE resource — the balloons visibly pop one by
+# one as it drains, so the cluster on the roof doubles as the charge meter.
+const FLOAT_FALL_CAP := 4.0         # fall speed the float converges to (m/s)
+var balloon_level: int = 0          # Party Balloons upgrade level (0 = not owned)
+var balloon_cap: float = 0.0        # full charge at this level (seconds of float)
+var balloon_time: float = 0.0       # charge remaining this run
+var floating: bool = false          # float active this tick (HCMain audio edge)
+var balloon_pops: int = 0           # pops so far this run (probes assert on it)
+var _float_k: float = 0.0           # smoothed engage 0..1 — C1 in/out, no force snap
+var _float_seg: float = 0.0         # continuous float seconds -> BALLOON FLOAT trick
+var _balloon_root: Node3D
+var _balloons: Array[Node3D] = []
+var _balloon_infl: float = 0.0      # inflate animation 0..1 (slower than _float_k)
+var _balloon_bob: float = 0.0       # shared bob phase for the idle wobble
+var _balloon_show: int = 0          # balloons currently un-popped (edge -> pop FX)
 var _tire_smoke: Array[GPUParticles3D] = []
 var _wind_streaks: GPUParticles3D   # thin speed-line streaks once you're moving fast
 var _exhaust_smoke: Array[GPUParticles3D] = []
@@ -146,6 +163,7 @@ var _loop_fall: Dictionary = {} # frame kept after a mid-wrap release: the ribbo
 signal gap_cleared(idx: int)
 signal gap_failed(can_respawn: bool)
 signal landed(impact: float, air_time: float)   # for camera juice (shake/punch)
+signal balloon_pop()                            # one balloon burst (HCMain plays the pop)
 
 # convertible body + parametric chassis (Stretch/Wide upgrades) + Sidecar
 var _body: Node3D
@@ -243,6 +261,7 @@ func _ready() -> void:
 	_build_cans()
 	_build_dust()
 	_build_rockets()
+	_build_balloons()
 	_build_smoke()
 	_build_wind()
 	_build_skids()
@@ -497,6 +516,29 @@ func _physics_process(delta: float) -> void:
 				var lat_speed: float = vel.dot(rvec)
 				var pull: float = clampf(-lat * AIR_GUIDE_POS_GAIN - lat_speed * AIR_GUIDE_VEL_GAIN, -AIR_GUIDE_MAX, AIR_GUIDE_MAX) * guide
 				apply_central_force(rvec * pull * mass)
+		# --- BALLOON FLOAT (hold the float input): buoyancy + fall damping so the drop
+		# CONVERGES on FLOAT_FALL_CAP instead of snapping to it. Every term is scaled by
+		# _float_k, which eases in and out — C1 engage/disengage, no impulse. The landing
+		# guidance above stays live during a float, so a floating car still homes on the
+		# reserved landing instead of drifting off it. Never active inside a loop zone.
+		# balloon_level gates first, then a has_action guard: probes that drive HCCar
+		# without HCMain never register "float", and an unguarded poll ERROR-spams the log
+		var want_float := (balloon_level > 0 and balloon_time > 0.0 and _loop.is_empty()
+				and InputMap.has_action("float") and Input.is_action_pressed("float"))
+		_float_k = move_toward(_float_k, 1.0 if want_float else 0.0, delta * 3.5)
+		if _float_k > 0.001:
+			# balloons cancel most of gravity; falls past the cap are damped back toward
+			# it, and upward motion is dragged — they float you DOWN, never launch you up
+			var lift := gravity_force * 0.82
+			if vel.y < -FLOAT_FALL_CAP:
+				lift += (-vel.y - FLOAT_FALL_CAP) * 2.6
+			elif vel.y > 0.5:
+				lift -= vel.y * 1.2
+			apply_central_force(Vector3.UP * lift * mass * _float_k)
+		if want_float:
+			balloon_time = maxf(balloon_time - delta, 0.0)
+			_float_seg += delta
+		floating = want_float
 
 	# The car self-levels on its four suspension springs, so it stays upright on its own —
 	# there is NO tip/lean/roll-over mechanic. Cars differ in the corners purely by turn
@@ -523,6 +565,7 @@ func _physics_process(delta: float) -> void:
 		health -= delta * 4.0   # recovering costs a little
 
 	_animate_surfaces(delta)
+	_update_balloons(delta)
 
 	# --- damage panel-shedding: pop small body panels at HP thresholds --------
 	# telegraphs health without reading the HUD; funny on a stacked-panel car. Must
@@ -704,6 +747,10 @@ func _on_land(vel: Vector3) -> void:
 	var dmg: float = impact * 2.1 + flat_pen * 42.0 * clamp(_air_time, 0.0, 1.5)
 	if dmg > 1.0:
 		health -= dmg
+	# balloons hate hard landings: a real slam bursts a chunk of the bundle at once
+	# (the visible-count tracker in _update_balloons turns the loss into staggered pops)
+	if _balloon_infl > 0.3 and into > 8.0:
+		balloon_time = maxf(balloon_time - balloon_cap * 0.25, 0.0)
 	# trick scoring: a clean landing feeds the combo chain (airtime + flips); the pot
 	# banks after the grace window if nothing else chains (see _update_combo)
 	var off_road := _road_off() > _road_half_here()
@@ -878,6 +925,12 @@ func reset_run(start: Vector3) -> void:
 	_gap_armed = false
 	_falling_out = false
 	tunnel_lifts = 0
+	balloon_time = balloon_cap   # fresh bundle every run
+	balloon_pops = 0
+	floating = false
+	_float_k = 0.0
+	_float_seg = 0.0
+	_balloon_infl = 0.0
 	_loop = {}
 	_loop_fall = {}
 	_loop_cd = 0.0
@@ -983,6 +1036,10 @@ func respawn_at(z: float) -> void:
 	linear_velocity = Vector3.ZERO
 	angular_velocity = Vector3.ZERO
 	fuel = maxf(fuel - max_fuel * 0.1, 0.0)   # small penalty for the wipeout
+	balloon_time = balloon_cap   # respawn = a fresh bundle (same spirit as the fuel carrot)
+	floating = false
+	_float_k = 0.0
+	_float_seg = 0.0
 	_gap_armed = false
 	_falling_out = false
 	_loop = {}
@@ -1096,7 +1153,7 @@ func _fit_parts() -> void:
 		gmove.append_array(_rockets)
 		for c in _cans:
 			gmove.append(c)
-		for n in [_rudder, _airbrake]:
+		for n in [_rudder, _airbrake, _balloon_root]:
 			if n:
 				gmove.append(n)
 		for n in gmove:
@@ -1110,7 +1167,7 @@ func _fit_parts() -> void:
 	move.append_array(_rockets)
 	for c in _cans:
 		move.append(c)
-	for n in [_rudder, _airbrake]:
+	for n in [_rudder, _airbrake, _balloon_root]:
 		if n:
 			move.append(n)
 	for n in move:
@@ -3021,6 +3078,134 @@ func _update_flames(on: bool, delta: float) -> void:
 		_boost_light.light_energy = 3.2 * clampf(flick, 0.35, 1.25)
 	else:
 		_boost_light.light_energy = 0.0
+
+# --- Party Balloons (contraption prototype) ------------------------------------
+
+## Roof bundle: up to six bright balloons, each a pivot at the tie point holding a
+## string + teardrop sphere + knot, so scaling the PIVOT inflates balloon and string
+## together. Deflated (a small nub bundle) whenever the float isn't held — the buy is
+## still visible on the car, and the full cluster blooming out on deploy is the juice.
+func _build_balloons() -> void:
+	_balloon_root = Node3D.new()
+	_balloon_root.position = Vector3(0, 1.05, 0.1)
+	_balloon_root.visible = false   # stays hidden until Party Balloons is bought
+	add_child(_balloon_root)
+	var cols: Array[Color] = [
+		Color(0.95, 0.25, 0.25), Color(0.25, 0.55, 0.95), Color(0.98, 0.8, 0.2),
+		Color(0.35, 0.85, 0.4), Color(0.9, 0.45, 0.85), Color(0.98, 0.55, 0.2),
+	]
+	var offs: Array[Vector3] = [
+		Vector3(0.0, 1.35, 0.0), Vector3(0.5, 1.15, 0.28), Vector3(-0.5, 1.22, 0.3),
+		Vector3(0.32, 1.55, -0.3), Vector3(-0.36, 1.5, -0.22), Vector3(0.05, 1.75, 0.34),
+	]
+	for i in range(6):
+		var p := Node3D.new()
+		_balloon_root.add_child(p)
+		var off: Vector3 = offs[i]
+		var ax := off.normalized()
+		# string: thin dark line from the tie point up to the balloon's knot
+		var st := MeshInstance3D.new()
+		var cm := CylinderMesh.new()
+		cm.top_radius = 0.012
+		cm.bottom_radius = 0.012
+		cm.height = off.length()
+		cm.radial_segments = 5
+		st.mesh = cm
+		st.material_override = _metal(Color(0.16, 0.16, 0.18))
+		st.position = off * 0.5
+		st.basis = Basis(Quaternion(Vector3.UP, ax))
+		p.add_child(st)
+		var bmat := StandardMaterial3D.new()
+		bmat.albedo_color = cols[i]
+		bmat.roughness = 0.22
+		bmat.metallic = 0.0
+		var bl := MeshInstance3D.new()
+		var sm := SphereMesh.new()
+		sm.radius = 0.3
+		sm.height = 0.7   # taller than wide = teardrop read, not a beach ball
+		bl.mesh = sm
+		bl.material_override = bmat
+		bl.position = off + ax * 0.3
+		p.add_child(bl)
+		var knot := MeshInstance3D.new()
+		var km := CylinderMesh.new()
+		km.top_radius = 0.045
+		km.bottom_radius = 0.015
+		km.height = 0.08
+		km.radial_segments = 6
+		knot.mesh = km
+		knot.material_override = bmat
+		knot.position = off
+		knot.basis = Basis(Quaternion(Vector3.UP, ax))
+		p.add_child(knot)
+		p.scale = Vector3.ONE * 0.001   # inflate animation owns the scale from here
+		_balloons.append(p)
+	apply_balloons(0)
+
+## How many balloons this level's bundle holds (more = bigger visible buy).
+func _balloons_for_level() -> int:
+	return 0 if balloon_level <= 0 else clampi(2 + balloon_level, 3, 6)
+
+## Party Balloons upgrade: level = more balloons, a slightly bigger bundle, and more
+## seconds of float. The charge refills only when the LEVEL changes (fresh bundle on
+## buy) — reapplying tuning mid-run must never top up a spent bundle for free.
+func apply_balloons(level: int) -> void:
+	var changed := level != balloon_level
+	balloon_level = level
+	balloon_cap = 0.0 if level == 0 else 2.5 + 1.1 * float(level)
+	if changed:
+		balloon_time = balloon_cap
+		balloon_pops = 0
+	if _balloon_root:
+		_balloon_root.visible = level > 0
+		var s := (1.0 + 0.06 * float(maxi(level - 1, 0))) * _part_scale
+		_balloon_root.scale = Vector3(s, s, s)
+	_balloon_show = _balloons_for_level()
+
+## Per-tick balloon bookkeeping + animation (called from the FX section, never from
+## the suspension/ground block): fold the float trick, run the inflate envelope and
+## string-bundle sway, and pop balloons one by one as the charge drains.
+func _update_balloons(delta: float) -> void:
+	if _grounded or dead:
+		floating = false
+		_float_k = move_toward(_float_k, 0.0, delta * 3.5)
+	# a long enough continuous float becomes ONE chained trick when it ends (landing
+	# or letting go) — short taps stay silent so the input can't spam the chain
+	if not floating and _float_seg > 0.0:
+		if _float_seg >= 2.0 and not dead:
+			_combo_add(_float_seg * 45.0, "BALLOON FLOAT %.1fs" % _float_seg)
+		_float_seg = 0.0
+	if balloon_level <= 0 or _balloon_root == null:
+		return
+	# inflate chases the engage envelope a touch slower, so the bloom-out reads
+	_balloon_infl = move_toward(_balloon_infl, 1.0 if _float_k > 0.02 else 0.0, delta * 2.2)
+	_balloon_bob += delta * 2.6
+	# bundle sway: lag opposite the car's local velocity, like balloons on strings
+	var lv := global_transform.basis.inverse() * linear_velocity
+	var tx: float = clampf(lv.z * 0.012, -0.35, 0.35)
+	var tz: float = clampf(-lv.x * 0.012, -0.35, 0.35)
+	var sw := 1.0 - exp(-6.0 * delta)
+	_balloon_root.rotation.x = lerpf(_balloon_root.rotation.x, tx, sw)
+	_balloon_root.rotation.z = lerpf(_balloon_root.rotation.z, tz, sw)
+	# visible count tracks the charge at ALL times (a half-spent bundle stays half a
+	# bundle when it deflates back to nubs) — each lost balloon is one pop
+	var n := _balloons_for_level()
+	var show := n
+	if balloon_cap > 0.0:
+		show = mini(int(ceil(balloon_time / balloon_cap * float(n))), n)
+	if show < _balloon_show:
+		balloon_pops += _balloon_show - show
+		balloon_pop.emit()
+	_balloon_show = show
+	for i in range(_balloons.size()):
+		var alive := i < _balloon_show
+		# deflated = a nub bundle on the roof (the buy stays visible); popped = gone
+		var target := 0.0 if not alive else lerpf(0.22, 1.0, _balloon_infl)
+		if alive and _balloon_infl > 0.5:
+			target *= 0.94 + 0.06 * sin(_balloon_bob + float(i) * 1.7)
+		var cur := _balloons[i].scale.x
+		var next := move_toward(cur, target, delta * (6.0 if target < cur else 2.5))
+		_balloons[i].scale = Vector3.ONE * maxf(next, 0.001)
 
 ## A normal tapered wing (trapezoid): wide root chord, narrower swept tip, slight dihedral.
 func _wing_mesh(side: float) -> ArrayMesh:

@@ -59,6 +59,8 @@ func _check_oneshots() -> void:
 	_report("play_combo(8)", _audio.call("play_combo", 8))
 	_report("play_bank", _audio.call("play_bank"))
 	_report("play_combo_lost", _audio.call("play_combo_lost"))
+	_report("play_balloon_inflate", _audio.call("play_balloon_inflate"))
+	_report("play_balloon_pop", _audio.call("play_balloon_pop"))
 	_report("play_wreck", _audio.call("play_wreck"))
 	_report("play_landing(0.05)", _audio.call("play_landing", 0.05))
 	_report("play_landing(1.0)", _audio.call("play_landing", 1.0))
