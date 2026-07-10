@@ -23,6 +23,25 @@ Design pillars (in priority order):
    all-drift sprint against the clock, big-air snow ridge. More flavors welcome.
 5. **Session-friendly.** Death → shop → retry in seconds. No friction.
 
+## Update (2026-07-09, eleventh pass — "HC v8", same session)
+
+- **6th map: Dune Drift** (amber card, classic mode): golden-hour desert, long
+  rhythmic rollers (hill_amp 9 / noise_freq 0.0015 / straight_bias 0.68), rare
+  modest gaps, rock-only scatter, dune/mesa silhouettes + wind-blown sand motes,
+  trial at 1100 m (medals bot-calibrated — human pass wanted, like gravity).
+  Bot: van 681 m (fuel plateau), sports 2424 m untouched at 40 m/s, F1 3804 m.
+  AutoDrive now sweeps all six maps + takes HC_AUTODRIVE_MAPS/VEHICLE env filters.
+- **Prop near-misses**: `HCTrack.props_near(x,z,r)` (flat [x,y,z,r] quads, per-tile
+  index, zero-alloc scratch buffer); HCCar pays NEAR MISS only when a prop passes
+  front-to-behind with tightest edge gap 0.05–1.6 m at ≥18 m/s — shares the rail
+  cooldown. Props sit 5 m off the drivable width, wreck line at +11 m: a real
+  verge gamble.
+- **Balloon tiers float softer** (5.20 m/s at L1 → 3.40 at L6), shop copy updated.
+- Gap landing pads are now `gap_pad_color` (export) — dunes overrides to earthy
+  green; default lime read alien on sand.
+- Owner played a mid-session build (through v7.9 + dunes). Battery 12/12 at the
+  session-long baseline 2.78/0.17.
+
 ## Update (2026-07-09, tenth pass — "HC v7.9", same session)
 
 - **Drift skid marks** (`HCSkid.gd`): 600-segment MultiMesh ring buffer of ribbon
