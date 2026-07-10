@@ -69,6 +69,9 @@ const CELL := 24.0           # spatial-hash cell size for projection + overlap t
 @export var gap_land_len := 55.0       # landing DOWNSLOPE past the void (long = smooth);
                                         # floored per-gap by _landing_catch_len (speed-aware)
 @export var gap_land_rise := 8.0       # landing lip height — you touch down and ride it down
+@export var gap_pad_color := Color(0.16, 0.5, 0.3)  # landing-pad paint — game language is
+                                        # "green = safe"; warm-palette maps override it so
+                                        # the pad doesn't read as an alien lime patch
 @export var gap_pit := -45.0           # void floor
 var _gaps: Array = []                  # {cs, vw, lvl, idx}
 var _gsamp := PackedInt32Array()       # per sample: index into _gaps, or -1
@@ -1895,7 +1898,7 @@ func _surface_color(d: float, lat: float, rh: float) -> Color:
 		if d > lip - gap_ramp_len and d < lip:
 			return Color(0.92, 0.78, 0.12) if fmod(d, 4.0) < 2.0 else Color(0.1, 0.1, 0.11)
 		elif d >= far and d < far + float(g.get("ll", gap_land_len)):
-			return Color(0.16, 0.5, 0.3).lerp(grass, smoothstep(rh - 1.5, rh + 1.0, al))
+			return gap_pad_color.lerp(grass, smoothstep(rh - 1.5, rh + 1.0, al))
 	# NOTE: centre/edge line markings are dedicated overlay strips (_build_lines), NOT
 	# vertex paint — cross-section vertices sit ~4.5 m apart, so colouring the centre
 	# vertex smeared a ~9 m wide wedge across the road.

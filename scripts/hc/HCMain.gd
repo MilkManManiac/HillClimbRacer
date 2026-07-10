@@ -130,6 +130,8 @@ const MAPS := {
 			"grass_color": Color(0.71, 0.55, 0.32), "asphalt_color": Color(0.17, 0.15, 0.14),
 			"centre_line_color": Color(0.95, 0.82, 0.45), "edge_line_color": Color(0.96, 0.92, 0.78),
 			"rail_band_color": Color(0.95, 0.62, 0.18), "rail_post_color": Color(0.42, 0.36, 0.30),
+			# earthier landing green — the default pad reads as a lime patch on sand
+			"gap_pad_color": Color(0.34, 0.48, 0.26),
 			"scatter_density": 0.45,
 			# rock_1 only: rock_2's mossy green patches read as random lime blocks
 			# against the sand (fine in canyon where the red haze mutes them)
@@ -227,7 +229,7 @@ const UP_DESC := {
 	"rockets": "Hold Ctrl: a little air boost (chugs fuel)",
 	"stretch": "Slippier body — higher top speed & carries momentum",
 	"wide": "Presses you into the road — roll over far less",
-	"balloons": "Hold F in the air: float down soft (they pop as they spend)",
+	"balloons": "Hold F in the air: float down soft (higher tiers drift down softer)",
 }
 const UP_BASECOST := {"engine": 320, "fuel": 260, "fueleff": 240, "cashmult": 400, "suspension": 300, "durability": 300, "wheels": 280, "wings": 380, "dive": 300, "rockets": 420, "stretch": 360, "wide": 320, "balloons": 340}
 const UP_COSTMULT := 1.9   # each level costs 1.9x the last — costs ramp hard
