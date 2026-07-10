@@ -66,6 +66,9 @@ var combo_chain: int = 0            # tricks in the current chain (drives the mu
 var _combo_time: float = 0.0        # grace remaining once the combo goes idle
 var _drift_seg_pts: float = 0.0     # style points accrued across ONE drift segment
 var _nearmiss_cd: float = 0.0       # per-event cooldown so one rail-hug fires once
+const PROP_NM_GAP := 1.6            # edge-to-edge window that pays a prop near-miss (m)
+const PROP_NM_SPEED := 18.0         # below this a pass is a stroll, not a near-miss
+var _prop_nm := {}                  # quantised prop pos -> Vector2(1, min edge gap) while ahead
 var terrain: Node3D   # set by HCMain; used to catch ground tunneling
 
 var _rays: Array[RayCast3D] = []
@@ -122,7 +125,8 @@ var wing_lift: float = 0.0          # lift from Wings upgrade (air time)
 # and a roof bundle of balloons inflates and turns the fall into a gentle drift down.
 # balloon_time (seconds of float) is THE resource — the balloons visibly pop one by
 # one as it drains, so the cluster on the roof doubles as the charge meter.
-const FLOAT_FALL_CAP := 4.0         # fall speed the float converges to (m/s)
+# fall speed the float converges to (m/s) — softer with every tier, so higher
+# levels buy a gentler drop as well as duration/count (see _float_fall_cap)
 var balloon_level: int = 0          # Party Balloons upgrade level (0 = not owned)
 var balloon_cap: float = 0.0        # full charge at this level (seconds of float)
 var balloon_time: float = 0.0       # charge remaining this run
@@ -552,7 +556,7 @@ func _physics_process(delta: float) -> void:
 				var pull: float = clampf(-lat * AIR_GUIDE_POS_GAIN - lat_speed * AIR_GUIDE_VEL_GAIN, -AIR_GUIDE_MAX, AIR_GUIDE_MAX) * guide
 				apply_central_force(rvec * pull * mass)
 		# --- BALLOON FLOAT (hold the float input): buoyancy + fall damping so the drop
-		# CONVERGES on FLOAT_FALL_CAP instead of snapping to it. Every term is scaled by
+		# CONVERGES on _float_fall_cap() instead of snapping to it. Every term is scaled by
 		# _float_k, which eases in and out — C1 engage/disengage, no impulse. The landing
 		# guidance above stays live during a float, so a floating car still homes on the
 		# reserved landing instead of drifting off it. Never active inside a loop zone.
@@ -565,8 +569,9 @@ func _physics_process(delta: float) -> void:
 			# balloons cancel most of gravity; falls past the cap are damped back toward
 			# it, and upward motion is dragged — they float you DOWN, never launch you up
 			var lift := gravity_force * 0.82
-			if vel.y < -FLOAT_FALL_CAP:
-				lift += (-vel.y - FLOAT_FALL_CAP) * 2.6
+			var cap := _float_fall_cap()
+			if vel.y < -cap:
+				lift += (-vel.y - cap) * 2.6
 			elif vel.y > 0.5:
 				lift -= vel.y * 1.2
 			apply_central_force(Vector3.UP * lift * mass * _float_k)
@@ -872,6 +877,7 @@ func _update_combo(delta: float) -> void:
 			score += _drift_seg_pts
 		_drift_seg_pts = 0.0
 	_check_near_miss()
+	_check_prop_near_miss()
 	# the chain stays open while airborne or sliding; grace only drains on plain road
 	if airborne or drifting:
 		return
@@ -933,6 +939,53 @@ func _check_near_miss() -> void:
 		_nearmiss_cd = 2.0
 		_combo_add(40.0 + spd, "NEAR MISS")
 
+## Threading the needle past a roadside tree/rock at speed = a chained NEAR MISS.
+## A prop only pays once it has actually PASSED front-to-behind with its tightest
+## edge gap inside the window — proximity alone never fires, and neither does
+## clipping straight through (gap < 0; scatter has no collision, car mask=2).
+## Shares the rail near-miss cooldown so rail + prop can't double-fire instantly.
+func _check_prop_near_miss() -> void:
+	if dead or not _loop.is_empty() or terrain == null or not terrain.has_method("props_near"):
+		return
+	var spd := linear_velocity.length()
+	if spd < PROP_NM_SPEED:
+		if not _prop_nm.is_empty():
+			_prop_nm.clear()   # slowed down mid-approach — the gamble is off
+		return
+	var fwd := -global_transform.basis.z
+	fwd.y = 0.0
+	if fwd.length_squared() < 0.0001:
+		return
+	fwd = fwd.normalized()
+	var pos := global_position
+	var quads: PackedFloat32Array = terrain.call("props_near", pos.x, pos.z, 9.0)
+	var seen := {}
+	for i in range(0, quads.size(), 4):
+		var px := quads[i]
+		var pz := quads[i + 2]
+		var pr := quads[i + 3]
+		var key := Vector2i(int(px * 4.0), int(pz * 4.0))
+		seen[key] = true
+		var dx := px - pos.x
+		var dz := pz - pos.z
+		var along := dx * fwd.x + dz * fwd.z
+		# horizontal miss distance off our travel line, minus half a car and the
+		# prop's own footprint = the visible daylight between metal and bark
+		var gap := absf(dx * fwd.z - dz * fwd.x) - pr - 1.05
+		if along > 0.5:
+			var st: Vector2 = _prop_nm.get(key, Vector2(1.0, INF))
+			_prop_nm[key] = Vector2(1.0, minf(st.y, gap))
+		elif _prop_nm.has(key):
+			var tightest: float = (_prop_nm[key] as Vector2).y
+			_prop_nm.erase(key)
+			if tightest > 0.05 and tightest < PROP_NM_GAP and _nearmiss_cd <= 0.0 and _grounded:
+				_nearmiss_cd = 2.0
+				_combo_add(50.0 + spd, "NEAR MISS")
+	# props that left the query radius without passing (we turned away) are forgotten
+	for k in _prop_nm.keys():
+		if not seen.has(k):
+			_prop_nm.erase(k)
+
 ## Road centre-line X at our forward position (0 if the terrain has no curves).
 func _road_cx() -> float:
 	if terrain and terrain.has_method("road_center_x"):
@@ -969,6 +1022,7 @@ func reset_run(start: Vector3) -> void:
 	_combo_time = 0.0
 	_drift_seg_pts = 0.0
 	_nearmiss_cd = 0.0
+	_prop_nm.clear()
 	gaps_cleared = 0
 	checkpoint_z = 0.0
 	_gap_armed = false
@@ -3427,6 +3481,11 @@ func _build_balloons() -> void:
 		p.scale = Vector3.ONE * 0.001   # inflate animation owns the scale from here
 		_balloons.append(p)
 	apply_balloons(0)
+
+## Terminal float fall speed for this tier — linear from ~5.2 m/s at level 1 down
+## to ~3.4 m/s at level 6, so a maxed bundle visibly drifts softer, not just longer.
+func _float_fall_cap() -> float:
+	return 5.56 - 0.36 * float(clampi(balloon_level, 1, 6))
 
 ## How many balloons this level's bundle holds (more = bigger visible buy).
 func _balloons_for_level() -> int:

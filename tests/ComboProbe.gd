@@ -103,6 +103,65 @@ func _ready() -> void:
 	# put the car back on the centre-line so the off-road wreck check can't trip
 	car.global_position -= (lv.right as Vector3) * (rh - 0.6)
 
+	# --- stage 4b: prop near-miss — a real scatter prop must PASS front-to-behind --
+	var home := car.global_position
+	var quads: PackedFloat32Array = terrain.call("props_near", home.x, home.z, 250.0)
+	_check(quads.size() >= 4, "props_near found scatter to thread (%d props)" % (quads.size() / 4))
+	if quads.size() >= 4:
+		# consume immediately — props_near returns a reused scratch buffer
+		var all := quads.duplicate()
+		# pick an ISOLATED prop (no neighbor within 12 m) so the synthetic passes can't
+		# accidentally thread past a second prop and muddy the assertions
+		var pick := 0
+		for a in range(0, all.size(), 4):
+			var lone := true
+			for b in range(0, all.size(), 4):
+				if a == b:
+					continue
+				var ndx: float = all[a] - all[b]
+				var ndz: float = all[a + 2] - all[b + 2]
+				if ndx * ndx + ndz * ndz < 144.0:
+					lone = false
+					break
+			if lone:
+				pick = a
+				break
+		var prop := Vector3(all[pick], all[pick + 1], all[pick + 2])
+		var pr := all[pick + 3]
+		var fwd: Vector3 = -car.global_transform.basis.z
+		fwd.y = 0.0
+		fwd = fwd.normalized()
+		var side := Vector3(fwd.z, 0.0, -fwd.x)
+		car.set("_nearmiss_cd", 0.0)
+		car.set("_grounded", true)
+		car.linear_velocity = fwd * 20.0
+		# the teleports below aren't continuous motion — flush any tracking state the
+		# drive so far accumulated so only THIS synthetic pass is measured
+		(car.get("_prop_nm") as Dictionary).clear()
+		var pot_before_pp := float(car.get("combo_pot"))
+		# approach 6 m ahead of the prop with ~0.8 m of daylight, then hop behind it —
+		# both calls are direct so no physics tick (or wreck check) runs in between
+		var d_ok: float = pr + 1.05 + 0.8
+		car.global_position = Vector3(prop.x, home.y, prop.z) - fwd * 6.0 - side * d_ok
+		car.call("_check_prop_near_miss")
+		car.global_position = Vector3(prop.x, home.y, prop.z) + fwd * 2.0 - side * d_ok
+		car.call("_check_prop_near_miss")
+		var pot_after_pp := float(car.get("combo_pot"))
+		_check(pot_after_pp > pot_before_pp + 30.0, "prop pass fed the combo (+%.0f)" % (pot_after_pp - pot_before_pp))
+		_check(float(car.get("_nearmiss_cd")) > 0.0, "prop near-miss armed the shared cooldown")
+		car.call("_check_near_miss")   # rail check right after must be swallowed
+		_check(float(car.get("combo_pot")) == pot_after_pp, "shared cooldown blocks rail refire")
+		# clipping straight THROUGH the trunk (gap < 0) must never pay
+		car.set("_nearmiss_cd", 0.0)
+		(car.get("_prop_nm") as Dictionary).clear()   # fresh pass, same reasoning as above
+		var d_thru: float = maxf(pr + 1.05 - 0.5, 0.0)
+		car.global_position = Vector3(prop.x, home.y, prop.z) - fwd * 6.0 - side * d_thru
+		car.call("_check_prop_near_miss")
+		car.global_position = Vector3(prop.x, home.y, prop.z) + fwd * 2.0 - side * d_thru
+		car.call("_check_prop_near_miss")
+		_check(float(car.get("combo_pot")) == pot_after_pp, "clipping through the prop pays nothing")
+		car.global_position = home   # back on the road for the death stage
+
 	# --- stage 5: death drops the pot, score untouched ----------------------------
 	var score_before_drop := float(car.get("score"))
 	car.set("health", 0.0)

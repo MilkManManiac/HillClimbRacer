@@ -77,7 +77,18 @@ func _ready() -> void:
 	var vy := car.linear_velocity.y
 	_check(not bool(car.get("_grounded")), "still airborne mid-float")
 	_check(bool(car.get("floating")), "floating flag live while held")
-	_check(vy > -7.0 and vy < 0.5, "fall speed capped near %.0f m/s (vy=%.2f)" % [4.0, vy])
+	# terminal fall is tier-scaled now: level 2 converges on ~4.84 m/s
+	var tcap := float(car.call("_float_fall_cap"))
+	_check(absf(tcap - 4.84) < 0.01, "level-2 fall cap = 4.84 m/s (got %.2f)" % tcap)
+	_check(vy > -(tcap + 2.0) and vy < 0.5, "fall speed capped near %.1f m/s (vy=%.2f)" % [tcap, vy])
+	# higher tiers must float softer, monotonically (level is restored right after)
+	car.set("balloon_level", 6)
+	var cap6 := float(car.call("_float_fall_cap"))
+	car.set("balloon_level", 1)
+	var cap1 := float(car.call("_float_fall_cap"))
+	car.set("balloon_level", 2)
+	_check(cap1 > tcap and tcap > cap6 and absf(cap1 - 5.2) < 0.01 and absf(cap6 - 3.4) < 0.01,
+			"tiered fall caps 5.2 > %.2f > 3.4 (L1 %.2f, L6 %.2f)" % [tcap, cap1, cap6])
 	_check(float(car.get("balloon_time")) < cap - 1.5, "charge is draining while floating")
 	_check(float(car.get("_balloon_infl")) > 0.5, "bundle visually inflated mid-float")
 

@@ -172,6 +172,9 @@ var _grid := {}                   # Vector2i cell -> Array[int] sample indices
 var _target: Node3D
 var _proj_i := 0                  # stateful nearest-sample hint for the target
 var _tiles := {}                  # tile index -> Node3D container
+var _tile_props := {}             # tile index -> PackedFloat32Array [x,y,z,r × N] solid verge props
+var _tile_prop_bounds := {}       # tile index -> Vector3 (cx, cz, bound radius) cheap query reject
+var _props_scratch := PackedFloat32Array()   # reused by props_near — callers must not hold it
 var _road_mat: StandardMaterial3D
 var _rail_mat: StandardMaterial3D
 var _rail_cap_mat: StandardMaterial3D
@@ -1638,6 +1641,8 @@ func _update_tiles() -> void:
 		if not want.has(t):
 			_tiles[t].queue_free()
 			_tiles.erase(t)
+			_tile_props.erase(t)
+			_tile_prop_bounds.erase(t)
 	# build up to a few missing tiles per frame (nearest first) to avoid hitches
 	var keys := want.keys()
 	keys.sort_custom(func(a, b): return absi(int(a) - ct) < absi(int(b) - ct))
@@ -2155,6 +2160,7 @@ func _scatter_tile(t: int, rows: Array, container: Node3D) -> void:
 	var buckets := {}
 	for k in scatter_kinds:
 		buckets[k] = [] as Array[Transform3D]
+	var props := PackedFloat32Array()   # [x,y,z,coarse radius] per accepted prop (near-miss feed)
 	for r in rows:
 		if r.void or float(r.dk) > 0.05:
 			continue   # no trees growing out of a bridge deck
@@ -2181,6 +2187,11 @@ func _scatter_tile(t: int, rows: Array, container: Node3D) -> void:
 			var s: float = rng.randf_range(0.8, 1.6) * float(_scatter_kind_scale.get(kind, 1.0))
 			var b := Basis(Vector3.UP, rng.randf() * TAU).scaled(Vector3(s, s, s))
 			buckets[kind].append(Transform3D(b, Vector3(wx, wy, wz)))
+			# coarse footprint for the near-miss check — trunk/boulder scale, not canopy
+			props.push_back(wx)
+			props.push_back(wy)
+			props.push_back(wz)
+			props.push_back(clampf(0.45 * s, 0.3, 1.4))
 	for kind in buckets.keys():
 		var xforms: Array = buckets[kind]
 		if xforms.is_empty():
@@ -2196,6 +2207,49 @@ func _scatter_tile(t: int, rows: Array, container: Node3D) -> void:
 		mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		mmi.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
 		container.add_child(mmi)
+	# index this tile's props for props_near: centroid + bound radius lets a query
+	# reject the whole tile with one distance check
+	if props.size() > 0:
+		var cx := 0.0
+		var cz := 0.0
+		var n := props.size() / 4
+		for i in range(0, props.size(), 4):
+			cx += props[i]
+			cz += props[i + 2]
+		cx /= float(n)
+		cz /= float(n)
+		var bound := 0.0
+		for i in range(0, props.size(), 4):
+			var dx: float = props[i] - cx
+			var dz: float = props[i + 2] - cz
+			bound = maxf(bound, dx * dx + dz * dz)
+		_tile_props[t] = props
+		_tile_prop_bounds[t] = Vector3(cx, cz, sqrt(bound) + 1.5)
+
+## Solid verge props (trees/rocks) within `radius` of (x,z) as flat [x,y,z,r] quads
+## (r = coarse trunk/boulder footprint). Feeds the car's prop near-miss. Returns a
+## REUSED scratch buffer — consume immediately, never hold across frames. Purely a
+## read of the scatter index; the ground-query path is untouched.
+func props_near(x: float, z: float, radius: float) -> PackedFloat32Array:
+	_props_scratch.resize(0)
+	for t in _tile_props:
+		var b: Vector3 = _tile_prop_bounds[t]
+		var bdx := x - b.x
+		var bdz := z - b.y
+		var reach: float = b.z + radius
+		if bdx * bdx + bdz * bdz > reach * reach:
+			continue
+		var arr: PackedFloat32Array = _tile_props[t]
+		for i in range(0, arr.size(), 4):
+			var dx := x - arr[i]
+			var dz := z - arr[i + 2]
+			var rr: float = radius + arr[i + 3]
+			if dx * dx + dz * dz <= rr * rr:
+				_props_scratch.push_back(arr[i])
+				_props_scratch.push_back(arr[i + 1])
+				_props_scratch.push_back(arr[i + 2])
+				_props_scratch.push_back(arr[i + 3])
+	return _props_scratch
 
 ## True if a DIFFERENT stretch of road (index gap > 10 from `own_i`) claims (x,z)
 ## as drivable-or-nearly (within its half-width + margin). Keeps verge props and
