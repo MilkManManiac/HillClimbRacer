@@ -10,7 +10,7 @@ extends Node
 ## pattern (process_mode ALWAYS + _begin_game past the title pause).
 
 const HCMainScript := preload("res://scripts/hc/HCMain.gd")
-const MAP_KEYS := ["hills", "canyon", "alpine"]
+const MAP_KEYS := ["hills", "canyon", "alpine", "midnight", "gravity", "dunes"]
 const MAX_FRAMES := 7200      # 60s @ 60Hz physics tick cap per map
 const SAMPLE_EVERY := 600     # 5s
 
@@ -18,7 +18,16 @@ func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	var root_scene := load("res://scenes/HillClimb.tscn") as PackedScene
 	var summary: Array = []
-	for key in MAP_KEYS:
+	# tuning hooks: HC_AUTODRIVE_MAPS="dunes,hills" limits the sweep to the maps
+	# being tuned; HC_AUTODRIVE_VEHICLE="sports" swaps the ride (default minivan) —
+	# both optional so the no-env behaviour stays the full stock sweep
+	var keys := MAP_KEYS
+	var env_maps := OS.get_environment("HC_AUTODRIVE_MAPS")
+	if env_maps != "":
+		keys = []
+		for k in env_maps.split(","):
+			keys.append(k.strip_edges())
+	for key in keys:
 		var result: Dictionary = await _run_map(root_scene, key)
 		summary.append(result)
 	_release_all()
@@ -36,6 +45,9 @@ func _run_map(root_scene: PackedScene, key: String) -> Dictionary:
 	await get_tree().process_frame
 	if inst.has_method("select_map"):
 		inst.call("select_map", key)
+	var env_veh := OS.get_environment("HC_AUTODRIVE_VEHICLE")
+	if env_veh != "" and inst.has_method("_swap_vehicle"):
+		inst.call("_swap_vehicle", env_veh)   # bypasses the buy path — bot runs are hermetic
 	if inst.has_method("_begin_game"):
 		inst.call("_begin_game")
 	await get_tree().process_frame

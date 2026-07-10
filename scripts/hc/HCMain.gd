@@ -112,8 +112,34 @@ const MAPS := {
 			],
 		},
 	},
+	"dunes": {
+		"name": "Dune Drift", "desc": "Golden-hour desert rollers — skim the crests, chain floaty hops, keep the flow.",
+		"mode": "classic", "sky_time": 0.35, "accent": Color(0.93, 0.72, 0.35),
+		"overrides": {
+			# rhythm map: LONG-wavelength medium rollers so 25-35 m/s flows crest to
+			# crest with small chained hops — deliberately distinct from alpine's huge
+			# singular jumps. High straight bias + wide radii keep the flow unbroken.
+			"hill_amp": 9.0, "noise_frequency": 0.0015,
+			"straight_bias": 0.68, "max_turn_deg": 110.0,
+			"turn_radius_min": 46.0, "turn_radius_max": 95.0,
+			"road_half": 19.0, "road_half_turn": 27.0,
+			# gaps stay rare and modest — the rollers ARE the feature here
+			"gap_start": 650.0, "gap_spacing": 520.0, "gap_spacing_grow": 160.0,
+			"gap_base_width": 14.0, "gap_grow": 6.0, "gap_ramp_rise": 5.0, "gap_land_len": 60.0,
+			"path_seed": 60660, "noise_seed": 3111,
+			"grass_color": Color(0.71, 0.55, 0.32), "asphalt_color": Color(0.17, 0.15, 0.14),
+			"centre_line_color": Color(0.95, 0.82, 0.45), "edge_line_color": Color(0.96, 0.92, 0.78),
+			"rail_band_color": Color(0.95, 0.62, 0.18), "rail_post_color": Color(0.42, 0.36, 0.30),
+			"scatter_density": 0.45,
+			# rock_1 only: rock_2's mossy green patches read as random lime blocks
+			# against the sand (fine in canyon where the red haze mutes them)
+			"scatter_kinds": [
+				"res://assets/rocks/rock_quaternius_1_cc0.glb",
+			],
+		},
+	},
 }
-const MAP_KEYS := ["hills", "canyon", "alpine", "midnight", "gravity"]
+const MAP_KEYS := ["hills", "canyon", "alpine", "midnight", "gravity", "dunes"]
 var _map := "hills"
 var _best := {}            # map_key -> best distance (m) reached on that map, persisted
 var _map_btns := {}       # key -> Button (title-screen map card)
@@ -858,6 +884,16 @@ func _apply_map_atmosphere(env: Environment, sun: DirectionalLight3D) -> void:
 			env.adjustment_contrast = 1.02
 			if sun:
 				sun.light_energy = 1.65
+		"dunes":
+			# golden hour: warm long-throw haze — kept restrained; the first pass
+			# (saturation 1.14, energy 1.95, low sun) blew the sand out to neon
+			env.fog_light_color = Color(0.90, 0.76, 0.55)
+			env.fog_depth_begin = 120.0
+			env.fog_density = 0.010
+			env.adjustment_saturation = 1.04
+			if sun:
+				sun.light_color = Color(1.0, 0.85, 0.60)
+				sun.light_energy = 1.75
 
 ## Sun-disc glow + star density: cheap, high-read per-map touches living in Sky.gd's
 ## own shader (see shaders/sky.gdshader — sun_glow/sun_glow_color/star_amount uniforms),
@@ -878,6 +914,10 @@ func _apply_map_sky_shader(sky_mat: ShaderMaterial) -> void:
 		"midnight":
 			# denser stars than the stock night value reads as a clearer, more dramatic sky
 			sky_mat.set_shader_parameter("star_amount", 1.0)
+		"dunes":
+			# big soft golden glare — golden hour without canyon's full sunset blaze
+			sky_mat.set_shader_parameter("sun_glow", 0.8)
+			sky_mat.set_shader_parameter("sun_glow_color", Color(1.0, 0.72, 0.35))
 
 func _setup_terrain_and_car() -> void:
 	_terrain = Node3D.new()
