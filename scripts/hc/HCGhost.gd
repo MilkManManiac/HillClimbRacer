@@ -38,7 +38,10 @@ var _play_count := 0
 var _mesh_root: Node3D   # built lazily on first load_data() with real samples
 
 # --- appearance (used to tell "your best" apart from an imported rival) --------
-var _tint := Color(0.35, 0.75, 1.0, 0.38)   # default: your-ghost blue
+var _tint := Color(0.86, 0.94, 1.0, 0.34)   # default: your own best, a pale glass ghost
+                                             # (the trial car itself is blue; a rival is red)
+var _shell_mat: StandardMaterial3D           # realistic ghost shell's one shared material
+const HCCarBody := preload("res://scripts/hc/HCCarBody.gd")
 var _label_text := ""                        # non-empty shows a floating Label3D (rival name)
 var _label3d: Label3D
 
@@ -54,6 +57,9 @@ func configure(tint: Color, label_text: String = "") -> void:
 		_apply_label()
 
 func _apply_tint() -> void:
+	if _shell_mat:
+		_shell_mat.albedo_color = _tint
+		_shell_mat.emission = Color(_tint.r, _tint.g, _tint.b)
 	for c in _mesh_root.get_children():
 		if c is MeshInstance3D and c.material_override is StandardMaterial3D:
 			(c.material_override as StandardMaterial3D).albedo_color = _tint
@@ -207,6 +213,28 @@ func _sample_rot(i: int) -> Quaternion:
 func _build_mesh() -> void:
 	_mesh_root = Node3D.new()
 	add_child(_mesh_root)
+	if DisplayServer.get_name() != "headless":
+		# realistic ghost: the trial car's own body as tinted glass. The depth pre-pass
+		# means only the nearest surface of the shell blends in, so it reads as one
+		# clean translucent car rather than a tangle of overlapping panels.
+		_shell_mat = StandardMaterial3D.new()
+		_shell_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_DEPTH_PRE_PASS
+		_shell_mat.albedo_color = _tint
+		_shell_mat.roughness = 0.35
+		_shell_mat.emission_enabled = true
+		_shell_mat.emission = Color(_tint.r, _tint.g, _tint.b)
+		_shell_mat.emission_energy_multiplier = 0.35
+		_shell_mat.rim_enabled = true
+		_shell_mat.rim = 0.7
+		# stance of the trial's sports car (HCCar.VSPEC fz 1.55; ground 0.12 above the
+		# body origin at its fixed suspension tune)
+		var shell := HCCarBody.concept_ghost(_shell_mat, 1.55, 0.12)
+		if shell:
+			_mesh_root.add_child(shell)
+			_mesh_root.visible = false
+			_apply_label()
+			return
+		_shell_mat = null
 	var mat := StandardMaterial3D.new()
 	mat.albedo_color = _tint
 	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA

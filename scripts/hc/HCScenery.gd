@@ -61,6 +61,8 @@ func configure(cfg: Dictionary) -> void:
 	_star_progress = 0.0
 	_star_timer = randf_range(STAR_INTERVAL[0], STAR_INTERVAL[1])
 	_style = str(cfg.get("style", "hills"))
+	if _style == "bare":
+		return   # realistic maps: HCLand supplies the whole landscape
 	var accent: Color = cfg.get("accent", Color(0.7, 0.75, 0.7))
 	match _style:
 		"canyon":

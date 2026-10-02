@@ -35,6 +35,10 @@ func _ready() -> void:
 			_car = c
 
 func _physics_process(delta: float) -> void:
+	# count from game start, not boot: a slower first frame (heavier scenery) adds paused
+	# ticks before _begin_game, which would slide the spawn-drop bounce into the window
+	if get_tree().paused:
+		return
 	_f += 1
 	if _car == null:
 		return
@@ -44,6 +48,11 @@ func _physics_process(delta: float) -> void:
 		var vy: float = _car.linear_velocity.y
 		var right: Vector3 = _car.global_transform.basis.x
 		var pitch_rate: float = _car.angular_velocity.dot(right)
+		if _f == 121:
+			# seed the deltas: comparing the first sample against 0 would count the car's
+			# whole vertical speed at that instant as one tick of acceleration
+			_prev_vy = vy
+			_prev_pitch_rate = pitch_rate
 		# skip gap zones: riding a launch ramp is INTENTIONAL vertical acceleration,
 		# not roughness — counting it makes the metric depend on where gaps land
 		var in_gap := false

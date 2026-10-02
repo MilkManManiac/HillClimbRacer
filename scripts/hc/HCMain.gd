@@ -11,6 +11,7 @@ const HCAudioScript := preload("res://scripts/hc/HCAudio.gd")
 const HCSceneryScript := preload("res://scripts/hc/HCScenery.gd")
 const HCTimeTrialScript := preload("res://scripts/hc/HCTimeTrial.gd")   # static rules only, never instanced
 const HCGhostScript := preload("res://scripts/hc/HCGhost.gd")
+const HCLook := preload("res://scripts/hc/HCLook.gd")   # realistic look kit (static)
 const USE_TRACK := true   # true = new 2-D winding road (HCTrack); false = classic corridor
 
 var _car: RigidBody3D
@@ -44,7 +45,13 @@ const MAPS := {
 			"grass_color": Color(0.55, 0.33, 0.18), "asphalt_color": Color(0.12, 0.11, 0.12),
 			"edge_line_color": Color(0.95, 0.88, 0.72), "rail_band_color": Color(0.95, 0.5, 0.15),
 			"scatter_density": 0.85,
-			"scatter_kinds": ["res://assets/rocks/rock_quaternius_1_cc0.glb", "res://assets/rocks/rock_quaternius_2_cc0.glb"],
+			# realistic look (HCLook.LOOKS): photo-textured ground, real terrain, the
+			# photographed sky. The colour overrides above only matter if it is removed.
+			"look": "desert",
+			"scatter_kinds": [
+				"baked:boulder_03:namaqualand_boulder_03", "baked:boulder_04:namaqualand_boulder_04",
+				"baked:boulder_05:namaqualand_boulder_05", "baked:boulder_06:namaqualand_boulder_06",
+			],
 		},
 	},
 	"alpine": {
@@ -360,6 +367,17 @@ var _fov_punch := 0.0       # transient FOV kick on hard landings
 ## strip, cosmetic swatches) still win over the theme, so this is additive, not a
 ## replacement for the bespoke accent-tinted looks those already have.
 var _ui_theme: Theme
+# One typeface everywhere (Barlow Condensed, OFL — assets/fonts): the narrow, upright
+# letterforms of motorsport timing graphics. All three carry tabular numerals, so a
+# running clock's digits never shuffle sideways.
+var _font_ui: Font      # SemiBold: every menu and HUD label
+var _font_bold: Font    # Bold: clocks, track names, the START slab
+var _font_caps: Font    # Medium, letter-spaced: small ALL-CAPS labels
+const UI_AMBER := Color(0.97, 0.63, 0.20)      # the one accent: sunset on sandstone
+const UI_TEXT := Color(0.93, 0.93, 0.91)
+const UI_DIM := Color(0.62, 0.63, 0.64)
+const UI_GLASS := Color(0.035, 0.035, 0.04, 0.80)
+const UI_HAIR := Color(1, 1, 1, 0.14)
 var _shop: Control
 var _shop_panel: PanelContainer   # the shop/wreck screen's card — animated in on open (see _animate_panel_in)
 var _shop_header: Label
@@ -371,8 +389,12 @@ var _reset_btn: Button
 var _restart_btn: Button
 var _money_btn: Button
 var _start_layer: CanvasLayer   # one-time title / how-to-play screen (pauses until dismissed)
-var _start_dim: ColorRect       # title screen dim backdrop — faded out (not just freed) on START
-var _start_center: CenterContainer   # title screen root Control — scaled/faded out on START
+var _start_dim: Control         # title screen scrim — faded out (not just freed) on START
+var _start_center: Control      # title screen root Control — faded out on START
+var _title_col: VBoxContainer   # the left text column (wider in classic, for the map grid)
+var _title_legend_lbl: Label
+var _title_name_lbl: Label
+var _title_tween: Tween         # drives the hero camera while the tree is paused
 var _start_btn: Button
 var _reset_armed := false   # fresh-start needs a confirm click so it's not a mis-tap
 var _first_veh_btn: Button   # focus target when the garage opens (gamepad nav)
@@ -417,6 +439,10 @@ var _cam_look_basis := Basis.IDENTITY  # roll-free smoothing accumulator (see _u
 var _cam_look_ready := false           # false until _cam_look_basis is seeded
 var _speed_fx := 0.0                   # smoothed speed-lines intensity 0..1
 var _speed_lines: Control              # full-screen streak overlay (mouse-ignored)
+var _speed_blur: ColorRect             # realistic maps: radial smear + vignette instead of streaks
+var _hud_layer: CanvasLayer            # hidden while the title screen is up
+var _speed_lbl: Label                  # trial HUD: big speed numerals, bottom right
+var _speed_unit_lbl: Label
 var _speed_line_nodes: Array[Line2D] = []
 var _speed_lines_size := Vector2.ZERO  # viewport size the streaks were laid out for
 
@@ -614,6 +640,7 @@ func _ready() -> void:
 	for ck in COSM_KEYS:
 		_cosm_color[ck] = COSMETICS[ck].default   # seed chosen colours from defaults
 	_setup_input()
+	_load_fonts()
 	_init_levels()
 	_scan_body_kits()   # before _load_game so a saved kit path can be validated
 	_load_game()   # restore money/levels/owned/vehicle/cosmetics/map/best BEFORE anything
@@ -883,6 +910,37 @@ func _tune_arcade_environment(sky: Node3D) -> void:
 	var sky_mat: ShaderMaterial = sky.get("_sky_mat")
 	if sky_mat:
 		_apply_map_sky_shader(sky_mat)
+	_apply_look_sky(env, sun)
+
+## The map's realistic look key ("" for the arcade-styled maps).
+func _map_look() -> String:
+	return str(MAPS[_map].overrides.get("look", ""))
+
+var _arcade_sky: Sky   # Sky.gd's own procedural sky, parked while a look map shows a photo
+
+## Realistic maps replace the whole arcade grade above with the photographed sky and
+## the lighting that goes with it (HCLook.apply_sky). Switching back to an arcade map
+## has to undo the pieces the arcade tuning never sets, or they would leak across.
+func _apply_look_sky(env: Environment, sun: DirectionalLight3D) -> void:
+	if env == null:
+		return
+	var look := _map_look()
+	if look != "":
+		if _arcade_sky == null:
+			_arcade_sky = env.sky
+		if not HCLook.apply_sky(look, env, sun):
+			env.sky = _arcade_sky   # headless / file missing: keep the procedural sky
+		return
+	if _arcade_sky != null:
+		env.sky = _arcade_sky
+	env.ssao_enabled = false
+	env.fog_height_density = 0.0
+	env.fog_sun_scatter = 0.0
+	env.reflected_light_source = Environment.REFLECTION_SOURCE_BG
+	if sun:
+		sun.light_angular_distance = 0.0
+		sun.directional_shadow_blend_splits = false
+		sun.shadow_normal_bias = 2.0
 
 ## Per-map fog color/density + sun-color seasoning: canyon's dusty warm haze, alpine's
 ## crisp cold thin air, hills' soft pastoral haze, gravity's industrial overcast-warm
@@ -1028,7 +1086,9 @@ func _setup_scenery() -> void:
 func _scenery_config() -> Dictionary:
 	var m: Dictionary = MAPS[_map]
 	return {
-		"style": _map,
+		# a look map has real terrain to the horizon (HCLand); the painted backdrop
+		# rings would stand in front of it
+		"style": "bare" if _map_look() != "" and not HCLook.headless() else _map,
 		"accent": m.get("accent", Color(0.7, 0.75, 0.7)),
 		"night": bool(m.get("night", false)),
 	}
@@ -1188,7 +1248,7 @@ func _update_map_row() -> void:
 func _setup_camera() -> void:
 	_cam = Camera3D.new()
 	_cam.fov = 70.0
-	_cam.far = 2000.0
+	_cam.far = 6000.0   # HCLand's far ring reaches ~3 km; fog hides the rest
 	_cam.current = true
 	# we drive the camera by hand every frame in _process; with the project's
 	# physics_interpolation on, Godot spams "Interpolated Camera3D triggered from
@@ -1273,7 +1333,10 @@ func _update_camera(delta: float) -> void:
 			lead_target = lead
 	_cam_lead = _cam_lead.lerp(lead_target, 1.0 - exp(-4.0 * delta))
 	var target := _car.global_position
-	var want := target - _cam_heading * 12.0 + Vector3(0, 6.0, 0)
+	# realistic maps sit the camera lower and closer with a longer lens: the arcade
+	# framing (12 m back, 6 m up, very wide) shrinks the car to a toy on a huge plane
+	var realistic: bool = _map_look() != ""
+	var want := target - _cam_heading * (7.2 if realistic else 12.0) + Vector3(0, 2.9 if realistic else 6.0, 0)
 	# gentle "cut the corner": nudge the chase position a small fraction of the aim bias
 	want += _cam_lead * 0.3
 	# loop-de-loop zones: trail-behind hides the car behind the ribbon up top —
@@ -1294,11 +1357,13 @@ func _update_camera(delta: float) -> void:
 	if blocked:
 		want = from.lerp(hit.position, 0.82)
 	# never let the camera dip below the terrain surface
-	var floor_y: float = _terrain.call("height_at", want.x, want.z) + 3.0
+	var floor_y: float = _terrain.call("height_at", want.x, want.z) + (1.5 if realistic else 3.0)
 	if want.y < floor_y:
 		want.y = floor_y
 	# snap in faster when blocked so the car never disappears
-	var snap: float = 16.0 if blocked else 6.0
+	# (the smoothing lag adds speed / snap metres of trail: a tighter follow on the
+	# realistic maps keeps the car from shrinking away at 250 km/h)
+	var snap: float = 16.0 if blocked else (9.5 if realistic else 6.0)
 	_cam.global_position = _cam.global_position.lerp(want, 1.0 - exp(-snap * delta))
 	var look := target + Vector3(0, 1.0, 0)
 	# lean the AIM toward the upcoming bend (composes with the roll-free basis below;
@@ -1327,6 +1392,8 @@ func _update_camera(delta: float) -> void:
 	var spd: float = _car.linear_velocity.length()
 	var boosting: bool = bool(_car.get("boosting"))
 	var target_fov: float = lerpf(70.0, 92.0, clamp(spd / 42.0, 0.0, 1.0))
+	if realistic:
+		target_fov = lerpf(60.0, 78.0, clamp(spd / 60.0, 0.0, 1.0))
 	target_fov += (9.0 if boosting else 0.0) + _fov_punch
 	_cam.fov = lerpf(_cam.fov, target_fov, 1.0 - exp(-4.0 * delta))
 	_fov_punch *= exp(-7.0 * delta)
@@ -1486,7 +1553,7 @@ func _update_sprint(delta: float) -> void:
 		_car.set("fuel", minf(float(_car.get("fuel")) + mf * SPRINT_FUEL_FRAC, mf))
 		var cash: int = int((SPRINT_CASH_BASE + SPRINT_CASH_STEP * (cp_idx - 1)) * _cash_mult())
 		money += cash
-		_car.set("trick_text", "CHECKPOINT  +%ds  ⛽  +$%d" % [int(SPRINT_BONUS_S), cash])
+		_car.set("trick_text", "CHECKPOINT  +%ds   +$%d" % [int(SPRINT_BONUS_S), cash])
 		_car.set("_trick_timer", 2.0)
 		if _audio:
 			_audio.call("play_checkpoint")
@@ -1637,6 +1704,14 @@ func _setup_speed_lines() -> void:
 	var layer := CanvasLayer.new()
 	layer.layer = 0
 	add_child(layer)
+	_speed_blur = ColorRect.new()
+	_speed_blur.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_speed_blur.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var blur_mat := ShaderMaterial.new()
+	blur_mat.shader = preload("res://shaders/hc_speed_blur.gdshader")
+	_speed_blur.material = blur_mat
+	_speed_blur.visible = false
+	layer.add_child(_speed_blur)
 	_speed_lines = Control.new()
 	_speed_lines.set_anchors_preset(Control.PRESET_FULL_RECT)
 	_speed_lines.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -1693,7 +1768,12 @@ func _update_feel(delta: float) -> void:
 			var f := (spd / SPEED_REF - SPEED_FX_ON) / maxf(SPEED_FX_MAX - SPEED_FX_ON, 0.01)
 			target = clampf(f, 0.0, 1.0)
 	_speed_fx = lerpf(_speed_fx, target, 1.0 - exp(-4.0 * delta))
-	_speed_lines.modulate.a = _speed_fx * 0.7   # peak ~0.35 alpha per streak
+	var realistic: bool = _map_look() != ""
+	_speed_lines.modulate.a = 0.0 if realistic else _speed_fx * 0.7   # peak ~0.35 alpha per streak
+	if _speed_blur:
+		# hidden behind the title/shop: the smear would blur the menu panels' backdrop
+		_speed_blur.visible = realistic and not (_shop != null and _shop.visible) and not get_tree().paused
+		(_speed_blur.material as ShaderMaterial).set_shader_parameter("strength", _speed_fx * 0.024)
 
 ## Sponsor Decals upgrade: scales all cash earned (distance payout + coins).
 func _cash_mult() -> float:
@@ -1822,110 +1902,136 @@ func _build_start_menu() -> void:
 	_start_layer.layer = 20                       # above the HUD and the shop
 	_start_layer.process_mode = Node.PROCESS_MODE_ALWAYS
 	add_child(_start_layer)
-	var dim := ColorRect.new()
-	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
-	dim.color = Color(0.03, 0.03, 0.05, 0.93)
-	_start_layer.add_child(dim)
-	_start_dim = dim
-	_setup_title_vignette(_start_layer)   # soft radial darkening behind the panel
-	_setup_title_dots(_start_layer)       # slow drifting motes — cheap parallax dressing
+	# No dimming slab and no card: the live scene is the title art, shot by a slow
+	# hero camera (_title_cam_update). A left-hand scrim carries the text column.
+	var scrim := _gradient_rect(Color(0.015, 0.015, 0.02, 0.90), Color(0.015, 0.015, 0.02, 0.0), Vector2(0.22, 0), Vector2(0.70, 0))
+	_start_layer.add_child(scrim)
+	_start_dim = scrim
+	var root := Control.new()
+	root.set_anchors_preset(Control.PRESET_FULL_RECT)
+	root.theme = _ui_theme
+	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_start_layer.add_child(root)
+	_start_center = root
+	var margin := MarginContainer.new()
+	margin.set_anchors_preset(Control.PRESET_LEFT_WIDE)
+	margin.add_theme_constant_override("margin_left", 64)
+	margin.add_theme_constant_override("margin_top", 38)
+	margin.add_theme_constant_override("margin_bottom", 26)
+	root.add_child(margin)
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 8)
+	margin.add_child(col)
+	_title_col = col
 
-	var center := CenterContainer.new()
-	center.set_anchors_preset(Control.PRESET_FULL_RECT)
-	center.theme = _ui_theme
-	center.pivot_offset = Vector2(640, 360)   # window is locked 1280x720 (CLAUDE.md invariant 4)
-	_start_layer.add_child(center)
-	_start_center = center
-	var panel := PanelContainer.new()
-	panel.custom_minimum_size = Vector2(760, 0)
-	_style_panel(panel, Color(0.07, 0.075, 0.1, 0.97), Color(0.32, 0.34, 0.42), 1, 16)
-	center.add_child(panel)
-	var pad := MarginContainer.new()
-	for m in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
-		pad.add_theme_constant_override(m, 22)
-	panel.add_child(pad)
-	var box := VBoxContainer.new()
-	box.add_theme_constant_override("separation", 10)
-	pad.add_child(box)
+	_cap_label(col, "HILL CLIMB RACER", 17, UI_AMBER)
+	_build_mode_toggle(col)
+	var gap := Control.new()
+	gap.custom_minimum_size = Vector2(0, 14)
+	col.add_child(gap)
 
-	# --- logo -----------------------------------------------------------------
-	var title_lbl := _shop_label(box, "🏎  HILL CLIMB RACER", 36, Color(1, 0.82, 0.42))
-	title_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	title_lbl.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.6))
-	title_lbl.add_theme_constant_override("outline_size", 6)
-	_bob_logo(title_lbl)   # slow bob/tilt flourish — purely cosmetic, tied to the ALWAYS-mode layer
-	_title_sub_lbl = _shop_label(box, "", 14, Color(0.68, 0.74, 0.86))
-	_title_sub_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	box.add_child(HSeparator.new())
-
-	# scrollable middle: mode toggle + map cards + vehicle strip + control legend, so
-	# this whole section can grow without ever pushing START off the 720px window
-	var sc := ScrollContainer.new()
-	sc.custom_minimum_size = Vector2(716, 434)
-	sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	box.add_child(sc)
-	var scb := VBoxContainer.new()
-	scb.add_theme_constant_override("separation", 10)
-	scb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	sc.add_child(scb)
-
-	_build_mode_toggle(scb)
-
-	# trial-only sections: this week's track card + ghost sharing
+	# trial-only: this week's track, your time, ghost sharing
 	_title_trial_box = VBoxContainer.new()
-	_title_trial_box.add_theme_constant_override("separation", 10)
-	scb.add_child(_title_trial_box)
+	_title_trial_box.add_theme_constant_override("separation", 6)
+	col.add_child(_title_trial_box)
 	_build_weekly_card(_title_trial_box)
 	_title_trial_box.add_child(HSeparator.new())
 	_build_ghost_row(_title_trial_box)
 
-	# classic-only sections: map grid + garage vehicle strip
+	# classic-only: map grid + garage vehicle strip. The grid scrolls, so this section
+	# can grow without ever pushing START off the 720px window.
 	_title_classic_box = VBoxContainer.new()
-	_title_classic_box.add_theme_constant_override("separation", 10)
-	scb.add_child(_title_classic_box)
-	_shop_label(_title_classic_box, "SELECT MAP", 13, Color(0.6, 0.64, 0.72))
+	_title_classic_box.add_theme_constant_override("separation", 8)
+	col.add_child(_title_classic_box)
+	_cap_label(_title_classic_box, "SELECT MAP", 14, UI_DIM)
+	var sc := ScrollContainer.new()
+	sc.custom_minimum_size = Vector2(690, 344)
+	sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	_title_classic_box.add_child(sc)
 	var grid := GridContainer.new()
 	grid.columns = 2
 	grid.add_theme_constant_override("h_separation", 10)
 	grid.add_theme_constant_override("v_separation", 10)
-	_title_classic_box.add_child(grid)
+	sc.add_child(grid)
 	_map_btns.clear()
 	_map_card_stat_lbl.clear()
 	for mk in MAP_KEYS:
 		_build_map_card(grid, mk)
-	_title_classic_box.add_child(HSeparator.new())
 	_build_title_vehicle_row(_title_classic_box)
+
+	var spring := Control.new()
+	spring.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	col.add_child(spring)
+
+	var go := HBoxContainer.new()
+	go.add_theme_constant_override("separation", 16)
+	col.add_child(go)
+	_start_btn = Button.new()
+	_start_btn.text = "START"
+	_start_btn.custom_minimum_size = Vector2(250, 58)
+	_start_btn.add_theme_font_override("font", _font_bold)
+	_start_btn.add_theme_font_size_override("font_size", 30)
+	# the one solid slab of accent on the screen
+	var slab := StyleBoxFlat.new()
+	slab.bg_color = UI_AMBER
+	slab.set_corner_radius_all(3)
+	var slab_hot: StyleBoxFlat = slab.duplicate()
+	slab_hot.bg_color = UI_AMBER.lightened(0.18)
+	var slab_focus := StyleBoxFlat.new()
+	slab_focus.bg_color = Color(0, 0, 0, 0)
+	slab_focus.border_color = Color(1, 1, 1, 0.9)
+	slab_focus.set_border_width_all(2)
+	slab_focus.set_corner_radius_all(3)
+	slab_focus.set_expand_margin_all(4)
+	_start_btn.add_theme_stylebox_override("normal", slab)
+	_start_btn.add_theme_stylebox_override("hover", slab_hot)
+	_start_btn.add_theme_stylebox_override("pressed", slab_hot)
+	_start_btn.add_theme_stylebox_override("focus", slab_focus)
+	for cn in ["font_color", "font_hover_color", "font_pressed_color", "font_focus_color"]:
+		_start_btn.add_theme_color_override(cn, Color(0.07, 0.05, 0.03))
+	_start_btn.pressed.connect(_begin_game)
+	go.add_child(_start_btn)
+	var go_hint := _cap_label(go, "ENTER  /  A", 14, UI_DIM)
+	go_hint.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	go_hint.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	var gap2 := Control.new()
+	gap2.custom_minimum_size = Vector2(0, 8)
+	col.add_child(gap2)
+	_title_legend_lbl = _cap_label(col, "", 13, UI_DIM)
+
 	_refresh_map_buttons()
 	_refresh_title_mode()
-
-	scb.add_child(HSeparator.new())
-	_shop_label(scb, "CONTROLS", 13, Color(0.6, 0.64, 0.72))
-	var hints := HBoxContainer.new()
-	hints.alignment = BoxContainer.ALIGNMENT_CENTER
-	hints.add_theme_constant_override("separation", 14)
-	scb.add_child(hints)
-	_nav_hint(hints, "W/S · RT/LT", "Throttle/Brake")
-	_nav_hint(hints, "A/D · ⇦⇨", "Steer")
-	_nav_hint(hints, "Space · LB", "Dive")
-	_nav_hint(hints, "Ctrl · RB", "Boost")
-	_nav_hint(hints, "R · Y", "Recover")
-	_nav_hint(hints, "Tab · ☰", "Garage")
-	_nav_hint(hints, "Esc", "Pause")
-	var tip := _shop_label(scb, "Drift corners by braking into the turn or flicking the wheel hard.", 12, Color(0.62, 0.66, 0.74))
-	tip.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	tip.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-
-	box.add_child(HSeparator.new())
-	_start_btn = Button.new()
-	_start_btn.text = "START  ▶   (Enter / Ⓐ)"
-	_start_btn.custom_minimum_size = Vector2(0, 54)
-	_start_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_start_btn.add_theme_font_size_override("font_size", 22)
-	_start_btn.pressed.connect(_begin_game)
-	box.add_child(_start_btn)
-
 	get_tree().paused = true
+	if _hud_layer:
+		_hud_layer.visible = false   # the title is a clean shot of the car; no clock, no bars
 	_start_btn.call_deferred("grab_focus")
+	# hero camera: a tween bound to the ALWAYS-mode layer keeps ticking through the pause
+	_title_tween = _start_layer.create_tween()
+	_title_tween.set_loops()
+	_title_tween.tween_method(_title_cam_update, 0.0, 1.0, 46.0)
+	_title_cam_update(0.0)
+
+## The title's hero shot: sit the car on the tarmac where it will start (it normally
+## hangs 4 m up waiting for physics to drop it) and drift a long-lens camera slowly
+## around its front quarter, framed right of centre so the text column stays clear.
+## Runs every frame of the title; _begin_game undoes the pose.
+func _title_cam_update(t: float) -> void:
+	if _car == null or _cam == null or _terrain == null:
+		return
+	var gh: float = _terrain.call("height_at", _start.x, _start.z)
+	var rest: float = float(_car.get("suspension_rest"))
+	_car.global_position = Vector3(_start.x, gh - (0.5 - rest) - 0.07, _start.z)
+	_car.reset_physics_interpolation()
+	var b := _car.global_transform.basis
+	var p := _car.global_position + Vector3(0, 0.6, 0)
+	var ang := deg_to_rad(-34.0 + 15.0 * sin(t * TAU))
+	var cam_pos: Vector3 = p + (-b.z * cos(ang) + b.x * sin(ang)) * 8.6 + Vector3(0, 0.75 + 0.25 * sin(t * TAU * 2.0), 0)
+	var to_car := (p - cam_pos).normalized()
+	var cam_right := to_car.cross(Vector3.UP).normalized()
+	_cam.global_position = cam_pos
+	_cam.look_at(p - cam_right * 1.75, Vector3.UP)   # aim left of the car: it sits right of centre
+	_cam.fov = 36.0
+	_cam.reset_physics_interpolation()
 
 ## Classic (default, endless) vs Time Trial (race the clock to a finish line — see
 ## HCTimeTrialScript). A segmented pair of toggle buttons rather than a checkbox so both
@@ -1933,16 +2039,30 @@ func _build_start_menu() -> void:
 ## entirely — see _reset_run_mode_state.
 func _build_mode_toggle(parent: Node) -> void:
 	var row := HBoxContainer.new()
-	row.alignment = BoxContainer.ALIGNMENT_CENTER
-	row.add_theme_constant_override("separation", 8)
+	row.add_theme_constant_override("separation", 22)
 	parent.add_child(row)
 	_mode_btns.clear()
-	for mode_key in ["classic", "trial"]:
+	# text tabs with an underline on the live one, not a pair of boxed buttons
+	var flat := StyleBoxFlat.new()
+	flat.bg_color = Color(0, 0, 0, 0)
+	flat.content_margin_bottom = 6
+	var live: StyleBoxFlat = flat.duplicate()
+	live.border_color = UI_AMBER
+	live.border_width_bottom = 3
+	for mode_key in ["trial", "classic"]:
 		var b := Button.new()
 		b.text = "CLASSIC" if mode_key == "classic" else "WEEKLY TRIAL"
 		b.toggle_mode = true
-		b.custom_minimum_size = Vector2(170, 38)
-		b.add_theme_font_size_override("font_size", 15)
+		b.add_theme_font_override("font", _font_bold)
+		b.add_theme_font_size_override("font_size", 24)
+		for sn in ["normal", "hover", "disabled"]:
+			b.add_theme_stylebox_override(sn, flat)
+		b.add_theme_stylebox_override("pressed", live)
+		b.add_theme_stylebox_override("focus", live)
+		b.add_theme_color_override("font_color", UI_DIM)
+		b.add_theme_color_override("font_hover_color", UI_TEXT)
+		for cn in ["font_pressed_color", "font_hover_pressed_color", "font_focus_color"]:
+			b.add_theme_color_override(cn, Color(1, 1, 1))
 		b.pressed.connect(_on_title_mode_button.bind(mode_key))
 		row.add_child(b)
 		_mode_btns[mode_key] = b
@@ -1979,30 +2099,38 @@ func _refresh_title_mode() -> void:
 		_title_classic_box.visible = not trial
 	if _title_sub_lbl and is_instance_valid(_title_sub_lbl):
 		_title_sub_lbl.text = "One track. One car. Fastest time wins." if trial else "Drive as far as you can. Fuel is your timer."
+	if _title_col and is_instance_valid(_title_col):
+		_title_col.custom_minimum_size = Vector2(470 if trial else 690, 0)
+	if _title_legend_lbl and is_instance_valid(_title_legend_lbl):
+		_title_legend_lbl.text = ("W  THROTTLE      S  BRAKE      A / D  STEER      ENTER  RESTART      ESC  PAUSE" if trial
+				else "W / S  THROTTLE, BRAKE      A / D  STEER      SPACE  DIVE      CTRL  BOOST      R  RECOVER      TAB  GARAGE      ESC  PAUSE")
 
 ## "This week's track": the one card trial mode offers. Everything on it is read from
 ## HCTimeTrialScript.TRACKS, so swapping the weekly track is a data edit.
 func _build_weekly_card(parent: Node) -> void:
 	var mk: String = HCTimeTrialScript.WEEKLY
 	var m: Dictionary = MAPS[mk]
-	var accent: Color = m.get("accent", Color(0.6, 0.62, 0.68))
-	var card := PanelContainer.new()
-	_style_panel(card, Color(0.09, 0.095, 0.12, 0.95), accent, 2, 12)
-	parent.add_child(card)
-	var cpad := MarginContainer.new()
-	for cm in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
-		cpad.add_theme_constant_override(cm, 16)
-	card.add_child(cpad)
-	var vb := VBoxContainer.new()
-	vb.add_theme_constant_override("separation", 4)
-	cpad.add_child(vb)
-	_shop_label(vb, "WEEK %d  ·  THIS WEEK'S TRACK" % HCTimeTrialScript.week_of(mk), 12, Color(0.6, 0.64, 0.72))
-	_shop_label(vb, str(m.name).to_upper(), 30, accent)
-	var car_name := str(VEHICLES[HCTimeTrialScript.car_for(mk)].name)
-	_shop_label(vb, "%s, fixed tune   ·   %.1f km   ·   no fuel, no upgrades" % [car_name, HCTimeTrialScript.length(mk) / 1000.0], 15, Color(0.86, 0.88, 0.93))
-	vb.add_child(HSeparator.new())
-	_weekly_stat_lbl = _shop_label(vb, "", 15, Color(0.86, 0.88, 0.93))
-	_shop_label(vb, HCTimeTrialScript.ladder_text(mk), 12, Color(0.6, 0.64, 0.72))
+	_cap_label(parent, "WEEK %d" % HCTimeTrialScript.week_of(mk), 15, UI_DIM)
+	_title_name_lbl = _shop_label(parent, str(m.name).to_upper(), 82, Color(1, 1, 1))
+	_title_name_lbl.add_theme_font_override("font", _font_bold)
+	_title_name_lbl.add_theme_constant_override("line_spacing", -14)
+	var car_name := str(VEHICLES[HCTimeTrialScript.car_for(mk)].name).to_upper()
+	_cap_label(parent, "%.1f KM      %s      FIXED TUNE" % [HCTimeTrialScript.length(mk) / 1000.0, car_name], 15, UI_TEXT)
+	_title_sub_lbl = _shop_label(parent, "", 18, UI_DIM)
+	var gap := Control.new()
+	gap.custom_minimum_size = Vector2(0, 10)
+	parent.add_child(gap)
+	parent.add_child(HSeparator.new())
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 18)
+	parent.add_child(row)
+	var best_cap := _cap_label(row, "YOUR BEST", 14, UI_DIM)
+	best_cap.custom_minimum_size = Vector2(96, 0)
+	best_cap.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	best_cap.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_weekly_stat_lbl = _shop_label(row, "", 46, UI_TEXT)
+	_weekly_stat_lbl.add_theme_font_override("font", _font_bold)
+	_cap_label(parent, HCTimeTrialScript.ladder_text(mk).to_upper(), 14, UI_DIM)
 	_refresh_weekly_card()
 
 func _refresh_weekly_card() -> void:
@@ -2011,12 +2139,12 @@ func _refresh_weekly_card() -> void:
 	var mk: String = HCTimeTrialScript.WEEKLY
 	var bt: float = float(_best_time.get(_trial_key(mk, HCTimeTrialScript.car_for(mk)), -1.0))
 	if bt < 0.0:
-		_weekly_stat_lbl.text = "Your best:  no time set yet"
-		_weekly_stat_lbl.add_theme_color_override("font_color", Color(0.86, 0.88, 0.93))
+		_weekly_stat_lbl.text = "NO TIME SET"
+		_weekly_stat_lbl.add_theme_color_override("font_color", UI_DIM)
 		return
 	var medal := HCTimeTrialScript.medal_for(mk, bt)
-	_weekly_stat_lbl.text = "Your best:  %s   %s" % [HCTimeTrialScript.format_time(bt), HCTimeTrialScript.medal_glyph(medal)]
-	_weekly_stat_lbl.add_theme_color_override("font_color", HCTimeTrialScript.medal_color(medal) if medal != "" else Color(0.86, 0.88, 0.93))
+	_weekly_stat_lbl.text = "%s   %s" % [HCTimeTrialScript.format_time(bt), HCTimeTrialScript.medal_glyph(medal)]
+	_weekly_stat_lbl.add_theme_color_override("font_color", HCTimeTrialScript.medal_color(medal) if medal != "" else UI_TEXT)
 
 func _refresh_mode_buttons() -> void:
 	for k in _mode_btns:
@@ -2038,9 +2166,10 @@ func _build_map_card(parent: Node, mk: String) -> void:
 	card.custom_minimum_size = Vector2(330, 108)
 	card.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	card.tooltip_text = str(m.desc)
-	var normal_sb := _panel_style(Color(0.09, 0.095, 0.12, 0.9), Color(accent.r, accent.g, accent.b, 0.35), 1, 10)
-	var hover_sb := _panel_style(Color(0.12, 0.125, 0.16, 0.94), accent, 2, 10)
-	var pressed_sb := _panel_style(Color(0.1, 0.11, 0.15, 0.97), accent, 3, 10)
+	var normal_sb := _panel_style(Color(0, 0, 0, 0.7), UI_HAIR, 1, 4)
+	var hover_sb := _panel_style(Color(0, 0, 0, 0.8), Color(accent.r, accent.g, accent.b, 0.7), 2, 4)
+	var pressed_sb := _panel_style(Color(0, 0, 0, 0.9), accent, 2, 4)
+	pressed_sb.border_width_left = 5   # the selected map wears its accent as a spine
 	card.add_theme_stylebox_override("normal", normal_sb)
 	card.add_theme_stylebox_override("hover", hover_sb)
 	card.add_theme_stylebox_override("pressed", pressed_sb)
@@ -2062,8 +2191,9 @@ func _build_map_card(parent: Node, mk: String) -> void:
 	var name_lbl := Label.new()
 	name_lbl.text = str(m.name)
 	name_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	name_lbl.add_theme_font_size_override("font_size", 18)
-	name_lbl.add_theme_color_override("font_color", accent)
+	name_lbl.add_theme_font_override("font", _font_bold)
+	name_lbl.add_theme_font_size_override("font_size", 24)
+	name_lbl.add_theme_color_override("font_color", Color(1, 1, 1))
 	vb.add_child(name_lbl)
 
 	var desc_lbl := Label.new()
@@ -2072,8 +2202,8 @@ func _build_map_card(parent: Node, mk: String) -> void:
 	desc_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	desc_lbl.clip_text = true
 	desc_lbl.custom_minimum_size = Vector2(300, 38)
-	desc_lbl.add_theme_font_size_override("font_size", 12)
-	desc_lbl.add_theme_color_override("font_color", Color(0.68, 0.7, 0.76))
+	desc_lbl.add_theme_font_size_override("font_size", 15)
+	desc_lbl.add_theme_color_override("font_color", UI_DIM)
 	vb.add_child(desc_lbl)
 
 	var hs := HSeparator.new()
@@ -2081,8 +2211,9 @@ func _build_map_card(parent: Node, mk: String) -> void:
 	vb.add_child(hs)
 	var stat_lbl := Label.new()
 	stat_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	stat_lbl.add_theme_font_size_override("font_size", 12)
-	stat_lbl.add_theme_color_override("font_color", Color(0.85, 0.88, 0.92))
+	stat_lbl.add_theme_font_override("font", _font_caps)
+	stat_lbl.add_theme_font_size_override("font_size", 14)
+	stat_lbl.add_theme_color_override("font_color", accent)
 	vb.add_child(stat_lbl)
 	_map_btns[mk] = card
 	_map_card_stat_lbl[mk] = stat_lbl
@@ -2095,38 +2226,21 @@ func _build_map_card(parent: Node, mk: String) -> void:
 ## window budget (CLAUDE.md invariant 4); all four actions no-op gracefully with a
 ## message in the status line rather than erroring.
 func _build_ghost_row(parent: Node) -> void:
-	_shop_label(parent, "GHOSTS — share your best run", 13, Color(0.6, 0.64, 0.72))
+	_cap_label(parent, "GHOSTS      SEND A FRIEND YOUR BEST RUN, RACE THEIRS", 14, UI_DIM)
 	var row := HBoxContainer.new()
-	row.alignment = BoxContainer.ALIGNMENT_CENTER
 	row.add_theme_constant_override("separation", 8)
 	parent.add_child(row)
-	var export_btn := Button.new()
-	export_btn.text = "⬆ Export Best"
-	export_btn.custom_minimum_size = Vector2(132, 32)
-	export_btn.add_theme_font_size_override("font_size", 12)
-	export_btn.pressed.connect(_export_best_ghost)
-	row.add_child(export_btn)
-	var folder_btn := Button.new()
-	folder_btn.text = "📂 Folder"
-	folder_btn.custom_minimum_size = Vector2(84, 32)
-	folder_btn.add_theme_font_size_override("font_size", 12)
-	folder_btn.pressed.connect(_reveal_ghosts_folder)
-	row.add_child(folder_btn)
-	var import_btn := Button.new()
-	import_btn.text = "⬇ Import Rival"
-	import_btn.custom_minimum_size = Vector2(132, 32)
-	import_btn.add_theme_font_size_override("font_size", 12)
-	import_btn.pressed.connect(_open_import_dialog)
-	row.add_child(import_btn)
-	var clear_btn := Button.new()
-	clear_btn.text = "✕ Clear Rival"
-	clear_btn.custom_minimum_size = Vector2(112, 32)
-	clear_btn.add_theme_font_size_override("font_size", 12)
-	clear_btn.pressed.connect(_clear_rival_ghost)
-	row.add_child(clear_btn)
-	_ghost_status_lbl = _shop_label(parent, "", 12, Color(0.72, 0.76, 0.84))
-	_ghost_status_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	for spec in [["Export best", _export_best_ghost], ["Open folder", _reveal_ghosts_folder],
+			["Import rival", _open_import_dialog], ["Clear rival", _clear_rival_ghost]]:
+		var b := Button.new()
+		b.text = str(spec[0])
+		b.custom_minimum_size = Vector2(0, 32)
+		b.add_theme_font_size_override("font_size", 16)
+		b.pressed.connect(spec[1])
+		row.add_child(b)
+	_ghost_status_lbl = _shop_label(parent, "", 15, UI_DIM)
 	_ghost_status_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_ghost_status_lbl.custom_minimum_size = Vector2(460, 0)
 	_refresh_ghost_row()
 
 ## Write the personal-best ghost for the CURRENTLY SELECTED map+vehicle to a standalone
@@ -2162,7 +2276,7 @@ func _export_best_ghost() -> void:
 		return
 	f.store_string(JSON.stringify(payload))
 	f.close()
-	_show_ghost_status("Exported %s — hit 📂 Folder to grab it." % fname)
+	_show_ghost_status("Exported %s. Open Folder to grab it." % fname)
 
 ## Open the (globalized) ghosts folder in the OS file browser so the owner can attach
 ## an exported .hcghost to an email/chat. Never called automatically from export —
@@ -2281,7 +2395,7 @@ func _ghost_dir() -> String:
 ## "unlock in the Garage" rather than letting you buy from the title screen (buying
 ## needs the shop's money readout/context, which doesn't exist here).
 func _build_title_vehicle_row(parent: Node) -> void:
-	_shop_label(parent, "VEHICLE", 13, Color(0.6, 0.64, 0.72))
+	_cap_label(parent, "VEHICLE", 14, UI_DIM)
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 6)
 	parent.add_child(row)
@@ -2289,9 +2403,9 @@ func _build_title_vehicle_row(parent: Node) -> void:
 	for vk in VEH_KEYS:
 		var b := Button.new()
 		b.toggle_mode = true
-		b.custom_minimum_size = Vector2(0, 38)
+		b.custom_minimum_size = Vector2(0, 36)
 		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		b.add_theme_font_size_override("font_size", 12)
+		b.add_theme_font_size_override("font_size", 15)
 		b.pressed.connect(_on_title_vehicle_button.bind(vk))
 		row.add_child(b)
 		_veh_title_btns[vk] = b
@@ -2315,17 +2429,26 @@ func _refresh_title_vehicle_buttons() -> void:
 		b.button_pressed = (_vehicle == vk)
 		b.disabled = not owned
 		if _vehicle == vk:
-			b.text = "✓ " + str(VEHICLES[vk].name)
+			b.text = "" + str(VEHICLES[vk].name)
 		elif owned:
 			b.text = str(VEHICLES[vk].name)
 		else:
-			b.text = "🔒 " + str(VEHICLES[vk].name)
+			b.text = "LOCKED  " + str(VEHICLES[vk].name)
 		b.tooltip_text = str(VEHICLES[vk].desc) if owned else "%s — $%d (unlock in the Garage)" % [str(VEHICLES[vk].name), int(VEHICLES[vk].price)]
 
 ## Leave the title screen: unpause and drop the overlay.
 func _begin_game() -> void:
 	if _audio:
 		_audio.call("play_click")
+	if _title_tween:
+		_title_tween.kill()   # stop the hero camera BEFORE the game owns the car and camera again
+		_title_tween = null
+		if _car:
+			_car.global_position = _start   # the normal spawn (a short drop onto the road)
+			_car.reset_physics_interpolation()
+		_cam_look_ready = false
+	if _hud_layer:
+		_hud_layer.visible = true
 	get_tree().paused = false   # the state change is immediate — everything below is cosmetic
 	if _start_layer:
 		var layer := _start_layer
@@ -2341,9 +2464,8 @@ func _begin_game() -> void:
 			# already running underneath by the time this finishes (paused flag cleared above)
 			var tw := layer.create_tween()
 			tw.set_parallel(true)
-			tw.tween_property(dim, "modulate:a", 0.0, 0.18)
-			tw.tween_property(center, "modulate:a", 0.0, 0.16)
-			tw.tween_property(center, "scale", Vector2(1.04, 1.04), 0.18).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+			tw.tween_property(dim, "modulate:a", 0.0, 0.3)
+			tw.tween_property(center, "modulate:a", 0.0, 0.22)
 			tw.chain().tween_callback(layer.queue_free)
 		else:
 			layer.queue_free()
@@ -2395,7 +2517,7 @@ func _build_pause_menu() -> void:
 	_shop_label(box, "PAUSED", 26, Color(1, 0.82, 0.42))
 	box.add_child(HSeparator.new())
 
-	_pause_resume_btn = _menu_button(box, "▶  Resume", _toggle_pause_menu)
+	_pause_resume_btn = _menu_button(box, "Resume", _toggle_pause_menu)
 	# HCMain._input is gated by the SceneTree pause (Node process_mode PAUSABLE, the
 	# default) so it can't hear ESC while paused — only this ALWAYS-mode subtree can.
 	# A Shortcut on the Resume button routes ESC through Control's own (pause-exempt)
@@ -2403,9 +2525,9 @@ func _build_pause_menu() -> void:
 	var esc_shortcut := Shortcut.new()
 	esc_shortcut.events = [_key(KEY_ESCAPE)]
 	_pause_resume_btn.shortcut = esc_shortcut
-	_menu_button(box, "⟲  Restart Run", _pause_restart)
-	_menu_button(box, "🏠  Main Menu", _go_to_main_menu)
-	_fullscreen_btn = _menu_button(box, "⛶  Fullscreen", _toggle_fullscreen)
+	_menu_button(box, "Restart Run", _pause_restart)
+	_menu_button(box, "Main Menu", _go_to_main_menu)
+	_fullscreen_btn = _menu_button(box, "Fullscreen", _toggle_fullscreen)
 
 	box.add_child(HSeparator.new())
 	var vol_row := HBoxContainer.new()
@@ -2464,7 +2586,7 @@ func _toggle_mute() -> void:
 		_vol_slider.set_value_no_signal(master_volume * 100.0)
 	_flash_volume_toast()
 
-## Small top-center "🔊 70%" readout that fades after any volume/mute change. Lives on its
+## Small top-center "VOLUME 70%" readout that fades after any volume/mute change. Lives on its
 ## own ALWAYS-mode layer + tween so it still animates while the tree is paused.
 func _build_volume_toast() -> void:
 	_vol_toast_layer = CanvasLayer.new()
@@ -2493,7 +2615,7 @@ func _flash_volume_toast() -> void:
 	if _vol_toast == null:
 		return
 	var pct: int = int(round(master_volume * 100.0))
-	_vol_toast.text = ("🔇  Muted" if master_volume <= 0.0 else "🔊  %d%%" % pct)
+	_vol_toast.text = ("MUTED" if master_volume <= 0.0 else "VOLUME  %d%%" % pct)
 	_vol_toast.modulate.a = 1.0
 	if _vol_toast_tween and _vol_toast_tween.is_valid():
 		_vol_toast_tween.kill()
@@ -2571,7 +2693,7 @@ func _toggle_fullscreen() -> void:
 func _refresh_fullscreen_btn() -> void:
 	if _fullscreen_btn:
 		var is_full := get_window().mode == Window.MODE_FULLSCREEN
-		_fullscreen_btn.text = "⛶  Windowed Mode" if is_full else "⛶  Fullscreen"
+		_fullscreen_btn.text = "Windowed Mode" if is_full else "Fullscreen"
 
 ## Save + reload the whole scene fresh, landing back on the (paused) title screen —
 ## the simplest correct way to "return to main menu" given how much live state a run
@@ -2647,9 +2769,9 @@ func _build_shop() -> void:
 	_shop_tabs.custom_minimum_size = Vector2(624, 430)
 	_shop_tabs.tab_alignment = TabBar.ALIGNMENT_CENTER
 	box.add_child(_shop_tabs)
-	var garage_list := _make_tab("🚗  Garage")
-	var upgrade_list := _make_tab("🔧  Upgrades")
-	var cosmetic_list := _make_tab("✨  Cosmetics")
+	var garage_list := _make_tab("Garage")
+	var upgrade_list := _make_tab("Upgrades")
+	var cosmetic_list := _make_tab("Cosmetics")
 
 	# --- GARAGE tab: unlock / select a ride ------------------------------------
 	var list := garage_list
@@ -2693,7 +2815,7 @@ func _build_shop() -> void:
 	_kit_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	krow.add_child(_kit_lbl)
 	var kbtn := Button.new()
-	kbtn.text = "next kit ▸"
+	kbtn.text = "next kit >"
 	kbtn.custom_minimum_size = Vector2(110, 40)
 	kbtn.pressed.connect(_cycle_body_kit)
 	krow.add_child(kbtn)
@@ -2778,7 +2900,7 @@ func _build_shop() -> void:
 		_cosm_rows[ck] = {"buy": cbuy, "swatches": sw_row, "swatch_btns": swatch_btns, "preview": pv_sb}
 
 	_restart_btn = Button.new()
-	_restart_btn.text = "RETRY  (Enter / ⓑ)  —  keeps your garage"
+	_restart_btn.text = "RETRY  (Enter / B)  —  keeps your garage"
 	_restart_btn.custom_minimum_size = Vector2(0, 46)
 	_restart_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_restart_btn.pressed.connect(_restart)
@@ -2787,7 +2909,7 @@ func _build_shop() -> void:
 	# Fresh start: wipe ALL progress (money, every vehicle's upgrades, unlocks) and
 	# return to the starter Hot Rod. Two-click confirm so it can't be a mis-tap.
 	_reset_btn = Button.new()
-	_reset_btn.text = "🔄 NEW GAME  —  wipe ALL upgrades & money"
+	_reset_btn.text = "NEW GAME  —  wipe ALL upgrades & money"
 	_reset_btn.custom_minimum_size = Vector2(0, 40)
 	_reset_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_reset_btn.add_theme_color_override("font_color", Color(1.0, 0.62, 0.55))
@@ -2796,7 +2918,7 @@ func _build_shop() -> void:
 
 	# TEST-ONLY: instant cash so you can buy anything while iterating
 	_money_btn = Button.new()
-	_money_btn.text = "🧪 +$1,000,000  (test money)"
+	_money_btn.text = "+$1,000,000  (test money)"
 	_money_btn.custom_minimum_size = Vector2(0, 34)
 	_money_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_money_btn.add_theme_color_override("font_color", Color(0.6, 1.0, 0.7))
@@ -2809,11 +2931,11 @@ func _build_shop() -> void:
 	hints.alignment = BoxContainer.ALIGNMENT_CENTER
 	hints.add_theme_constant_override("separation", 16)
 	box.add_child(hints)
-	_nav_hint(hints, "Q / E  ·  ⇦⇨", "Tabs")
-	_nav_hint(hints, "↑ / ↓", "Move")
-	_nav_hint(hints, "← / →", "Sell / Buy")
-	_nav_hint(hints, "⏎ · Ⓐ", "Select")
-	_nav_hint(hints, "Tab · ☰", "Close")
+	_nav_hint(hints, "Q / E  ·  LB / RB", "Tabs")
+	_nav_hint(hints, "Up / Down", "Move")
+	_nav_hint(hints, "Left / Right", "Sell / Buy")
+	_nav_hint(hints, "Enter · A", "Select")
+	_nav_hint(hints, "Tab · Start", "Close")
 
 	_wire_focus_chain()
 	# connect AFTER the rows exist (adding tabs above fires tab_changed early, when the
@@ -2989,16 +3111,15 @@ func _shop_label(parent: Node, text: String, size: int, col: Color) -> Label:
 ## its own StyleBoxFlat.
 func _panel_style(bg: Color, border: Color, border_w: int = 1, radius: int = 12) -> StyleBoxFlat:
 	var sb := StyleBoxFlat.new()
-	sb.bg_color = bg
-	sb.border_color = border
-	sb.set_border_width_all(border_w)
-	sb.set_corner_radius_all(radius)
+	# every overlay is the same black glass; callers still pass their old tint, but only
+	# its alpha is honoured so no screen drifts back to a blue-grey card
+	sb.bg_color = Color(UI_GLASS.r, UI_GLASS.g, UI_GLASS.b, clampf(bg.a, 0.6, 0.92))
+	sb.border_color = border if border_w > 1 else UI_HAIR
+	sb.set_border_width_all(1)
+	sb.set_corner_radius_all(mini(radius, 4))
 	sb.content_margin_left = 14; sb.content_margin_right = 14
 	sb.content_margin_top = 10; sb.content_margin_bottom = 10
 	sb.anti_aliasing = true
-	sb.shadow_color = Color(0, 0, 0, 0.4)   # droplet shadow — every panel/card shares this now
-	sb.shadow_size = 8
-	sb.shadow_offset = Vector2(0, 3)
 	return sb
 
 ## Apply the shared panel look to an existing PanelContainer.
@@ -3014,29 +3135,78 @@ func _style_panel(p: PanelContainer, bg: Color, border: Color, border_w: int = 1
 ## theme lookups per-state, so this is purely additive.
 func _build_ui_theme() -> Theme:
 	var th := Theme.new()
+	th.default_font = _font_ui
+	th.default_font_size = 18
 	var mk := func(bg: Color, brd: Color, bw: int) -> StyleBoxFlat:
 		var sb := StyleBoxFlat.new()
 		sb.bg_color = bg
 		sb.border_color = brd
 		sb.set_border_width_all(bw)
-		sb.set_corner_radius_all(9)
+		sb.set_corner_radius_all(3)
 		sb.content_margin_left = 14; sb.content_margin_right = 14
-		sb.content_margin_top = 8; sb.content_margin_bottom = 8
-		sb.shadow_color = Color(0, 0, 0, 0.35)
-		sb.shadow_size = 4
+		sb.content_margin_top = 7; sb.content_margin_bottom = 7
 		sb.anti_aliasing = true
 		return sb
-	th.set_stylebox("normal", "Button", mk.call(Color(0.16, 0.17, 0.22, 0.96), Color(0.34, 0.36, 0.44), 1))
-	th.set_stylebox("hover", "Button", mk.call(Color(0.21, 0.22, 0.29, 0.98), Color(1.0, 0.82, 0.42, 0.9), 2))
-	th.set_stylebox("pressed", "Button", mk.call(Color(0.11, 0.12, 0.16, 0.98), Color(0.85, 0.65, 0.3), 2))
-	th.set_stylebox("disabled", "Button", mk.call(Color(0.1, 0.1, 0.12, 0.55), Color(0.22, 0.22, 0.26), 1))
-	th.set_stylebox("focus", "Button", mk.call(Color(0.19, 0.2, 0.26, 0.97), Color(1.0, 0.82, 0.42), 2))
-	th.set_color("font_color", "Button", Color(0.92, 0.93, 0.96))
-	th.set_color("font_hover_color", "Button", Color(1, 0.95, 0.8))
-	th.set_color("font_pressed_color", "Button", Color(1, 0.88, 0.55))
-	th.set_color("font_disabled_color", "Button", Color(0.45, 0.46, 0.5))
-	th.set_color("font_focus_color", "Button", Color(1, 0.95, 0.8))
+	# black glass with a hairline; the accent arrives only on hover/focus, and a
+	# pressed (selected) button turns solid amber with dark text
+	th.set_stylebox("normal", "Button", mk.call(Color(0.05, 0.05, 0.06, 0.74), UI_HAIR, 1))
+	th.set_stylebox("hover", "Button", mk.call(Color(0.10, 0.10, 0.11, 0.86), Color(UI_AMBER.r, UI_AMBER.g, UI_AMBER.b, 0.85), 1))
+	th.set_stylebox("pressed", "Button", mk.call(UI_AMBER, UI_AMBER, 1))
+	th.set_stylebox("disabled", "Button", mk.call(Color(0.05, 0.05, 0.06, 0.4), Color(1, 1, 1, 0.06), 1))
+	th.set_stylebox("focus", "Button", mk.call(Color(0, 0, 0, 0), UI_AMBER, 2))
+	th.set_color("font_color", "Button", UI_TEXT)
+	th.set_color("font_hover_color", "Button", Color(1, 1, 1))
+	th.set_color("font_pressed_color", "Button", Color(0.06, 0.05, 0.04))
+	th.set_color("font_hover_pressed_color", "Button", Color(0.06, 0.05, 0.04))
+	th.set_color("font_disabled_color", "Button", Color(0.42, 0.42, 0.44))
+	th.set_color("font_focus_color", "Button", Color(1, 1, 1))
+	var sep := StyleBoxLine.new()
+	sep.color = UI_HAIR
+	sep.thickness = 1
+	th.set_stylebox("separator", "HSeparator", sep)
 	return th
+
+## Load the UI typeface from the raw .ttf files (no editor import, same policy as the
+## models). A missing file falls back to the engine font rather than failing.
+func _load_fonts() -> void:
+	_font_ui = _font_from("res://assets/fonts/BarlowCondensed-SemiBold.ttf", 0)
+	_font_bold = _font_from("res://assets/fonts/BarlowCondensed-Bold.ttf", 0)
+	_font_caps = _font_from("res://assets/fonts/BarlowCondensed-Medium.ttf", 2)
+
+func _font_from(path: String, glyph_spacing: int) -> Font:
+	var ff := FontFile.new()
+	if not FileAccess.file_exists(path) or ff.load_dynamic_font(path) != OK:
+		return ThemeDB.fallback_font
+	var fv := FontVariation.new()
+	fv.base_font = ff
+	fv.opentype_features = {TextServerManager.get_primary_interface().name_to_tag("tnum"): 1}
+	fv.spacing_glyph = glyph_spacing
+	return fv
+
+## A small letter-spaced ALL-CAPS label: section heads, units, legends.
+func _cap_label(parent: Node, text: String, size: int, col: Color) -> Label:
+	var l := _shop_label(parent, text, size, col)
+	l.add_theme_font_override("font", _font_caps)
+	return l
+
+## Full-screen colour ramp between two points (0..1 screen space) — the scrims that
+## keep title text readable over the live scene.
+func _gradient_rect(c0: Color, c1: Color, from: Vector2, to: Vector2) -> TextureRect:
+	var grad := Gradient.new()
+	grad.set_color(0, c0)
+	grad.set_color(1, c1)
+	var tex := GradientTexture2D.new()
+	tex.gradient = grad
+	tex.fill_from = from
+	tex.fill_to = to
+	tex.width = 256
+	tex.height = 256
+	var rect := TextureRect.new()
+	rect.texture = tex
+	rect.set_anchors_preset(Control.PRESET_FULL_RECT)
+	rect.stretch_mode = TextureRect.STRETCH_SCALE
+	rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return rect
 
 ## Recursively wire hover/press micro-interactions onto every Button under `root` —
 ## called once per screen right after it's built (screens are built once at _ready and
@@ -3099,60 +3269,6 @@ func _animate_panel_in(panel: Control, slam: bool) -> void:
 	tw.set_trans(Tween.TRANS_BACK if slam else Tween.TRANS_QUAD)
 	tw.tween_property(panel, "scale", Vector2.ONE, 0.22 if slam else 0.15)
 	tw.parallel().tween_property(panel, "modulate:a", 1.0, 0.12)
-
-## Slow logo bob/tilt flourish on the title screen — a small looping rotation tween
-## bound to the (ALWAYS-mode) title layer so it keeps animating while the tree is
-## paused, same pattern as the volume toast's fade tween.
-func _bob_logo(lbl: Label) -> void:
-	lbl.pivot_offset = lbl.size * 0.5
-	lbl.resized.connect(func(): lbl.pivot_offset = lbl.size * 0.5)
-	var tw := lbl.create_tween()
-	tw.set_loops()
-	tw.tween_property(lbl, "rotation_degrees", 1.4, 1.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-	tw.tween_property(lbl, "rotation_degrees", -1.4, 1.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-
-## Soft radial vignette behind the title panel — cheap atmosphere, procedural
-## (GradientTexture2D generated at runtime, no asset file).
-func _setup_title_vignette(parent: Node) -> void:
-	var grad := Gradient.new()
-	grad.set_color(0, Color(0, 0, 0, 0))
-	grad.set_color(1, Color(0, 0, 0, 0.5))
-	var tex := GradientTexture2D.new()
-	tex.gradient = grad
-	tex.fill = GradientTexture2D.FILL_RADIAL
-	tex.fill_from = Vector2(0.5, 0.5)
-	tex.fill_to = Vector2(1.0, 0.5)
-	tex.width = 256
-	tex.height = 256
-	var rect := TextureRect.new()
-	rect.texture = tex
-	rect.set_anchors_preset(Control.PRESET_FULL_RECT)
-	rect.stretch_mode = TextureRect.STRETCH_SCALE
-	rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	parent.add_child(rect)
-
-## Slow drifting motes behind the title panel — each is a tiny translucent dot,
-## ping-ponged between two points by its own looping tween (bound to `parent`, the
-## ALWAYS-mode title layer, so they keep drifting while the tree is paused). Cheap:
-## no per-frame processing at all, just Tween-driven position.
-func _setup_title_dots(parent: Node) -> void:
-	var rng := RandomNumberGenerator.new()
-	rng.seed = 7
-	for i in range(16):
-		var dot := ColorRect.new()
-		var r: float = rng.randf_range(2.0, 4.0)
-		dot.size = Vector2(r, r)
-		dot.color = Color(1, 1, 1, rng.randf_range(0.05, 0.16))
-		dot.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		var start_pos := Vector2(rng.randf_range(20.0, 1260.0), rng.randf_range(20.0, 700.0))
-		dot.position = start_pos
-		parent.add_child(dot)
-		var drift := Vector2(rng.randf_range(-40.0, 40.0), rng.randf_range(-70.0, -20.0))
-		var dur: float = rng.randf_range(9.0, 16.0)
-		var tw := dot.create_tween()
-		tw.set_loops()
-		tw.tween_property(dot, "position", start_pos + drift, dur).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-		tw.tween_property(dot, "position", start_pos, dur).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
 
 ## Subtle black outline on a HUD label — readability + one consistent look across the
 ## fuel/health readout, score, combo, trick text, sprint/trial timers. Never touches
@@ -3260,7 +3376,7 @@ func _swap_vehicle(vk: String) -> void:
 func _on_reset_pressed() -> void:
 	if not _reset_armed:
 		_reset_armed = true
-		_reset_btn.text = "⚠ CONFIRM — wipe EVERYTHING?"
+		_reset_btn.text = "CONFIRM — wipe EVERYTHING?"
 		return
 	_fresh_start()
 
@@ -3287,14 +3403,14 @@ func _fresh_start() -> void:
 	_swap_vehicle("minivan")                          # rebuild the car clean + re-apply zeros
 	                                                   # (this also re-saves the blank state)
 	if _reset_btn:
-		_reset_btn.text = "🔄 NEW GAME  —  wipe ALL upgrades & money"
+		_reset_btn.text = "NEW GAME  —  wipe ALL upgrades & money"
 	_refresh_shop()
 
 func _refresh_shop() -> void:
 	# any other shop action cancels a pending fresh-start confirmation
 	if _reset_armed and _reset_btn:
 		_reset_armed = false
-		_reset_btn.text = "🔄 NEW GAME  —  wipe ALL upgrades & money"
+		_reset_btn.text = "NEW GAME  —  wipe ALL upgrades & money"
 	var bank := "TOTAL MONEY:  $%d   (kept between tries)" % money
 	_shop_money.text = (_shop_summary + "\n" + bank) if _shop_summary != "" else bank
 	if _kit_lbl:
@@ -3467,6 +3583,7 @@ func _refresh_cosmetics() -> void:
 func _setup_hud() -> void:
 	var layer := CanvasLayer.new()
 	add_child(layer)
+	_hud_layer = layer
 	_fuel_bg = _bar_bg(layer, Vector2(28, 28), Color(0, 0, 0, 0.5))
 	_fuel_bar = _bar(layer, Vector2(30, 30), Color(0.95, 0.8, 0.2))
 	_health_bg = _bar_bg(layer, Vector2(28, 56), Color(0, 0, 0, 0.5))
@@ -3543,29 +3660,29 @@ func _setup_hud() -> void:
 	# mutually exclusive per run (see _reset_run_mode_state), so they never overlap.
 	_trial_lbl = Label.new()
 	_trial_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
-	_trial_lbl.position = Vector2(-120, 54)
+	_trial_lbl.position = Vector2(-120, 22)
 	_trial_lbl.custom_minimum_size = Vector2(240, 0)
 	_trial_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_trial_lbl.add_theme_font_size_override("font_size", 40)
+	_trial_lbl.add_theme_font_size_override("font_size", 56)
 	_trial_lbl.add_theme_color_override("font_color", Color(1, 1, 1))
 	_hud_outline(_trial_lbl, 6)
 	layer.add_child(_trial_lbl)
 	_trial_sub_lbl = Label.new()
 	_trial_sub_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
-	_trial_sub_lbl.position = Vector2(-200, 100)
+	_trial_sub_lbl.position = Vector2(-200, 88)
 	_trial_sub_lbl.custom_minimum_size = Vector2(400, 0)
 	_trial_sub_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_trial_sub_lbl.add_theme_font_size_override("font_size", 14)
+	_trial_sub_lbl.add_theme_font_size_override("font_size", 15)
 	_trial_sub_lbl.add_theme_color_override("font_color", Color(0.75, 0.8, 0.88))
 	_hud_outline(_trial_sub_lbl, 3)
 	layer.add_child(_trial_sub_lbl)
 	# split gap: the big green/red number a trial is actually played for
 	_split_lbl = Label.new()
 	_split_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
-	_split_lbl.position = Vector2(-200, 128)
+	_split_lbl.position = Vector2(-200, 116)
 	_split_lbl.custom_minimum_size = Vector2(400, 0)
 	_split_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_split_lbl.add_theme_font_size_override("font_size", 46)
+	_split_lbl.add_theme_font_size_override("font_size", 54)
 	_hud_outline(_split_lbl, 7)
 	layer.add_child(_split_lbl)
 	_split_rival_lbl = Label.new()
@@ -3592,7 +3709,34 @@ func _setup_hud() -> void:
 	hint.add_theme_font_size_override("font_size", 13)
 	hint.add_theme_color_override("font_color", Color(0.8, 0.8, 0.85))
 	_hint_lbl = hint
-	hint.text = "KB: Shift/W drive • S brake • A/D steer • Ctrl boost • Space dive • F balloons • R recover • air W/S pitch, Q/E roll • Tab garage • Enter retry\nPad: RT throttle • LT brake • L-stick steer/pitch • R-stick roll • RB boost • LB dive • Ⓧ balloons • Y recover • Start garage • Ⓑ retry"
+	# trial speed readout: the one number besides the clock, big, bottom right
+	_speed_lbl = Label.new()
+	_speed_lbl.set_anchors_preset(Control.PRESET_BOTTOM_RIGHT)
+	_speed_lbl.position = Vector2(-250, -126)
+	_speed_lbl.custom_minimum_size = Vector2(200, 0)
+	_speed_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	_speed_lbl.add_theme_font_size_override("font_size", 76)
+	_hud_outline(_speed_lbl, 5)
+	layer.add_child(_speed_lbl)
+	_speed_unit_lbl = Label.new()
+	_speed_unit_lbl.set_anchors_preset(Control.PRESET_BOTTOM_RIGHT)
+	_speed_unit_lbl.position = Vector2(-250, -44)
+	_speed_unit_lbl.custom_minimum_size = Vector2(200, 0)
+	_speed_unit_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	_speed_unit_lbl.text = "KM/H"
+	_speed_unit_lbl.add_theme_font_size_override("font_size", 16)
+	_speed_unit_lbl.add_theme_color_override("font_color", Color(0.85, 0.85, 0.83))
+	_hud_outline(_speed_unit_lbl, 3)
+	layer.add_child(_speed_unit_lbl)
+	# one typeface across the HUD; the clocks and big numerals take the bold cut
+	for c in layer.get_children():
+		if c is Label:
+			(c as Label).add_theme_font_override("font", _font_ui)
+	for l in [_trial_lbl, _split_lbl, _sprint_lbl, _speed_lbl, _big]:
+		l.add_theme_font_override("font", _font_bold)
+	for l in [_trial_sub_lbl, _speed_unit_lbl]:
+		l.add_theme_font_override("font", _font_caps)
+	hint.text = "KB: Shift/W drive • S brake • A/D steer • Ctrl boost • Space dive • F balloons • R recover • air W/S pitch, Q/E roll • Tab garage • Enter retry\nPad: RT throttle • LT brake • L-stick steer/pitch • R-stick roll • RB boost • LB dive • X balloons • Y recover • Start garage • B retry"
 	layer.add_child(hint)
 
 func _bar_bg(layer: CanvasLayer, pos: Vector2, col: Color) -> ColorRect:
@@ -3632,9 +3776,12 @@ func _update_hud() -> void:
 		n.visible = not trial
 	if _hint_lbl.visible == trial:
 		_hint_lbl.visible = not trial
-	var air: String = "  ✈ AIR" if _car.get("airborne") else ""
+	var air: String = "  AIR" if _car.get("airborne") else ""
+	_speed_lbl.visible = trial
+	_speed_unit_lbl.visible = trial
 	if trial:
-		_info.text = "%d km/h" % int(_car.call("get_speed_kmh"))
+		_info.text = ""
+		_speed_lbl.text = "%d" % int(_car.call("get_speed_kmh"))
 	else:
 		_info.text = "%d m    %d km/h%s" % [int(dist), int(_car.call("get_speed_kmh")), air]
 	_score_lbl.text = "SCORE %d" % int(_car.get("score"))
@@ -3676,9 +3823,9 @@ func _update_trial_hud() -> void:
 	var best_txt: String = ("best " + HCTimeTrialScript.format_time(best)) if best >= 0.0 else "no time set yet"
 	if _trial_running:
 		var remain: float = maxf(_trial_finish_s - float(_car.get("distance")), 0.0)
-		_trial_sub_lbl.text = "%d m to go   ·   %s" % [int(remain), best_txt]
+		_trial_sub_lbl.text = ("%d M TO GO      %s" % [int(remain), best_txt]).to_upper()
 	else:
-		_trial_sub_lbl.text = "%s   ·   Enter restarts" % best_txt
+		_trial_sub_lbl.text = ("%s      ENTER RESTARTS" % best_txt).to_upper()
 
 # --- trial: finish panel -----------------------------------------------------------
 
@@ -3706,15 +3853,16 @@ func _build_results_panel() -> void:
 	var box := VBoxContainer.new()
 	box.add_theme_constant_override("separation", 6)
 	pad.add_child(box)
-	var head := _shop_label(box, "FINISH", 14, Color(0.6, 0.64, 0.72))
+	var head := _cap_label(box, "FINISH", 15, UI_DIM)
 	head.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_results_time_lbl = _shop_label(box, "", 58, Color(1, 1, 1))
+	_results_time_lbl = _shop_label(box, "", 84, Color(1, 1, 1))
+	_results_time_lbl.add_theme_font_override("font", _font_bold)
 	_results_time_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_results_gap_lbl = _shop_label(box, "", 22, Color(1, 1, 1))
+	_results_gap_lbl = _shop_label(box, "", 26, Color(1, 1, 1))
 	_results_gap_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_results_medal_lbl = _shop_label(box, "", 15, Color(0.75, 0.8, 0.88))
+	_results_medal_lbl = _cap_label(box, "", 15, UI_TEXT)
 	_results_medal_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_results_rival_lbl = _shop_label(box, "", 15, Color(1.0, 0.55, 0.5))
+	_results_rival_lbl = _shop_label(box, "", 18, Color(1.0, 0.55, 0.5))
 	_results_rival_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	box.add_child(HSeparator.new())
 	_results_retry_btn = _menu_button(box, "RETRY   (Enter / Back)", _restart)
@@ -3742,8 +3890,8 @@ func _show_results(prev_best: float, is_best: bool) -> void:
 		if ladder.has(tier) and _trial_time > float(ladder[tier]):
 			next_up = "%s at %s" % [tier, HCTimeTrialScript.format_time(float(ladder[tier]))]
 			break
-	var medal_txt: String = (HCTimeTrialScript.medal_glyph(medal) + " MEDAL") if medal != "" else "no medal"
-	_results_medal_lbl.text = medal_txt if next_up == "" else "%s   ·   next: %s" % [medal_txt, next_up]
+	var medal_txt: String = (HCTimeTrialScript.medal_glyph(medal) + " MEDAL") if medal != "" else "NO MEDAL"
+	_results_medal_lbl.text = medal_txt if next_up == "" else ("%s      NEXT: %s" % [medal_txt, next_up]).to_upper()
 	var rd: Dictionary = _rival_data.get(_map, {})
 	_results_rival_lbl.visible = rd.has("data")
 	if rd.has("data"):
@@ -3776,14 +3924,16 @@ func _sync_trial_props() -> void:
 	var accent: Color = MAPS[_map].get("accent", Color(0.9, 0.5, 0.2))
 	_build_gate(_trial_start_s, "start", accent)
 	_build_gate(_trial_finish_s, "finish", accent)
+	var sector := 1
 	for off in HCTimeTrialScript.split_offsets(_map):
-		_build_gate(_trial_start_s + off, "split", accent)
+		_build_gate(_trial_start_s + off, "split", accent, str(sector))
+		sector += 1
 
 ## One arch across the road at arc-length s, tilted to the road's own grade. "start" and
 ## "finish" get heavy posts, a chequered banner and a chequered strip on the tarmac;
 ## "split" is a slim glowing hoop you only need to notice, not read. Visual only — no
 ## collision, so nothing here can ever touch the car or the camera ray.
-func _build_gate(s: float, kind: String, accent: Color) -> void:
+func _build_gate(s: float, kind: String, accent: Color, tag := "") -> void:
 	var fr: Dictionary = _terrain.call("frame_at_s", s)
 	var pos: Vector3 = fr.pos
 	var right: Vector3 = (fr.right as Vector3).normalized()
@@ -3796,6 +3946,9 @@ func _build_gate(s: float, kind: String, accent: Color) -> void:
 	_trial_props.add_child(gate)
 	gate.global_transform = Transform3D(Basis(right, up, -fwd).orthonormalized(), pos)
 	var half: float = float(fr.half) + 2.0   # posts stand just outside the drivable edge
+	if _map_look() != "":
+		_build_gate_real(gate, kind, half, float(fr.half), tag)
+		return
 	var heavy := kind != "split"
 	var post_w: float = 0.9 if heavy else 0.35
 	var height: float = 10.0 if heavy else 7.5
@@ -3843,6 +3996,183 @@ func _build_gate(s: float, kind: String, accent: Color) -> void:
 	strip.position = Vector3(0, 0.07, 0)   # just proud of the tarmac so it never z-fights
 	gate.add_child(strip)
 
+## Realistic-map gate dressing, built into `gate` (local frame: x = across the road,
+## y = up, -z = direction of travel). Start/finish are a steel truss gantry carrying a
+## sign board, with the line painted on the tarmac; a split is a pair of sector boards
+## at the barriers and a thin painted line. Lit materials throughout — nothing glows.
+func _build_gate_real(gate: Node3D, kind: String, half: float, road_half: float, tag: String) -> void:
+	var steel := StandardMaterial3D.new()
+	steel.albedo_color = Color(0.17, 0.18, 0.20)
+	steel.metallic = 0.6
+	steel.roughness = 0.5
+	var paint := StandardMaterial3D.new()
+	paint.albedo_color = Color(0.82, 0.82, 0.79)
+	paint.roughness = 0.75
+	if kind == "split":
+		for side in [-1.0, 1.0]:
+			var x: float = side * (road_half - 0.6)
+			var st := SurfaceTool.new()
+			st.begin(Mesh.PRIMITIVE_TRIANGLES)
+			_st_beam(st, Vector3(x, -0.4, 0), Vector3(x, 3.1, 0), 0.10)
+			st.generate_normals()
+			var post := MeshInstance3D.new()
+			post.mesh = st.commit()
+			post.material_override = steel
+			gate.add_child(post)
+			var board := MeshInstance3D.new()
+			var bm := BoxMesh.new()
+			bm.size = Vector3(1.5, 1.1, 0.06)
+			board.mesh = bm
+			board.material_override = paint
+			board.position = Vector3(x - side * 0.85, 2.55, 0.0)
+			gate.add_child(board)
+			var num := Label3D.new()
+			num.text = tag
+			num.font_size = 160
+			num.pixel_size = 0.0058
+			num.modulate = Color(0.06, 0.06, 0.07)
+			num.outline_size = 0
+			num.shaded = true
+			num.alpha_cut = Label3D.ALPHA_CUT_DISCARD
+			num.position = board.position + Vector3(0, 0, 0.04)   # +z faces oncoming cars
+			gate.add_child(num)
+		_road_paint(gate, road_half * 2.0 - 5.6, 0.35, 1, paint.albedo_color, true)
+		return
+	# gantry: two lattice towers and a box truss across, in one mesh
+	var height := 8.5
+	var st2 := SurfaceTool.new()
+	st2.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var tw := 0.55   # tower half-width
+	for side in [-1.0, 1.0]:
+		var cx: float = side * (half + 0.6)
+		for lx in [-tw, tw]:
+			for lz in [-tw, tw]:
+				_st_beam(st2, Vector3(cx + lx, -0.5, lz), Vector3(cx + lx, height, lz), 0.11)
+		var y := 0.2
+		var flip := false
+		while y < height - 1.0:
+			for face in [-tw, tw]:
+				var a := -tw if flip else tw
+				_st_beam(st2, Vector3(cx + a, y, face), Vector3(cx - a, y + 1.3, face), 0.06)
+				_st_beam(st2, Vector3(cx + face, y, a), Vector3(cx + face, y + 1.3, -a), 0.06)
+			y += 1.3
+			flip = not flip
+	var span: float = half + 0.6
+	var top := height
+	var bot := height - 1.1
+	for fz in [-tw, tw]:
+		_st_beam(st2, Vector3(-span, top, fz), Vector3(span, top, fz), 0.11)
+		_st_beam(st2, Vector3(-span, bot, fz), Vector3(span, bot, fz), 0.11)
+		var x := -span
+		var up := true
+		while x < span - 0.1:
+			var x2: float = minf(x + 1.5, span)
+			_st_beam(st2, Vector3(x, bot if up else top, fz), Vector3(x2, top if up else bot, fz), 0.06)
+			x = x2
+			up = not up
+	st2.generate_normals()
+	var truss := MeshInstance3D.new()
+	truss.mesh = st2.commit()
+	truss.material_override = steel
+	gate.add_child(truss)
+	# sign board hung under the truss: chequer either side of the word
+	var board_h := 1.7
+	var board_y: float = bot - 0.25 - board_h * 0.5
+	var word_w := 9.0
+	var back := MeshInstance3D.new()
+	var bb := BoxMesh.new()
+	bb.size = Vector3(span * 2.0 - 1.4, board_h, 0.08)
+	back.mesh = bb
+	var dark := StandardMaterial3D.new()
+	dark.albedo_color = Color(0.05, 0.05, 0.06)
+	dark.roughness = 0.6
+	back.material_override = dark
+	back.position = Vector3(0, board_y, 0)
+	gate.add_child(back)
+	var wing_w: float = (span * 2.0 - 1.4 - word_w) * 0.5
+	for side in [-1.0, 1.0]:
+		for face in [-1.0, 1.0]:
+			var chk := MeshInstance3D.new()
+			var qm := QuadMesh.new()
+			qm.size = Vector2(wing_w, board_h)
+			chk.mesh = qm
+			chk.material_override = _checker_paint(maxi(int(round(wing_w / (board_h * 0.5))), 2), 2)
+			chk.position = Vector3(side * (word_w * 0.5 + wing_w * 0.5), board_y, face * 0.045)
+			if face < 0.0:
+				chk.rotation.y = PI
+			gate.add_child(chk)
+	for face in [-1.0, 1.0]:
+		var word := Label3D.new()
+		word.text = "START" if kind == "start" else "FINISH"
+		word.font_size = 200
+		word.pixel_size = 0.0062
+		word.modulate = Color(0.9, 0.9, 0.87)
+		word.outline_size = 0
+		word.shaded = true
+		word.alpha_cut = Label3D.ALPHA_CUT_DISCARD
+		word.position = Vector3(0, board_y, face * 0.05)
+		if face < 0.0:
+			word.rotation.y = PI
+		gate.add_child(word)
+	if kind == "start":
+		_road_paint(gate, road_half * 2.0 - 5.6, 0.6, 1, paint.albedo_color, false)
+	else:
+		_road_paint(gate, road_half * 2.0 - 5.6, 2.0, 2, paint.albedo_color, false)
+
+## A square-section strut from a to b appended to `st` (gate trusses are a few dozen of
+## these in one mesh rather than a node each).
+func _st_beam(st: SurfaceTool, a: Vector3, b: Vector3, half: float) -> void:
+	var axis := (b - a).normalized()
+	var ref := Vector3.UP if absf(axis.y) < 0.9 else Vector3.RIGHT
+	var u := axis.cross(ref).normalized() * half
+	var v := axis.cross(u).normalized() * half
+	var c: Array[Vector3] = [-u - v, u - v, u + v, -u + v]
+	for i in range(4):
+		var j := (i + 1) % 4
+		st.add_vertex(a + c[i]); st.add_vertex(b + c[i]); st.add_vertex(a + c[j])
+		st.add_vertex(a + c[j]); st.add_vertex(b + c[i]); st.add_vertex(b + c[j])
+		# both windings, so a strut is solid from every side without caring about order
+		st.add_vertex(a + c[i]); st.add_vertex(a + c[j]); st.add_vertex(b + c[i])
+		st.add_vertex(a + c[j]); st.add_vertex(b + c[j]); st.add_vertex(b + c[i])
+
+## A band of road paint across the track at the gate: `rows` > 1 makes it a chequer
+## (the finish), `dashed` breaks a plain line into blocks (a split).
+func _road_paint(gate: Node3D, width: float, length: float, rows: int, col: Color, dashed: bool) -> void:
+	var strip := MeshInstance3D.new()
+	var qm := QuadMesh.new()
+	qm.size = Vector2(width, length)
+	strip.mesh = qm
+	var cols: int = maxi(int(round(width / (length / float(rows)))), 2) if rows > 1 else (maxi(int(round(width / 3.0)), 2) if dashed else 1)
+	var img := Image.create(cols, rows, false, Image.FORMAT_RGBA8)
+	for y in range(rows):
+		for x in range(cols):
+			var on: bool = ((x + y) % 2 == 0) if (rows > 1 or dashed) else true
+			# worn road paint is never pure white, and the "black" squares are bare tarmac
+			img.set_pixel(x, y, Color(col.r, col.g, col.b, 0.9) if on else Color(0, 0, 0, 0.55 if rows > 1 else 0.0))
+	var mat := StandardMaterial3D.new()
+	mat.albedo_texture = ImageTexture.create_from_image(img)
+	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.roughness = 0.75
+	strip.material_override = mat
+	strip.rotation.x = -PI * 0.5
+	strip.position = Vector3(0, 0.05, 0)
+	strip.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	gate.add_child(strip)
+
+## Lit two-tone chequer for sign boards (the arcade _checker_material is unshaded and
+## would glow against a photographed scene).
+func _checker_paint(cols: int, rows: int) -> StandardMaterial3D:
+	var img := Image.create(cols, rows, false, Image.FORMAT_RGB8)
+	for y in range(rows):
+		for x in range(cols):
+			img.set_pixel(x, y, Color(0.86, 0.86, 0.83) if (x + y) % 2 == 0 else Color(0.05, 0.05, 0.06))
+	var mat := StandardMaterial3D.new()
+	mat.albedo_texture = ImageTexture.create_from_image(img)
+	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+	mat.roughness = 0.6
+	return mat
+
 ## Two-tone chequer as a tiny nearest-filtered texture (cols × rows texels): `light`
 ## against near-black. Unshaded so the pattern stays readable at dusk and at night.
 func _checker_material(cols: int, rows: int, light: Color) -> StandardMaterial3D:
@@ -3872,8 +4202,8 @@ func _update_gap_telegraph() -> void:
 	var v_req: float = 6.0 + float(g.void_w) * 0.9        # m/s needed to clear it
 	var spd: float = _car.linear_velocity.length()
 	if spd >= v_req:
-		_big.text = "SEND IT!  ▶▶"
+		_big.text = "SEND IT!"
 		_big.add_theme_color_override("font_color", Color(0.5, 1.0, 0.55))
 	else:
-		_big.text = "⚠ GO FASTER   %d / %d km/h" % [int(spd * 3.6), int(v_req * 3.6)]
+		_big.text = "GO FASTER   %d / %d km/h" % [int(spd * 3.6), int(v_req * 3.6)]
 		_big.add_theme_color_override("font_color", Color(1.0, 0.45, 0.4))

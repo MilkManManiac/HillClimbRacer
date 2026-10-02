@@ -226,6 +226,17 @@ var _shed_clone_script: GDScript              # lazily-built self-contained tumb
 @export var body_glb: String = ""
 const HCCarBody := preload("res://scripts/hc/HCCarBody.gd")
 var _glb_top: float = 0.0   # imported shell's roof height (car-local); 0 = procedural body
+# Realistic sports-car shell (HCCarBody.concept_instance): the model's own wheels are
+# lifted out into steer/spin rigs that follow the physics wheels, replacing the black
+# cylinders. Empty arrays = some other body.
+var _concept: Node3D                       # scaled, flipped wrapper holding the shell
+var _wheel_rigs: Array[Node3D] = []        # per wheel: positioned + steered
+var _wheel_spins: Array[Node3D] = []       # per wheel: child of the rig, rotates on the axle
+var _wheel_vis_radius := 0.0               # the model tyre's radius at game scale
+var _wheel_vis_scale := 1.0
+var _wheel_spin := 0.0
+var _tail_mat: BaseMaterial3D
+const CONCEPT_SAG := 0.07                  # ride height: how far the springs settle at rest
 # INVARIANT: the box bottom (col_y - col.y/2) MUST sit BELOW the wheel-ray origin
 # (local y=0.5). If the box catches the car deeper than that, the ray origins drop
 # under the ground when the car bottoms out, the rays stop seeing ground, the
@@ -285,6 +296,8 @@ func _ready() -> void:
 	_build_rockets()
 	_build_balloons()
 	_build_smoke()
+	if _concept != null:
+		_soften_smoke()
 	_build_wind()
 	_build_skids()
 	_build_underglow()
@@ -614,6 +627,7 @@ func _physics_process(delta: float) -> void:
 
 	_animate_surfaces(delta)
 	_update_balloons(delta)
+	_animate_concept(delta, fwd_speed, braking)
 
 	# --- damage panel-shedding: pop small body panels at HP thresholds --------
 	# telegraphs health without reading the HUD; funny on a stacked-panel car. Must
@@ -637,11 +651,13 @@ func _physics_process(delta: float) -> void:
 			tpm.initial_velocity_min = 0.8 + speed_k * 1.4
 			tpm.initial_velocity_max = 2.4 + speed_k * 3.0
 	var puffing: bool = (drive > 0.05 and fuel > 0.0) or boosting
+	# the realistic body keeps tyre smoke only: no cartoon exhaust puffs or wind streaks
+	var clean: bool = _concept != null
 	for es in _exhaust_smoke:
-		es.emitting = puffing
+		es.emitting = puffing and not clean
 	# thin speed-line streaks once you're really moving (subsides at low speed / airborne)
 	if _wind_streaks:
-		_wind_streaks.emitting = speed > max_speed * 0.6
+		_wind_streaks.emitting = speed > max_speed * 0.6 and not clean
 	# damage smoke once the frame's beat up
 	if _damage_smoke:
 		_damage_smoke.emitting = health < max_health * 0.5
@@ -1198,6 +1214,13 @@ func _update_wheel_visual(i: int, dist: float) -> void:
 	else:
 		wy = base.y - reach + wheel_radius    # full droop in the air (springs stretch out)
 	wm.position = Vector3(base.x, wy, base.z)
+	if i < _wheel_rigs.size():
+		# the realistic wheel is smaller than the physics one: seat ITS tread on the
+		# contact point, and let it hang a believable 25 cm in the air (not the full
+		# ray reach, which would drop it out of the arch)
+		var hang: float = suspension_rest + 0.25
+		var dv: float = clampf(dist, 0.0, hang) if dist >= 0.0 else hang
+		_wheel_rigs[i].position = Vector3(base.x, base.y - dv + _wheel_vis_radius, base.z)
 	# coil spring: spans a fixed chassis mount down to the wheel hub, so it visibly
 	# COMPRESSES on landings and STRETCHES when the wheel droops in the air.
 	if i < _springs.size():
@@ -1549,6 +1572,7 @@ func apply_wheel_size() -> void:
 		var base: Vector3 = _wheel_positions[i]
 		# bottom of wheel sits at the rest ground level (local y = 0.5 - suspension_rest)
 		wm.position = Vector3(base.x, 0.5 - suspension_rest + wheel_radius, base.z)
+	_place_concept()
 
 ## A small box helper for the procedural body panels.
 func _panel(parent: Node3D, size: Vector3, pos: Vector3, col: Color, rough := 0.5, metal := 0.0) -> MeshInstance3D:
@@ -1619,6 +1643,105 @@ func _fit_wheels_to_body(winfo: Array[Dictionary], bottom: float) -> void:
 	wheel_radius = clampf(r_avg / 4.0, 0.3, 0.75)
 	apply_wheel_size()
 
+## The realistic sports car. The shell is scaled so its wheelbase matches this
+## vehicle's physics stance (VSPEC fx/fz are NOT touched — every car in a trial must
+## drive identically), turned to face -Z, and set at ride height. Its four wheels are
+## re-hung on rigs driven by the physics wheels. Returns false if the model is missing.
+func _build_concept_body() -> bool:
+	var model: Node3D = HCCarBody.concept_instance()
+	if model == null:
+		return false
+	var wheels: Array[Node3D] = []
+	var centres: Array[Vector3] = []
+	for nm in HCCarBody.CONCEPT_WHEELS:
+		var w := model.find_child(nm, true, false) as Node3D
+		if w == null:
+			model.free()
+			return false
+		wheels.append(w)
+		centres.append(HCCarBody._xform_to_root(w, model).origin)
+	# model space: front axle towards +Z, ground at y = 0
+	var m_wheelbase: float = absf(centres[0].z - centres[2].z)
+	if m_wheelbase < 0.5:
+		model.free()
+		return false
+	var k: float = (2.0 * float(_vs.fz)) / m_wheelbase
+	_wheel_vis_scale = k
+	_wheel_vis_radius = centres[0].y * k   # axle height above the model's ground plane
+	model.position = Vector3(0.0, 0.0, -(centres[0].z + centres[2].z) * 0.5)   # mid-axle on the origin
+	_concept = Node3D.new()
+	_concept.name = "ConceptBody"
+	_concept.add_child(model)
+	_concept.scale = Vector3(k, k, k)
+	_concept.rotation.y = PI
+	_body.add_child(_concept)
+	_glb_top = 1.25 * k
+	for i in range(4):
+		var rig := Node3D.new()
+		add_child(rig)
+		var spin := Node3D.new()
+		rig.add_child(spin)
+		var w := wheels[i]
+		for ch in w.get_children():
+			w.remove_child(ch)
+			# the caliper stays put; rim, tyre and disc turn. The wheel node's own baked
+			# pose (the model ships with the fronts steered and each wheel part-rotated)
+			# is dropped by leaving it behind.
+			if String(ch.name).contains("BrakePad"):
+				rig.add_child(ch)
+			else:
+				spin.add_child(ch)
+		_wheel_rigs.append(rig)
+		_wheel_spins.append(spin)
+	for wm in _wheel_meshes:
+		wm.visible = false
+	for sp in _springs:
+		sp.visible = false
+	_tail_mat = HCCarBody.concept_tail_material(_concept)
+	_add_headlights(_body, 0.72, 0.62, -2.35)
+	_place_concept()
+	return true
+
+## Tyre smoke as a thin haze rather than the arcade bodies' chunky puffs.
+func _soften_smoke() -> void:
+	for ts in _tire_smoke:
+		var tpm := ts.process_material as ParticleProcessMaterial
+		if tpm:
+			tpm.scale_min = 1.3
+			tpm.scale_max = 2.8
+			var grad := Gradient.new()
+			grad.set_color(0, Color(0.82, 0.80, 0.77, 0.075))
+			grad.set_color(1, Color(0.82, 0.80, 0.77, 0.0))
+			var gt := GradientTexture1D.new()
+			gt.gradient = grad
+			tpm.color_ramp = gt
+		ts.amount = 150   # many faint puffs merge into one plume; few strong ones read as dots
+		ts.lifetime = 1.7
+
+## Ride height follows the suspension tune (set after _ready by HCMain), so this is
+## re-run from apply_wheel_size.
+func _place_concept() -> void:
+	if _concept == null:
+		return
+	_concept.position = Vector3(0.0, 0.5 - suspension_rest + CONCEPT_SAG, 0.0)
+	for i in range(_wheel_rigs.size()):
+		var base: Vector3 = _wheel_positions[i]
+		_wheel_rigs[i].position = Vector3(base.x, _concept.position.y + _wheel_vis_radius, base.z)
+		_wheel_rigs[i].basis = Basis(Vector3.UP, PI).scaled(Vector3.ONE * _wheel_vis_scale)
+
+## Spin and steer the realistic body's wheels, and light the tail under braking.
+func _animate_concept(delta: float, fwd_speed: float, braking: float) -> void:
+	if _wheel_rigs.is_empty():
+		return
+	_wheel_spin = fmod(_wheel_spin + fwd_speed / maxf(_wheel_vis_radius, 0.1) * delta, TAU)
+	for i in range(_wheel_rigs.size()):
+		var yaw: float = PI + (_steer * 0.38 if i < 2 else 0.0)
+		_wheel_rigs[i].basis = Basis(Vector3.UP, yaw).scaled(Vector3.ONE * _wheel_vis_scale)
+		_wheel_spins[i].rotation.x = _wheel_spin
+	if _tail_mat:
+		var want: float = HCCarBody.CONCEPT_TAIL_BRAKE if braking > 0.1 else HCCarBody.CONCEPT_TAIL_IDLE
+		_tail_mat.emission_energy_multiplier = lerpf(_tail_mat.emission_energy_multiplier, want, 1.0 - exp(-18.0 * delta))
+
 ## Open-top CONVERTIBLE hot-rod built from panels so the driver is visible and the
 ## whole body scales cleanly for the Stretch/Wide upgrades. Faces -Z.
 ## Composed from many stepped boxes/prisms + chrome trim, lights, fenders, bumpers,
@@ -1628,6 +1751,8 @@ func _build_body() -> void:
 	add_child(_body)
 	if body_glb != "" and _build_glb_body():
 		return   # imported shell in place; procedural panels skipped
+	if vehicle_type == "sports" and DisplayServer.get_name() != "headless" and _build_concept_body():
+		return   # realistic shell (headless test runs keep the cheap panel body)
 	match vehicle_type:
 		"monster":
 			_build_monster_body(); return

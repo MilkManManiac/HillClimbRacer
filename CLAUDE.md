@@ -49,6 +49,9 @@ Baseline SmoothProbe numbers (HC v7.5): `vert_accel rms=2.78` (worst ~26), `pitc
 rms=0.17` — both dominated by the one-time spawn drop; healthy mid-run windows print
 0.00. Excluded from the metric: gap/ramp zones AND a short settle window after real-jump
 touchdowns (launches and their landings are intentional impacts, not road roughness).
+HC v10 (2026-10-02): the probe now counts ticks from game start (not boot) and seeds its
+first sample; with that fix v9 measures 2.36 / 0.12 and v10 2.97 / 0.00. The residual
+is still the spawn-drop bounce overlapping the window, and it shifts with its phase.
 Gates: vert rms ≤ 3.0, pitch_jerk rms ≤ 0.6 — if either rises, the driving got rougher;
 find out why before proceeding.
 

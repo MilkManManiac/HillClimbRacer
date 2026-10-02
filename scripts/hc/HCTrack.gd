@@ -13,6 +13,8 @@ signal pickup_collected(kind: String, value: float)
 
 const HCPickup := preload("res://scripts/hc/HCPickup.gd")
 const GlbUtil := preload("res://scripts/GlbUtil.gd")
+const HCLook := preload("res://scripts/hc/HCLook.gd")
+const HCLandScript := preload("res://scripts/hc/HCLand.gd")
 
 const STEP := 4.0            # path sample spacing (m)
 const N_MAX := 7000          # samples -> 28 km of road
@@ -42,6 +44,11 @@ const CELL := 24.0           # spatial-hash cell size for projection + overlap t
 @export var edge_line_color := Color(0.92, 0.92, 0.88)     # solid verge-edge stripe
 @export var rail_post_color := Color(0.5, 0.5, 0.55)       # guardrail posts + strip base
 @export var rail_band_color := Color(0.9, 0.3, 0.25)       # emissive top band / cap rail
+## Realistic look key (HCLook.LOOKS); "" keeps the flat-colour arcade ground. When set,
+## the ribbon is photo-textured by shaders/hc_ground.gdshader (markings painted in the
+## shader, not as overlay strips), the barrier is plain steel, and HCLand builds real
+## terrain around the road. Visual only: paths, heights and prop positions are identical.
+@export var look := ""
 @export_range(0.0, 1.0) var scatter_density := 0.6         # 0..1 chance of a prop per verge slot
 @export var scatter_kinds: Array[String] = [
 	"res://assets/trees/pine_quaternius_cc0.glb",
@@ -182,6 +189,8 @@ var _tile_props := {}             # tile index -> PackedFloat32Array [x,y,z,r ×
 var _tile_prop_bounds := {}       # tile index -> Vector3 (cx, cz, bound radius) cheap query reject
 var _props_scratch := PackedFloat32Array()   # reused by props_near — callers must not hold it
 var _road_mat: StandardMaterial3D
+var _ground_mat: ShaderMaterial   # realistic look only (see `look`)
+var _land: Node3D                 # HCLand, realistic look + a real renderer only
 var _rail_mat: StandardMaterial3D
 var _rail_cap_mat: StandardMaterial3D
 var _post_mat: StandardMaterial3D
@@ -214,6 +223,11 @@ func _ready() -> void:
 	_parse_stunts()
 	_build_path()   # gaps are now scheduled INSIDE _build_path (see _try_gap)
 	_reconcile_overlaps()
+	if look != "" and not HCLook.headless():
+		_land = Node3D.new()
+		_land.set_script(HCLandScript)
+		_land.call("setup", self, look)
+		add_child(_land)
 
 # --- deterministic 2-D path generation with hard no-overlap -------------------
 func _build_path() -> void:
@@ -1088,6 +1102,8 @@ func set_target(t: Node3D) -> void:
 	_target = t
 	_proj_i = 0
 	_update_tiles()
+	if _land:
+		_land.call("set_target", t)
 
 func has_gaps() -> bool:
 	return true
@@ -1116,6 +1132,28 @@ func frame_at_s(s: float) -> Dictionary:
 		"right": Vector3(cos(_ph[i]), 0.0, sin(_ph[i])),
 		"half": lerpf(road_half, road_half_turn, _pw[i]),
 	}
+
+## Read-only bundle for HCLand: the centre-line samples, the ground height at the
+## ribbon's outer edge beside each one, the spatial hash, and the ribbon half-width
+## where the land mesh takes over. Packed arrays are shared copy-on-write, not copied.
+func land_data() -> Dictionary:
+	var eh := PackedFloat32Array()
+	eh.resize(_n)
+	for i in range(_n):
+		var s := float(i) * STEP
+		eh[i] = _base_hill(s, 1.0e6, road_half) + (_ovl_off(s) if not _ovl.is_empty() else 0.0)
+	return {"px": _px, "pz": _pz, "eh": eh, "grid": _grid, "cell": CELL,
+			"half": road_half_turn + mesh_verge, "seed": noise_seed}
+
+## The ribbon's own analytic surface at (x,z), projected from sample i. Pure (never
+## touches the stateful projection hint), so HCLand may call it from worker threads.
+func land_ribbon_h(i: int, x: float, z: float) -> float:
+	var p := _project_at(i, x, z)
+	return _carved_height(p.s, p.lat, lerpf(road_half, road_half_turn, p.w))
+
+## Is the HCLand terrain around the car fully streamed in? (true when there is none)
+func land_settled() -> bool:
+	return _land == null or bool(_land.call("is_settled"))
 
 ## Distance-along-road (arc-length) at a world position — drives distance/money.
 func progress(pos: Vector3) -> float:
@@ -1727,9 +1765,28 @@ func _mats() -> void:
 		_reflector_mat.emission = rail_band_color
 		# subtle catch-the-light dot by day, a real glow once night auto-detects
 		_reflector_mat.emission_energy_multiplier = 1.8 if _night else 0.2
+	if look != "" and _ground_mat == null:
+		_ground_mat = HCLook.ground_material(look, true)
+		# a real barrier is galvanised steel: grey, metallic, nothing glows
+		_rail_mat.metallic = 0.45
+		_rail_mat.roughness = 0.58
+		_rail_mat.metallic_specular = 0.4
+		_rail_cap_mat.albedo_color = Color(0.42, 0.43, 0.45)
+		_rail_cap_mat.metallic = 0.45
+		_rail_cap_mat.roughness = 0.55
+		_rail_cap_mat.emission_enabled = false
+		_post_mat.albedo_color = Color(0.40, 0.41, 0.43)
+		_post_mat.metallic = 0.8
+		_post_mat.roughness = 0.5
+		_reflector_mat.albedo_color = Color(0.85, 0.55, 0.12)
+		_reflector_mat.emission = Color(0.85, 0.55, 0.12)
 
 # lateral cross-section offsets (fractions of the meshed half-width) for the ribbon.
 const LAT_FR := [-1.0, -0.8, -0.62, -0.5, -0.32, -0.12, 0.0, 0.12, 0.32, 0.5, 0.62, 0.8, 1.0]
+# realistic look: one extra column each side, bent down, so the ribbon's edge dives
+# under the HCLand terrain instead of ending in a visible lip
+const LAT_FR_SKIRT := [-1.07, -1.0, -0.8, -0.62, -0.5, -0.32, -0.12, 0.0, 0.12, 0.32, 0.5, 0.62, 0.8, 1.0, 1.07]
+const SKIRT_DROP := 1.6
 
 func _build_tile(t: int) -> void:
 	_mats()
@@ -1746,6 +1803,8 @@ func _build_tile(t: int) -> void:
 	var have_und := false
 	var rows: Array = []       # per sample: Array of Vector3 cross-section points
 	var half_mesh := road_half_turn + mesh_verge
+	var realistic := look != ""
+	var frs: Array = LAT_FR_SKIRT if realistic else LAT_FR
 	for i in range(i0, i1 + 1):
 		var cx := _px[i]; var cz := _pz[i]
 		var rx := cos(_ph[i]); var rz := sin(_ph[i])
@@ -1758,23 +1817,30 @@ func _build_tile(t: int) -> void:
 		var hm := lerpf(half_mesh, rh + 3.0, dk)
 		var pts: Array = []
 		var cols: Array = []
-		for fr in LAT_FR:
+		var lats: Array = []
+		for fr in frs:
 			var lat: float = float(fr) * hm
 			var wx := cx + rx * lat
 			var wz := cz + rz * lat
 			var wy := _height_lat(d, lat, rh)
+			if absf(float(fr)) > 1.0:
+				wy -= SKIRT_DROP * (1.0 - dk)   # no curtain hanging off a bridge deck
 			pts.append(Vector3(wx, wy, wz))
-			cols.append(_surface_color(d, lat, rh))
-		rows.append({"p": pts, "c": cols, "rh": rh, "cx": cx, "cz": cz, "rx": rx, "rz": rz, "d": d, "void": _in_void_s(d), "dk": dk, "hm": hm, "i": i})
+			lats.append(lat)
+			cols.append(_paint_color(d, lat, rh) if realistic else _surface_color(d, lat, rh))
+		rows.append({"p": pts, "c": cols, "l": lats, "w": _pw[i], "rh": rh, "cx": cx, "cz": cz, "rx": rx, "rz": rz, "d": d, "void": _in_void_s(d), "dk": dk, "hm": hm, "i": i})
 	# stitch rows into the ribbon + collision band
 	for r in range(rows.size() - 1):
 		var a: Dictionary = rows[r]
 		var b: Dictionary = rows[r + 1]
 		var over_void: bool = a.void or b.void   # no floor over a jump — the car falls in
-		for k in range(LAT_FR.size() - 1):
-			_quad(st, a.p[k], a.p[k + 1], b.p[k], b.p[k + 1], a.c[k], a.c[k + 1], b.c[k], b.c[k + 1])
+		for k in range(frs.size() - 1):
+			if realistic:
+				_ribbon_quad(st, a, b, k)
+			else:
+				_quad(st, a.p[k], a.p[k + 1], b.p[k], b.p[k + 1], a.c[k], a.c[k + 1], b.c[k], b.c[k + 1])
 			# collision across the drivable band (a bit past the rails so a slide still lands)
-			var midlat: float = (float(LAT_FR[k]) + float(LAT_FR[k + 1])) * 0.5 * minf(float(a.hm), float(b.hm))
+			var midlat: float = (float(frs[k]) + float(frs[k + 1])) * 0.5 * minf(float(a.hm), float(b.hm))
 			if not over_void and absf(midlat) <= road_half_turn + 2.0:
 				_quad(col, a.p[k], a.p[k + 1], b.p[k], b.p[k + 1], Color.WHITE, Color.WHITE, Color.WHITE, Color.WHITE)
 		# bridge-deck slab: underside + side skirts so an overpass reads as a solid
@@ -1784,7 +1850,7 @@ func _build_tile(t: int) -> void:
 			var ta := Vector3(0, 0.9 * float(a.dk) + 0.05, 0)
 			var tb := Vector3(0, 0.9 * float(b.dk) + 0.05, 0)
 			var cu := Color(0.30, 0.29, 0.28)
-			var last := LAT_FR.size() - 1
+			var last := frs.size() - 1
 			for k in range(last):
 				_quad(und, a.p[k] - ta, a.p[k + 1] - ta, b.p[k] - tb, b.p[k + 1] - tb, cu, cu, cu, cu)
 			var ce := Color(0.38, 0.37, 0.35)
@@ -1794,7 +1860,7 @@ func _build_tile(t: int) -> void:
 	var container := Node3D.new()
 	var mi := MeshInstance3D.new()
 	mi.mesh = st.commit()
-	mi.material_override = _road_mat
+	mi.material_override = _ground_mat if realistic else _road_mat
 	container.add_child(mi)
 	if have_und:
 		und.generate_normals()
@@ -1805,10 +1871,14 @@ func _build_tile(t: int) -> void:
 	# rails down both edges (band + emissive cap + posts)
 	_build_rail_side(container, rows, -1.0)
 	_build_rail_side(container, rows, 1.0)
-	# painted markings (dashed centre + solid edges) as crisp overlay strips
-	container.add_child(_build_lines(rows))
+	# painted markings (dashed centre + solid edges) as crisp overlay strips — the
+	# realistic ground shader paints its own, per pixel
+	if not realistic:
+		container.add_child(_build_lines(rows))
 	# roadside scatter (trees/rocks) — purely visual, verge band only
 	_scatter_tile(t, rows, container)
+	if realistic:
+		_scatter_scrub(t, rows, container)
 	# chevron turn-warning boards — purely visual, outside edge of bends only
 	_build_chevrons(t, container)
 	# loop-de-loop ribbon: the anchor tile owns the whole circle (deck + underside +
@@ -1829,6 +1899,47 @@ func _build_tile(t: int) -> void:
 
 func _height_lat(d: float, lat: float, rh: float) -> float:
 	return _carved_height(d, lat, rh)
+
+## One ribbon quad for the realistic ground shader: besides position it carries the
+## road-frame coordinates the shader paints from (UV = lateral m, arc-length m; UV2 =
+## drivable half-width, turn widen), the row's right vector as the tangent, and the
+## level-design paint (hazard stripes, landing pad) in vertex colour.
+func _ribbon_quad(st: SurfaceTool, a: Dictionary, b: Dictionary, k: int) -> void:
+	var ta := Plane(Vector3(float(a.rx), 0.0, float(a.rz)), 1.0)
+	var tb := Plane(Vector3(float(b.rx), 0.0, float(b.rz)), 1.0)
+	_ribbon_vert(st, a, k, ta)
+	_ribbon_vert(st, b, k, tb)
+	_ribbon_vert(st, a, k + 1, ta)
+	_ribbon_vert(st, a, k + 1, ta)
+	_ribbon_vert(st, b, k, tb)
+	_ribbon_vert(st, b, k + 1, tb)
+
+func _ribbon_vert(st: SurfaceTool, r: Dictionary, k: int, tangent: Plane) -> void:
+	st.set_color(r.c[k])
+	st.set_uv(Vector2(float(r.l[k]), float(r.d)))
+	st.set_uv2(Vector2(float(r.rh), float(r.w)))
+	st.set_tangent(tangent)
+	st.add_vertex(r.p[k])
+
+## Level-design paint for the realistic shader: rgb = colour, a = how much of the
+## photographed surface it replaces. Transparent everywhere except jump dressing and
+## a bridge deck's concrete shoulder.
+func _paint_color(d: float, lat: float, rh: float) -> Color:
+	var al := absf(lat)
+	if al > rh + 1.0:
+		var dk := _deck_at(d)
+		return Color(0.46, 0.45, 0.43, dk) if dk > 0.01 else Color(0, 0, 0, 0)
+	var gi := _gap_index_at_s(d)
+	if gi >= 0 and al < rh:
+		var g: Dictionary = _gaps[gi]
+		var lip: float = g.cs - g.vw * 0.5
+		var far: float = g.cs + g.vw * 0.5
+		if d > lip - gap_ramp_len and d < lip:
+			var c := Color(0.92, 0.78, 0.12) if fmod(d, 4.0) < 2.0 else Color(0.1, 0.1, 0.11)
+			return Color(c.r, c.g, c.b, 1.0)
+		elif d >= far and d < far + float(g.get("ll", gap_land_len)):
+			return Color(gap_pad_color.r, gap_pad_color.g, gap_pad_color.b, 1.0 - smoothstep(rh - 1.5, rh + 1.0, al))
+	return Color(0, 0, 0, 0)
 
 # lateral cross-section fractions for the loop ribbon (narrower than the road)
 const LOOP_FR := [-1.0, -0.86, -0.45, 0.0, 0.45, 0.86, 1.0]
@@ -2004,6 +2115,9 @@ const RAIL_FLARE_ROWS := 3   # rows of taper approaching a gap void's edge
 ## shadow in the valley (index 2), dark steel base (0) rising to the bright accent
 ## band at the top (3, matching the emissive cap).
 func _rail_band_color(profile_index: int) -> Color:
+	if look != "":
+		# plain galvanised steel; the corrugation still gets its baked light/dark facets
+		return [Color(0.34, 0.35, 0.37), Color(0.52, 0.53, 0.55), Color(0.28, 0.29, 0.31), Color(0.46, 0.47, 0.49)][mini(profile_index, 3)]
 	match profile_index:
 		0:
 			return rail_post_color.darkened(0.15)
@@ -2161,14 +2275,20 @@ func _ensure_scatter_meshes() -> void:
 		return
 	_scatter_meshes_loaded = true
 	for k in scatter_kinds:
-		var m := GlbUtil.load_mesh(k)
+		var m: Mesh
+		if k.begins_with("baked:"):
+			# "baked:<mesh>:<texture folder>" — a scanned prop from tools/BakeProps.gd
+			var parts := k.split(":")
+			m = HCLook.prop_mesh(parts[1], parts[2])
+		else:
+			m = GlbUtil.load_mesh(k)
 		if m == null:
 			continue
 		_scatter_kind_mesh[k] = m
 		var aabb := m.get_aabb()
 		var is_tree: bool = k.contains("/trees/")
 		var native: float = aabb.size.y if is_tree else maxf(aabb.size.x, aabb.size.z)
-		var target: float = 9.0 if is_tree else 2.0   # trees ~9m tall, rocks ~2m wide
+		var target: float = 9.0 if is_tree else (2.7 if k.begins_with("baked:") else 2.0)   # trees ~9m tall, rocks ~2m wide
 		_scatter_kind_scale[k] = (target / native) if native > 0.01 else 1.0
 
 ## Scatters trees/rocks along tile `t`'s verge band, deterministically from a local
@@ -2213,6 +2333,8 @@ func _scatter_tile(t: int, rows: Array, container: Node3D) -> void:
 			var wy: float = _carved_height(r.d, lat, rh)
 			var s: float = rng.randf_range(0.8, 1.6) * float(_scatter_kind_scale.get(kind, 1.0))
 			var b := Basis(Vector3.UP, rng.randf() * TAU).scaled(Vector3(s, s, s))
+			if kind.begins_with("baked:"):
+				wy -= 0.22 * s   # scanned boulders sit IN the ground, not balanced on it
 			buckets[kind].append(Transform3D(b, Vector3(wx, wy, wz)))
 			# coarse footprint for the near-miss check — trunk/boulder scale, not canopy
 			props.push_back(wx)
@@ -2231,7 +2353,8 @@ func _scatter_tile(t: int, rows: Array, container: Node3D) -> void:
 			mm.set_instance_transform(i, xforms[i])
 		var mmi := MultiMeshInstance3D.new()
 		mmi.multimesh = mm
-		mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		if look == "":
+			mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		mmi.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
 		container.add_child(mmi)
 	# index this tile's props for props_near: centroid + bound radius lets a query
@@ -2252,6 +2375,54 @@ func _scatter_tile(t: int, rows: Array, container: Node3D) -> void:
 			bound = maxf(bound, dx * dx + dz * dz)
 		_tile_props[t] = props
 		_tile_prop_bounds[t] = Vector3(cx, cz, sqrt(bound) + 1.5)
+
+## Dry desert scrub on the verge (realistic look). Visual only, and drawn from its OWN
+## random stream: the gameplay scatter above (whose positions feed the prop near-miss)
+## stays exactly as it was. Hidden past ~260 m so far tiles cost nothing.
+const SCRUB_KINDS := ["bush_b", "bush_c", "bush_d", "bush_e"]
+func _scatter_scrub(t: int, rows: Array, container: Node3D) -> void:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = hash(Vector3i(t, int(path_seed) & 0xffff, 4242))
+	var half_mesh := road_half_turn + mesh_verge
+	var buckets := {}
+	for r in rows:
+		if r.void or float(r.dk) > 0.05:
+			continue
+		var rh: float = r.rh
+		for side in [-1.0, 1.0]:
+			for _n in range(2):
+				if rng.randf() > 0.45:
+					continue
+				var lat: float = lerpf(rh + 1.4, half_mesh - 1.0, rng.randf()) * side
+				var wx: float = r.cx + r.rx * lat + rng.randf_range(-1.5, 1.5)
+				var wz: float = r.cz + r.rz * lat + rng.randf_range(-1.5, 1.5)
+				if _claimed_by_other(wx, wz, int(r.i), 3.0):
+					continue
+				var kind: String = SCRUB_KINDS[rng.randi() % SCRUB_KINDS.size()]
+				var s: float = rng.randf_range(1.5, 3.3)
+				var b := Basis(Vector3.UP, rng.randf() * TAU).scaled(Vector3(s, s * rng.randf_range(0.8, 1.15), s))
+				if not buckets.has(kind):
+					buckets[kind] = []
+				buckets[kind].append(Transform3D(b, Vector3(wx, _carved_height(r.d, lat, rh) - 0.04 * s, wz)))
+	for kind in buckets:
+		var mesh := HCLook.prop_mesh(kind, "wild_rooibos_bush")
+		if mesh == null:
+			continue
+		var xforms: Array = buckets[kind]
+		var mm := MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.mesh = mesh
+		mm.instance_count = xforms.size()
+		for i in range(xforms.size()):
+			mm.set_instance_transform(i, xforms[i])
+		var mmi := MultiMeshInstance3D.new()
+		mmi.multimesh = mm
+		mmi.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
+		mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF   # twig shadows are sub-pixel noise
+		mmi.visibility_range_end = 200.0
+		mmi.visibility_range_end_margin = 30.0
+		mmi.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
+		container.add_child(mmi)
 
 ## Solid verge props (trees/rocks) within `radius` of (x,z) as flat [x,y,z,r] quads
 ## (r = coarse trunk/boulder footprint). Feeds the car's prop near-miss. Returns a

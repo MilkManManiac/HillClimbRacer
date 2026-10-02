@@ -23,6 +23,38 @@ Design pillars (in priority order):
    all-drift sprint against the clock, big-air snow ridge. More flavors welcome.
 5. **Session-friendly.** Death → shop → retry in seconds. No friction.
 
+## Update (2026-10-02 — "HC v10", realistic look on Sunset Canyon)
+
+Owner reaction: "the most insane upgrade ive ever fucking seen in anything ever." This
+is the visual direction now: real scanned/photographed assets, not procedural colour.
+
+- **Opt-in per map**: `MAPS[key].overrides.look = "desert"` (HCTrack export `look`).
+  Only Sunset Canyon has it; the other maps are untouched. Everything realistic is
+  skipped under `--headless`, so tests stay fast and physics are identical.
+- **`HCLook.gd`**: per-look config (textures, sky, sun angle, haze) and the shared
+  material/sky builders. Sky = Poly Haven HDRI that also lights the scene; the sun is
+  aimed from where the sun is in the photo. AgX tonemap, SSAO, light fog, soft shadows.
+- **`shaders/hc_ground.gdshader`**: one shader for road AND land so the seam vanishes.
+  Road markings (edge lines, kerbs on tight corners, cracks, patches, rubber line, sand
+  at the edges) are computed per pixel from ribbon vertex data (UV = lateral m /
+  arc-length m, UV2 = half-width / widen, COLOR = level paint).
+- **`HCLand.gd`**: canyon terrain generated from distance to the road (floor → talus →
+  terraced walls → mesa), streamed in near/far chunks on WorkerThreadPool. Scatters
+  baked boulders and scrub.
+- **Car**: Khronos "Car Concept" (CC-BY, credited) on the trial's sports car, scaled to
+  the physics wheelbase, wheels re-hung on steer/spin rigs (`HCCar._build_concept_body`,
+  `HCCarBody.concept_instance`). Physics/VSPEC untouched. Ghost = same body as glass.
+- **Gates**: steel truss gantries + sector boards (`HCMain._build_gate_real`).
+- **UI**: title rebuilt over the live scene, Barlow Condensed, amber accent, no emoji;
+  trial HUD speed readout; results panel restyled.
+- **Assets** (~85 MB): `assets/pbr`, `assets/sky`, `assets/desert` (+ `baked/*.res`
+  made by `tools/BakeProps.gd`, run without `--headless`), `assets/car/concept`,
+  `assets/fonts`. All loaded at runtime, no editor import needed.
+- **Visual review**: `tests/LookShot.tscn` (no `--headless`; env `HC_SHOT_S`,
+  `HC_SHOT_MAP`, `HC_SHOT_ORBIT=1`, `HC_SHOT_PERF=1`). ~117 fps on an RTX 4060 Ti.
+- **Known issues**: the car's left-side wheel spokes render near-black in shade (Rim1
+  material too dark); other maps still have the old look.
+
 ## Direction change (2026-10-01 — "HC v9", weekly trial)
 
 Owner call: "drop a lot of the upgrade stuff and focus more on a multiplayer trial type

@@ -1,6 +1,7 @@
 extends Node
 ## Renders the weekly-trial screens to PNGs for visual review (run WITHOUT --headless;
-## takes about a minute because the bot drives a full lap in real time): the trial title
+## takes about a minute and a half because the bot drives a full lap in real time, then
+## part of a second one against its own ghost): the trial title
 ## card, the start line, a split call-out, the approach to the finish gate, and the
 ## results panel. TitleShot.gd pattern — real renderer, save, quit. PNGs land in
 ## HC_SHOT_DIR (default res://) — delete them after looking.
@@ -10,6 +11,8 @@ var _f := 0
 var _stage := 0
 var _dir := "res://"
 var _driving := false
+var _title_snapped := -1
+var _slow := false
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
@@ -37,9 +40,17 @@ func _process(_d: float) -> void:
 		0:   # title screen, switched to the weekly trial
 			if _f == 20:
 				_root.call("_on_title_mode_button", "trial")
-			elif _f == 50:
+			elif _f >= 50 and _title_snapped < 0 and _land_ready():
+				# the title's backdrop is the live scene: wait for the terrain to stream in
+				_title_snapped = _f
 				_snap("trial_title.png")
-			elif _f == 60:
+			elif _title_snapped > 0 and _f == _title_snapped + 6:
+				_root.call("_on_title_mode_button", "classic")
+			elif _title_snapped > 0 and _f == _title_snapped + 30:
+				_snap("classic_title.png")
+			elif _title_snapped > 0 and _f == _title_snapped + 36:
+				_root.call("_on_title_mode_button", "trial")
+			elif _title_snapped > 0 and _f == _title_snapped + 50:
 				_root.call("_begin_game")
 				_f = 0
 				_stage = 1
@@ -70,7 +81,24 @@ func _process(_d: float) -> void:
 			if _f == 50:
 				_snap("trial_results.png")
 			elif _f == 70:
+				# second run, a little slower, so the ghost of the first pulls ahead and
+				# the split shows a real gap
+				_root.call("_restart")
+				_slow = true
+				_stage = 7
+		7:
+			if (_root.get("_run_splits") as Array).size() >= 1:
+				_f = 0
+				_stage = 8
+		8:
+			if _f == 12:
+				_snap("trial_ghost_split.png")
+			elif _f == 30:
 				get_tree().quit()
+
+func _land_ready() -> bool:
+	var terrain: Node = _root.get("_terrain")
+	return terrain == null or not terrain.has_method("land_settled") or bool(terrain.call("land_settled"))
 
 func _snap(fname: String) -> void:
 	await RenderingServer.frame_post_draw
@@ -105,5 +133,5 @@ func _drive_step(car: RigidBody3D, terrain: Node) -> void:
 		Input.action_release("accelerate")
 		Input.action_press("brake", 0.7)
 	else:
-		Input.action_press("accelerate")
+		Input.action_press("accelerate", 0.82 if _slow else 1.0)
 		Input.action_release("brake")
