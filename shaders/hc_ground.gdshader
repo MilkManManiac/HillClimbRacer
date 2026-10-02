@@ -30,6 +30,7 @@ uniform vec3 sand_tint : source_color = vec3(1.0);
 uniform vec3 cliff_tint : source_color = vec3(1.0);
 uniform vec3 line_color : source_color = vec3(0.86, 0.85, 0.80);
 uniform vec3 kerb_color : source_color = vec3(0.62, 0.07, 0.05);
+uniform vec3 centre_color : source_color = vec3(0.80, 0.57, 0.10);
 uniform float normal_strength = 1.0;
 
 // far land only: the square the fine near-land covers; the coarse mesh is cut out there
@@ -209,6 +210,19 @@ void fragment() {
 			float paint = e_line * mix(0.55, 0.95, wear);
 			paint_c = mix(paint_c, kerb_c, kerb_zone);
 			paint = max(paint, kerb_zone * mix(0.7, 0.97, wear));
+			// centre line, highway yellow: dashed on the straights, solid through the
+			// bends (the same widen signal that lays the kerbs), so the line itself says
+			// a corner is coming. Never thinner than about a pixel: far down the road it
+			// is the one mark that shows which way the tarmac goes.
+			float c_half = max(0.17, px * 0.75);
+			float c_line = 1.0 - smoothstep(c_half - px * 0.5, c_half + px, al);
+			float ds = fwidth(s) / 12.0;
+			float dph = fract(s / 12.0);
+			float dash = smoothstep(0.0, ds, dph) * (1.0 - smoothstep(0.58, 0.58 + ds, dph));
+			dash = mix(dash, 0.58, smoothstep(0.2, 0.5, ds));
+			c_line *= max(dash, smoothstep(0.28, 0.5, widen));
+			paint_c = mix(paint_c, centre_color, c_line);
+			paint = max(paint, c_line * mix(0.72, 0.97, wear));
 			// distant paint thinner than a pixel shimmers; let it fade into the asphalt
 			paint *= 1.0 - smoothstep(180.0, 420.0, vdist) * 0.6;
 			a_c = mix(a_c, paint_c, paint);

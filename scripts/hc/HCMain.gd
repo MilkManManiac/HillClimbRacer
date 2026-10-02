@@ -262,7 +262,7 @@ const UP_DESC := {
 	"durability": "Reinforced armor — more health (HP)",
 	"wheels": "Taller wheels, more clearance",
 	"wings": "Lift = more air time off jumps",
-	"dive": "Hold Space to dive + an air-brake flap",
+	"dive": "Hold Space in the air to dive + an air-brake flap",
 	"rockets": "Hold Ctrl: a little air boost (chugs fuel)",
 	"stretch": "Slippier body — higher top speed & carries momentum",
 	"wide": "Presses you into the road — roll over far less",
@@ -433,6 +433,15 @@ const SPEED_LINE_COUNT := 32           # number of radial streaks
 const CAM_LOOKAHEAD_DIST := 45.0       # metres ahead of the car to sample the road
 const CAM_LOOKAHEAD_GAIN := 0.6        # how strongly lateral road bend maps to aim bias
 const CAM_LOOKAHEAD_MAX := 7.0         # max aim bias (metres)
+# the realistic maps' tighter chase rig (see _update_camera; tests/CamProbe measures it)
+const CAM_TIGHT_HEADING := 5.0         # how fast the rig swings behind the velocity (1/s)
+const CAM_TIGHT_SNAP := 12.0           # position follow rate (1/s)
+const CAM_TIGHT_TRAIL_CANCEL := 0.65   # fraction of the speed-lag trail fed forward
+const CAM_TIGHT_AIM := 12.0            # aim follow rate (1/s)
+const CAM_TIGHT_LEAD_MAX := 2.6        # max corner look-ahead aim bias (metres)
+const CURSOR_HIDE_AFTER := 1.5         # seconds of still mouse before the cursor hides while driving
+const RESULTS_FOCUS_DELAY := 0.6       # see _show_results
+var _mouse_idle := 0.0
 var _cam_lead := Vector3.ZERO          # smoothed look-ahead aim bias (horizontal vector)
 var _cam_roll := 0.0                   # smoothed camera bank angle (degrees)
 var _cam_look_basis := Basis.IDENTITY  # roll-free smoothing accumulator (see _update_camera)
@@ -696,6 +705,9 @@ func _cycle_body_kit() -> void:
 	_swap_vehicle(_vehicle)   # full rebuild in the new shell (+ saves + refreshes shop)
 
 func _input(event: InputEvent) -> void:
+	if event is InputEventMouseMotion:
+		_mouse_idle = 0.0
+		return
 	if event.is_action_pressed("pause_menu"):
 		_toggle_pause_menu()
 		return
@@ -733,10 +745,16 @@ func _setup_input() -> void:
 	_joy_axis("turn_right", JOY_AXIS_LEFT_X, 1.0)
 	_new_action("boost", 0.5, [_key(KEY_CTRL), _btn(JOY_BUTTON_RIGHT_SHOULDER)])
 	_new_action("dive", 0.5, [_key(KEY_SPACE), _btn(JOY_BUTTON_LEFT_SHOULDER)])
+	# Space is the handbrake on the ground and the dive in the air (HCCar sorts out which)
+	_new_action("handbrake", 0.5, [_key(KEY_SPACE), _btn(JOY_BUTTON_A)])
+	# arrow keys drive too: project.godot only binds Up/Down, so Left/Right did nothing
+	for pair in [["turn_left", KEY_LEFT], ["turn_right", KEY_RIGHT]]:
+		if InputMap.has_action(pair[0]):
+			InputMap.action_add_event(pair[0], _key(pair[1]))
 	_new_action("recover", 0.5, [_key(KEY_R), _btn(JOY_BUTTON_Y)])
 	_new_action("float", 0.5, [_key(KEY_F), _btn(JOY_BUTTON_X)])   # Party Balloons deploy
-	_new_action("pitch_down", 0.2, [_key(KEY_W), _axis(JOY_AXIS_LEFT_Y, -1.0)])
-	_new_action("pitch_up", 0.2, [_key(KEY_S), _axis(JOY_AXIS_LEFT_Y, 1.0)])
+	_new_action("pitch_down", 0.2, [_key(KEY_W), _key(KEY_UP), _axis(JOY_AXIS_LEFT_Y, -1.0)])
+	_new_action("pitch_up", 0.2, [_key(KEY_S), _key(KEY_DOWN), _axis(JOY_AXIS_LEFT_Y, 1.0)])
 	_new_action("roll_left", 0.2, [_key(KEY_Q), _axis(JOY_AXIS_RIGHT_X, -1.0)])
 	_new_action("roll_right", 0.2, [_key(KEY_E), _axis(JOY_AXIS_RIGHT_X, 1.0)])
 	_new_action("toggle_shop", 0.5, [_key(KEY_TAB), _btn(JOY_BUTTON_START)])
@@ -1258,7 +1276,19 @@ func _setup_camera() -> void:
 	_cam.global_position = _start + Vector3(0, 6, 12)
 	_cam.look_at(_start, Vector3.UP)
 
+## The cursor is only in the way while driving: hide it once the mouse has sat still,
+## bring it back the instant it moves or any menu is up.
+func _sync_cursor(delta: float) -> void:
+	_mouse_idle += delta
+	var menu_up: bool = (_start_layer != null or get_tree().paused
+			or (_shop != null and _shop.visible)
+			or (_results_layer != null and _results_layer.visible))
+	var want: int = Input.MOUSE_MODE_HIDDEN if (not menu_up and _mouse_idle > CURSOR_HIDE_AFTER) else Input.MOUSE_MODE_VISIBLE
+	if Input.get_mouse_mode() != want:
+		Input.set_mouse_mode(want)
+
 func _process(delta: float) -> void:
+	_sync_cursor(delta)
 	_shop_autoscroll(delta)
 	if _car == null:
 		return
@@ -1300,8 +1330,11 @@ func _update_camera(delta: float) -> void:
 	# heading from horizontal velocity (stable during flips); fall back to last heading
 	var vel: Vector3 = _car.linear_velocity
 	var vh := Vector3(vel.x, 0, vel.z)
+	# realistic maps frame the car close with a longer lens, so every bit of follow lag
+	# is magnified on screen: they run a tighter rig throughout (CamProbe has the numbers)
+	var realistic: bool = _map_look() != ""
 	if vh.length() > 2.0:
-		_cam_heading = _cam_heading.lerp(vh.normalized(), 1.0 - exp(-3.0 * delta))
+		_cam_heading = _cam_heading.lerp(vh.normalized(), 1.0 - exp(-(CAM_TIGHT_HEADING if realistic else 3.0) * delta))
 	# feature 1: bank the camera toward the slide while drifting. Sign comes from
 	# the car's lateral velocity (horizontal vel dotted onto the car's right axis);
 	# smoothed so it eases in/out and can't snap. Applied to the view basis below.
@@ -1327,15 +1360,19 @@ func _update_camera(delta: float) -> void:
 		lead.y = 0.0
 		lead -= _cam_heading * lead.dot(_cam_heading)   # sideways component only
 		lead *= CAM_LOOKAHEAD_GAIN
-		if lead.length() > CAM_LOOKAHEAD_MAX:
-			lead = lead.normalized() * CAM_LOOKAHEAD_MAX
+		# the aim bias is in metres at the car: 7 m seen from 12 m back is a glance into
+		# the bend, from 7 m back it throws the car to the edge of the frame
+		var lead_max: float = CAM_TIGHT_LEAD_MAX if realistic else CAM_LOOKAHEAD_MAX
+		if lead.length() > lead_max:
+			lead = lead.normalized() * lead_max
 		if lead.is_finite():
 			lead_target = lead
 	_cam_lead = _cam_lead.lerp(lead_target, 1.0 - exp(-4.0 * delta))
-	var target := _car.global_position
+	# follow the car where it is DRAWN (physics runs at 120 Hz and the body is
+	# interpolated between ticks); the raw tick position steps against the render frame
+	var target := _car.get_global_transform_interpolated().origin if realistic else _car.global_position
 	# realistic maps sit the camera lower and closer with a longer lens: the arcade
 	# framing (12 m back, 6 m up, very wide) shrinks the car to a toy on a huge plane
-	var realistic: bool = _map_look() != ""
 	var want := target - _cam_heading * (7.2 if realistic else 12.0) + Vector3(0, 2.9 if realistic else 6.0, 0)
 	# gentle "cut the corner": nudge the chase position a small fraction of the aim bias
 	want += _cam_lead * 0.3
@@ -1363,7 +1400,11 @@ func _update_camera(delta: float) -> void:
 	# snap in faster when blocked so the car never disappears
 	# (the smoothing lag adds speed / snap metres of trail: a tighter follow on the
 	# realistic maps keeps the car from shrinking away at 250 km/h)
-	var snap: float = 16.0 if blocked else (9.5 if realistic else 6.0)
+	var snap: float = 16.0 if blocked else (CAM_TIGHT_SNAP if realistic else 6.0)
+	if realistic and not blocked:
+		# lead the chase point by most of that trail, so the car pulls away a little
+		# under power (it should: that is the sense of speed) instead of doubling the gap
+		want += vh * (CAM_TIGHT_TRAIL_CANCEL / snap)
 	_cam.global_position = _cam.global_position.lerp(want, 1.0 - exp(-snap * delta))
 	var look := target + Vector3(0, 1.0, 0)
 	# lean the AIM toward the upcoming bend (composes with the roll-free basis below;
@@ -1383,7 +1424,7 @@ func _update_camera(delta: float) -> void:
 		if not _cam_look_ready:
 			_cam_look_basis = t.basis
 			_cam_look_ready = true
-		_cam_look_basis = _cam_look_basis.slerp(t.basis, 1.0 - exp(-8.0 * delta))
+		_cam_look_basis = _cam_look_basis.slerp(t.basis, 1.0 - exp(-(CAM_TIGHT_AIM if realistic else 8.0) * delta))
 		# feature 1: roll the final view about its forward axis by the smoothed bank,
 		# rebuilt from the un-rolled basis each frame (no drift over time).
 		var fwd: Vector3 = (-_cam_look_basis.z).normalized()
@@ -1570,6 +1611,10 @@ func _update_sprint(delta: float) -> void:
 func _update_trial(delta: float) -> void:
 	if _ghost:
 		_ghost.call("tick_record", delta)   # no-op unless a recording is in progress
+	if _car:
+		# no air pitch/yaw/roll on the run-up: the clock hasn't started, and W would
+		# tip the nose into the road on the spawn drop
+		_car.set("air_control_locked", _trial_active and not _trial_running and not _trial_finished)
 	if not _trial_active or _car == null:
 		return
 	if _trial_running or _trial_finished:
@@ -2102,8 +2147,8 @@ func _refresh_title_mode() -> void:
 	if _title_col and is_instance_valid(_title_col):
 		_title_col.custom_minimum_size = Vector2(470 if trial else 690, 0)
 	if _title_legend_lbl and is_instance_valid(_title_legend_lbl):
-		_title_legend_lbl.text = ("W  THROTTLE      S  BRAKE      A / D  STEER      ENTER  RESTART      ESC  PAUSE" if trial
-				else "W / S  THROTTLE, BRAKE      A / D  STEER      SPACE  DIVE      CTRL  BOOST      R  RECOVER      TAB  GARAGE      ESC  PAUSE")
+		_title_legend_lbl.text = ("W  THROTTLE      S  BRAKE      A / D  STEER      SPACE  HANDBRAKE, DRIFT      ENTER  RESTART      ESC  PAUSE" if trial
+				else "W / S  THROTTLE, BRAKE      A / D  STEER      SPACE  HANDBRAKE (AIR: DIVE)      CTRL  BOOST      R  RECOVER      TAB  GARAGE      ESC  PAUSE")
 
 ## "This week's track": the one card trial mode offers. Everything on it is read from
 ## HCTimeTrialScript.TRACKS, so swapping the weekly track is a data edit.
@@ -2450,6 +2495,9 @@ func _begin_game() -> void:
 	if _hud_layer:
 		_hud_layer.visible = true
 	get_tree().paused = false   # the state change is immediate — everything below is cosmetic
+	# START keeps keyboard focus while the title fades out, and Space/Enter press the
+	# focused button: without this, a handbrake tap in the first moments re-fires START
+	get_viewport().gui_release_focus()
 	if _start_layer:
 		var layer := _start_layer
 		var dim := _start_dim
@@ -3736,7 +3784,7 @@ func _setup_hud() -> void:
 		l.add_theme_font_override("font", _font_bold)
 	for l in [_trial_sub_lbl, _speed_unit_lbl]:
 		l.add_theme_font_override("font", _font_caps)
-	hint.text = "KB: Shift/W drive • S brake • A/D steer • Ctrl boost • Space dive • F balloons • R recover • air W/S pitch, Q/E roll • Tab garage • Enter retry\nPad: RT throttle • LT brake • L-stick steer/pitch • R-stick roll • RB boost • LB dive • X balloons • Y recover • Start garage • B retry"
+	hint.text = "KB: Shift/W drive • S brake • A/D steer • Space handbrake (air: dive) • Ctrl boost • F balloons • R recover • air W/S pitch, Q/E roll • Tab garage • Enter retry\nPad: RT throttle • LT brake • L-stick steer/pitch • R-stick roll • RB boost • LB dive • A handbrake • X balloons • Y recover • Start garage • Back retry"
 	layer.add_child(hint)
 
 func _bar_bg(layer: CanvasLayer, pos: Vector2, col: Color) -> ColorRect:
@@ -3898,7 +3946,12 @@ func _show_results(prev_best: float, is_best: bool) -> void:
 		_results_rival_lbl.text = "%s   %s" % [str(rd.get("name", "RIVAL")), HCTimeTrialScript.format_delta(_trial_time - float(rd.get("time", 0.0)))]
 	_results_layer.visible = true
 	_animate_panel_in(_results_panel, false)
-	_results_retry_btn.call_deferred("grab_focus")
+	# Space and Enter "click" whichever button has focus, and Space is the handbrake:
+	# a drift held across the line would retry before the time was ever read. Give
+	# RETRY the focus a beat later (Enter still restarts at once through its own action).
+	get_tree().create_timer(RESULTS_FOCUS_DELAY).timeout.connect(func():
+		if _results_layer.visible and is_instance_valid(_results_retry_btn):
+			_results_retry_btn.grab_focus())
 
 func _hide_results() -> void:
 	if _results_layer:

@@ -7,6 +7,7 @@ extends Node
 ##   HC_SHOT_S      comma list of arc-lengths to visit (default below)
 ##   HC_SHOT_MAP    map key (default: the weekly trial track)
 ##   HC_SHOT_ORBIT  "1" also saves side / front / high orbit frames at each spot
+##   HC_SHOT_DRIFT  "1" the bot pulls the handbrake through bends (smoke / skid review)
 
 const DEFAULT_S := [150.0, 620.0, 1180.0, 1750.0, 2400.0]
 
@@ -19,6 +20,7 @@ var _stage := 0
 var _orbit := false
 var _orbit_i := 0
 var _free_cam: Camera3D
+var _drift := false         # HC_SHOT_DRIFT=1
 var _perf := false          # HC_SHOT_PERF=1: no stills, just drive 20 s and report frame times
 var _perf_t := 0.0
 var _perf_frames := 0
@@ -31,6 +33,7 @@ func _ready() -> void:
 		_dir = OS.get_environment("HC_SHOT_DIR").rstrip("/") + "/"
 	_orbit = OS.get_environment("HC_SHOT_ORBIT") == "1"
 	_perf = OS.get_environment("HC_SHOT_PERF") == "1"
+	_drift = OS.get_environment("HC_SHOT_DRIFT") == "1"
 	var s_env := OS.get_environment("HC_SHOT_S")
 	if s_env != "":
 		for part in s_env.split(","):
@@ -191,3 +194,7 @@ func _drive_step(car: RigidBody3D, terrain: Node) -> void:
 	else:
 		Input.action_press("accelerate")
 		Input.action_release("brake")
+	if _drift and absf(err) > 0.1 and speed > 20.0:
+		Input.action_press("handbrake")
+	else:
+		Input.action_release("handbrake")

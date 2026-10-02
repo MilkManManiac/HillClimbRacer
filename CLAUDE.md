@@ -36,11 +36,17 @@ first so you can checkpoint and diff your own work.
 <console> --headless --path . tests/ComboProbe.tscn     # combo v2: chain math, bank/drop, near-miss, HUD
 <console> --headless --path . tests/BalloonProbe.tscn   # Party Balloons: fall cap, drain/pops, save round-trip
 <console> --headless --path . tests/SkidProbe.tscn      # skid ribbons: pool cap, strip breaks, brake-lock, reset
+<console> --headless --path . tests/KbmProbe.tscn       # real key events: Space handbrake/drift, arrows, no stray button clicks
 ```
 When changing a trial track's car, tune or length (`HCTimeTrial.TRACKS`), run
 `tests/TrialBot.tscn` — a bot lap that prints time/average speed/wrecks — and re-set
 the medal times from it. `tests/TrialShot.tscn` (no `--headless`, ~1 min) renders the
 trial screens.
+
+When touching the chase camera (`HCMain._update_camera`), run `tests/CamProbe.tscn`
+with `--headless --fixed-fps 60` before and after — a bot lap that prints camera
+distance, how far off-centre the car sits and view yaw acceleration (v10.1: distance
+6.4–8.7 m, off-centre rms 11° / max 20°, yaw accel rms 129 deg/s²).
 
 When editing a map's `stunts` string, run `tests/LoopScan.tscn` first — it sweeps
 anchor placements against generator collisions (the `creep_xing` tripwire).

@@ -23,6 +23,112 @@ Design pillars (in priority order):
    all-drift sprint against the clock, big-air snow ridge. More flavors welcome.
 5. **Session-friendly.** Death → shop → retry in seconds. No friction.
 
+## Plan (2026-10-02, night — shipping the trial to Scryproof; NOT deployed)
+
+Owner direction: ship like Drain The Swamp (Scryproof Activities, repo
+`CodeProjects/GoOffline`, see its `docs/activities/README.md`), trial only, and show
+other people's best times. "No deploys yet", plan only.
+
+**Direction (same night, owner): not a browser game.** "Can we just say this shouldn't
+be played on browser?" Yes: ship a Windows download linked from Scryproof instead of
+an Activity. The browser findings below are why. The plan in plain words is in
+`README.md`; steps 3–4 there (hosting the download, a times API with a per-person game
+code) are Scryproof changes and wait on Matt. Scryproof already serves its own
+installer from `scryproof.com/download/` (`GoOffline/scripts/publish-installer.sh`);
+it has no per-user token system today, so the game code is new work.
+
+- **Air controls locked before the start line** (owner's idea). On a keyboard W is both
+  throttle and air nose-down, so flooring it through the spawn drop dug the nose in.
+  `HCCar.air_control_locked`, set every frame by `HCMain._update_trial` (trial active,
+  clock not started). KbmProbe measures it: 44.4° nose dip without the lock, 1.1° with.
+- **Trial web export, measured in a scratch copy** (templates for 4.6.3 are installed;
+  headless Chrome on the RTX 4060 Ti, 1280×720). The repo has no `export_presets.cfg`
+  yet. What the test showed:
+  - It boots and plays. Browser = Compatibility renderer (WebGL2), single-threaded.
+  - **The realistic look does not survive as-is**: the frame is blown out to white
+    (exposure/tonemap/sky energy read differently in Compatibility) and the scanned
+    sports car falls back to the blocky panel body (`_build_concept_body` returned
+    false; the raw glTF is in the pack, cause not yet found, GlbUtil fails silently).
+  - **28 fps while driving, 120 on the paused title** with the same scene on screen,
+    so the cost is game code, not drawing. Likely (not proven) `HCLand` chunk jobs:
+    they use `WorkerThreadPool`, which runs on the main thread in a no-threads build.
+  - **Download 182 MB** (`index.pck`; every raw asset ships twice, raw + imported, and
+    all six maps' art is in). Wasm is 37.7 MB raw, 9.5 MB gzipped. Scryproof's game
+    router caps each connection at 2 MB/s and the installer rejects exports over 256 MB.
+  - File dialogs (ghost export/import/open folder) do not exist in a browser.
+- **Scryproof side**: the Activities host is static by design (no backend, CSP
+  `connect-src 'self'`, cookies stripped, the game gets no account data). Game id
+  `drain-the-swamp` is hardcoded in `build-drain-the-swamp.py`, `publish.sh`,
+  `infra/activities/nginx.conf` and the bridge; a second game needs those generalised
+  and an entry in `web/src/lib/activities.ts`. The builder needs a clean, committed
+  checkout. Times would travel game → `postMessage` → the signed-in Scryproof page →
+  its own API (same shape as the Purdle routes).
+
+## Update (2026-10-02, evening — "HC v10.2", keyboard + drift polish)
+
+Owner direction: "make sure kbm works properly. Space should be break/aka drift", plus
+"any other things we can improve on? Go wild."
+
+- **Space = handbrake** (new `handbrake` action: Space / pad A). On the ground it brakes
+  at full `brake_force` off the throttle (never into reverse) and at 30% while on the gas
+  (`HANDBRAKE_POWER_DRAG`), and with any steer it breaks traction — the same drift the
+  S-brake always triggered. In the air Space is still the dive; a hold carried off a
+  crest is blocked from diving until re-pressed (`HCCar._dive_block`). Brake lights and
+  rear skid marks follow the handbrake.
+- **Arrow keys** now steer (project.godot only bound Up/Down) and pitch in the air.
+- **Space/Enter can no longer click a stale button**: focus is released when START is
+  pressed, and the results panel hands RETRY the focus 0.6 s late so a drift held across
+  the line doesn't skip the time. Enter still restarts instantly via its own action.
+- **Cursor** hides after 1.5 s of still mouse while driving, returns on any movement or
+  menu.
+- **`tests/KbmProbe.tscn`**: drives with real key events (`Input.parse_input_event`), so
+  the bindings themselves are tested — every other probe presses actions directly.
+- **Skid marks were dashed** because segments overlapped by 6 cm and are alpha-blended
+  (each joint drew twice as dark over a ribbon barely darker than the road in linear
+  light). Now butt-jointed and black. Ruled out with measurements, don't re-chase: wheel
+  contact flicker (solid) and the ribbon being buried by the road mesh (mesh is at most
+  2.1 cm above the analytic surface over the whole canyon; the ribbon sits at 3 cm).
+- **Tyre smoke was a row of grey balls**: GPUParticles step at 30 Hz by default and drop
+  each step's puffs in one spot. Realistic body now steps every frame and scatters the
+  puffs over about a frame's travel (`_soften_smoke`, `emission_sphere_radius`).
+- **Wheels on the car's shaded side were black discs** (most visible on the title hero
+  shot). Cause: the model's baked occlusion map is near-black on the wheels and occlusion
+  scales ambient light, which is all a shaded wheel gets. `ao_enabled = false` on
+  Rim1/Rim2/Tire*. This, not the albedo retune in v10.1, was the real "dark spokes" bug.
+- **Landing dust and exhaust backfire** on the realistic body drew as flat squares (tan
+  for dust, a blocky white mosaic for backfire). Both now use the soft puff sprite
+  (`_soften_smoke`). Arcade bodies unchanged.
+- `LookShot` gained `HC_SHOT_DRIFT=1` (bot pulls the handbrake through bends). Use
+  `HC_SHOT_ORBIT=1` and look at BOTH sides of the car: o0/o1 are its right (sunlit on the
+  canyon straight), o3 its left.
+- Open: a rare segfault on exit after a probe has already passed (seen in TrialProbe
+  about 1 run in 6-10, once in TitleFlowProbe, 0 of 12 when hunted). Present at v10
+  (HEAD) too. All checks print before it; treat exit 139 with "ALL OK" as a pass.
+- Noticed, not changed: braking is about 0.7 g (31 m/s to rest takes 4.3 s), so from top
+  speed a stop is ~10 s. The bot and medals are calibrated on it; owner call.
+
+## Update (2026-10-02, later — "HC v10.1", canyon polish)
+
+Owner direction: perfect Sunset Canyon (the trial track) first; it becomes the standard
+the other maps are brought up to. His notes: camera "a little funky maybe a little too
+loose", and a centre line "will help with seeing turns".
+
+- **Chase camera, realistic maps only** (`HCMain._update_camera`, `CAM_TIGHT_*`): rig
+  swings behind the velocity faster, position follow is quicker with most of the
+  speed-lag trail fed forward, aim follows faster, corner look-ahead capped at 2.6 m
+  (was 7 m, which from 7 m back threw the car to the edge of the frame), and it follows
+  the car's interpolated (drawn) position. Arcade maps keep the old rig.
+- **`tests/CamProbe.tscn`** (`--headless --fixed-fps 60`): bot lap, prints camera
+  distance, how far off-centre the car sits, and view yaw acceleration. Before → after:
+  distance 7.0–13.6 m → 6.4–8.7 m; car off-centre rms 19° / max 41° → 11° / 20°; yaw
+  accel rms 110 → 129 deg/s². Owner has not driven it yet; retune from his verdict.
+- **Centre line** (`hc_ground.gdshader`, `centre_color`): highway yellow, dashed on
+  straights, solid through bends (same `widen` signal as the kerbs), held to about a
+  pixel wide at distance so the road's direction reads far ahead.
+- **Skid ribbons** default tint near-black (they are unshaded and were drawing lighter
+  than the canyon's dark asphalt). **Wheels**: `Rim1` lifted from black to gunmetal, so
+  the spokes no longer vanish in shade (closes the v10 known issue).
+
 ## Update (2026-10-02 — "HC v10", realistic look on Sunset Canyon)
 
 Owner reaction: "the most insane upgrade ive ever fucking seen in anything ever." This
@@ -52,8 +158,8 @@ is the visual direction now: real scanned/photographed assets, not procedural co
   `assets/fonts`. All loaded at runtime, no editor import needed.
 - **Visual review**: `tests/LookShot.tscn` (no `--headless`; env `HC_SHOT_S`,
   `HC_SHOT_MAP`, `HC_SHOT_ORBIT=1`, `HC_SHOT_PERF=1`). ~117 fps on an RTX 4060 Ti.
-- **Known issues**: the car's left-side wheel spokes render near-black in shade (Rim1
-  material too dark); other maps still have the old look.
+- **Known issues**: other maps still have the old look. (Dark wheel spokes: fixed in
+  v10.1.)
 
 ## Direction change (2026-10-01 — "HC v9", weekly trial)
 

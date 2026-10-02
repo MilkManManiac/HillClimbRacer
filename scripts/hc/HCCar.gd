@@ -5,7 +5,7 @@ extends RigidBody3D
 ## pitch. Fuel drains under power; Health drops on hard/bad landings. R = self-right.
 ##
 ## Inputs: W/S throttle+brake (and air pitch), A/D steer (and air roll), Q/E air yaw,
-##         Shift = dive, R = recover.
+##         Space = handbrake (ground) / dive (air), R = recover.
 
 # --- tunables ---
 @export var engine_force: float = 19000.0
@@ -109,6 +109,10 @@ var _boost_light: OmniLight3D                   # flickering orange point light 
 var _boost_flicker_t: float = 0.0
 var boosting: bool = false
 var drifting: bool = false          # rear traction broken (hard turn / handbrake) -> tire smoke
+var handbraking: bool = false       # Space / pad A held on the ground this tick
+var _dive_block: bool = false       # Space was held at takeoff: no dive until re-pressed
+var air_control_locked: bool = false   # set by HCMain: trial grid, before the start line
+const HANDBRAKE_POWER_DRAG := 0.3   # fraction of brake force the handbrake applies while on the gas
 var _grip_break: float = 0.0        # 0 = full grip, 1 = fully sliding; ramps in fast, out slow
 var _drift_yaw_cur: float = 0.0     # smoothed drift yaw (drift_snap controls how fast it chases target)
 const DRIFT_YAW_EXP := 1.9          # >1 = gentle at small steer, ramps up the harder you turn
@@ -429,8 +433,19 @@ func _physics_process(delta: float) -> void:
 	if downforce > 0.0 and _grounded and _loop.is_empty():
 		apply_central_force(Vector3.DOWN * downforce * speed * mass * 0.12)
 
-	# --- dive (hold Space / LB): drop faster, burns fuel --------------------
-	var diving := Input.is_action_pressed("dive") and fuel > 0.0
+	# --- handbrake (Space / pad A): read here because Space is ALSO the dive key. On the
+	# ground Space is the handbrake, in the air it dives — and a handbrake hold carried
+	# off a crest must not turn into a dive until the key is released and pressed again.
+	# has_action guard: probes that drive HCCar without HCMain never register it.
+	var hb_held: bool = InputMap.has_action("handbrake") and Input.is_action_pressed("handbrake")
+	if _grounded:
+		_dive_block = hb_held
+	elif not hb_held:
+		_dive_block = false
+	handbraking = hb_held and _grounded and not autobrake
+
+	# --- dive (hold Space / LB in the air): drop faster, burns fuel ----------
+	var diving := Input.is_action_pressed("dive") and fuel > 0.0 and not _dive_block
 	if diving:
 		apply_central_force(Vector3.DOWN * dive_force * mass)
 		fuel -= delta * 9.0 * fuel_eff   # the drop costs fuel
@@ -467,6 +482,11 @@ func _physics_process(delta: float) -> void:
 				apply_central_force(fwd * -braking * engine_force * 0.4)
 		else:
 			apply_central_force(-fwd * fwd_speed * 0.04 * mass * 0.02)   # tiny coast drag, keeps momentum
+		# handbrake: drags the car to a stop but never into reverse. Full strength only
+		# off the throttle — held WITH the gas it is a drift button, and a drift that
+		# ate all your speed would make Space useless through a fast bend.
+		if handbraking and absf(fwd_speed) > 0.5:
+			apply_central_force(-fwd * signf(fwd_speed) * brake_force * (HANDBRAKE_POWER_DRAG if drive > 0.01 else 1.0))
 		fuel -= delta * 0.9 * fuel_eff   # idle burn
 		# smoothed steering (slower response than raw input)
 		_steer = lerpf(_steer, steer_in, 1.0 - exp(-steer_rate * delta))
@@ -480,7 +500,7 @@ func _physics_process(delta: float) -> void:
 		# rear loose. While drifting, grip collapses so the car slides instead of
 		# re-aiming — you keep your momentum and skate sideways.
 		var hard: float = absf(_steer) * k
-		var handbrake: bool = braking > 0.3 and absf(_steer) > 0.1
+		var handbrake: bool = (braking > 0.3 or handbraking) and absf(_steer) > 0.1
 		# drift is INTENTIONAL: the handbrake breaks traction (at any steer, low speed OK);
 		# a bare hard flick only breaks it near full lock so fast cornering stays gripped.
 		var breaking_now: bool = hspeed > 4.0 and (handbrake or hard > slide_thresh)
@@ -534,9 +554,16 @@ func _physics_process(delta: float) -> void:
 	else:
 		_grip_break = move_toward(_grip_break, 0.0, delta * 4.0)
 		drifting = false   # no tire smoke in the air
-		# --- airborne: full manual 3-axis (no assist) ----------------------
+		# --- airborne: full manual 3-axis (no assist; off until the trial clock starts)
 		var pitch := pitch_in                      # W/left-stick nose down, S nose up
 		var qe := Input.get_action_strength("roll_right") - Input.get_action_strength("roll_left")  # Q/E / right stick
+		if air_control_locked:
+			# on a keyboard the throttle IS the nose-down key, so flooring it off the grid
+			# through the spawn drop dug the nose in; with no input the arrest below
+			# levels the car instead
+			pitch = 0.0
+			steer_in = 0.0
+			qe = 0.0
 		# modest high-speed air-steer authority bump: the same torque turns a fast,
 		# heavier-feeling nose less, so give a little more yaw punch at speed to help
 		# correct a trajectory before landing (pitch/roll are untouched — this is
@@ -627,7 +654,7 @@ func _physics_process(delta: float) -> void:
 
 	_animate_surfaces(delta)
 	_update_balloons(delta)
-	_animate_concept(delta, fwd_speed, braking)
+	_animate_concept(delta, fwd_speed, maxf(braking, 1.0 if handbraking else 0.0))
 
 	# --- damage panel-shedding: pop small body panels at HP thresholds --------
 	# telegraphs health without reading the HUD; funny on a stacked-panel car. Must
@@ -650,6 +677,11 @@ func _physics_process(delta: float) -> void:
 		if tpm:
 			tpm.initial_velocity_min = 0.8 + speed_k * 1.4
 			tpm.initial_velocity_max = 2.4 + speed_k * 3.0
+			# every puff born in one drawn frame spawns at the SAME point, so at speed the
+			# plume beads into balls a frame's travel apart. Scatter them over about that
+			# distance (assumes ~60 fps; faster just overlaps more).
+			if _concept != null:
+				tpm.emission_sphere_radius = clampf(speed / 120.0, 0.15, 0.7)
 	var puffing: bool = (drive > 0.05 and fuel > 0.0) or boosting
 	# the realistic body keeps tyre smoke only: no cartoon exhaust puffs or wind streaks
 	var clean: bool = _concept != null
@@ -1709,6 +1741,7 @@ func _soften_smoke() -> void:
 		if tpm:
 			tpm.scale_min = 1.3
 			tpm.scale_max = 2.8
+			tpm.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_SPHERE   # radius set live from speed
 			var grad := Gradient.new()
 			grad.set_color(0, Color(0.82, 0.80, 0.77, 0.075))
 			grad.set_color(1, Color(0.82, 0.80, 0.77, 0.0))
@@ -1717,6 +1750,31 @@ func _soften_smoke() -> void:
 			tpm.color_ramp = gt
 		ts.amount = 150   # many faint puffs merge into one plume; few strong ones read as dots
 		ts.lifetime = 1.7
+		# the default 30 Hz particle step drops each step's puffs in ONE spot: at speed
+		# that is a row of grey balls metres apart. 0 = step every drawn frame.
+		ts.fixed_fps = 0
+	# landing dust: the arcade bodies' flat tan squares read as a rendering glitch next
+	# to scanned rock. Same emitters, drawn as soft sand-coloured puffs that fade out.
+	for d in [_dust, _dust_big, _dust_dir]:
+		if d == null:
+			continue
+		var qm := d.draw_pass_1 as QuadMesh
+		qm.size = Vector2(1.5, 1.5)
+		qm.material = _fx_puff_mat(Color(1, 1, 1, 1), false)
+		var dpm := d.process_material as ParticleProcessMaterial
+		var dgrad := Gradient.new()
+		dgrad.set_color(0, Color(0.66, 0.50, 0.36, 0.22))
+		dgrad.set_color(1, Color(0.66, 0.50, 0.36, 0.0))
+		var dgt := GradientTexture1D.new()
+		dgt.gradient = dgrad
+		dpm.color_ramp = dgt
+		d.fixed_fps = 0
+	# backfire: same story — additive flat squares stack into a blocky white mosaic.
+	# Small soft flame licks at the tailpipes instead.
+	for bf in _backfire:
+		var bq := bf.draw_pass_1 as QuadMesh
+		bq.size = Vector2(0.9, 0.9)
+		bq.material = _fx_puff_mat(Color(1, 1, 1, 0.5), true)
 
 ## Ride height follows the suspension tune (set after _ready by HCMain), so this is
 ## re-run from apply_wheel_size.
@@ -3391,7 +3449,8 @@ func _update_skids(delta: float, braking: float) -> void:
 	if not _skid:
 		return
 	_skid_scuff = maxf(_skid_scuff - delta, 0.0)
-	var drift: bool = drifting and _grounded
+	# a straight-line handbrake locks the REAR pair only, so it marks like a drift
+	var drift: bool = (drifting or (handbraking and linear_velocity.length() > 8.0)) and _grounded
 	var lock: bool = braking > 0.7 and linear_velocity.length() > 15.0 and _grounded
 	var scuff: bool = _skid_scuff > 0.0 and _grounded
 	var w: float = clampf(_wheel_base_width * 0.85, 0.3, 0.9)

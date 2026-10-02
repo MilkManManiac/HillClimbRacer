@@ -13,7 +13,10 @@ const SEG_MIN := 0.28          # accumulate contacts until a segment is this lon
 const SEG_MAX := 4.0           # longer than this = respawn/teleport, break the strip
 const LIFT := 0.03             # metres above the road along its normal (z-fight guard)
 
-var tint := Color(0.05, 0.05, 0.06)   # rubber RGB; cosmetics recolor future marks
+# rubber RGB; cosmetics recolor future marks. Black on purpose: the ribbon is unshaded
+# and blends in linear light, where the canyon's asphalt is only ~0.02 — a merely
+# "dark" tint lands within a hair of the road (or above it: pale tape, not rubber).
+var tint := Color(0.002, 0.002, 0.002)
 
 var _mmi: MultiMeshInstance3D
 var _mm: MultiMesh
@@ -76,8 +79,9 @@ func lay(track: int, pos: Vector3, n: Vector3, width: float, strength: float) ->
 		return
 	right = right.normalized()
 	var mid := (_last[track] + pos) * 0.5 + n * LIFT
-	# slight overlap along the direction of travel hides the joint between segments
-	var xf := Transform3D(Basis(right * width, n, dir * (len + 0.06)), mid)
+	# segments butt end to end with NO overlap: they are alpha-blended, so any overlap
+	# draws twice as dark and the mark reads as a row of dashes instead of one ribbon
+	var xf := Transform3D(Basis(right * width, n, dir * len), mid)
 	_mm.set_instance_transform(_idx, xf)
 	_mm.set_instance_color(_idx, Color(tint.r, tint.g, tint.b, clampf(strength, 0.0, 1.0)))
 	_mm.set_instance_custom_data(_idx, Color(_clock, 0.0, 0.0, 0.0))
@@ -111,7 +115,7 @@ varying vec4 v_col;
 void vertex() {
 	float age = u_now - INSTANCE_CUSTOM.x;
 	float fade = clamp(1.0 - age / %f, 0.0, 1.0);
-	v_col = vec4(COLOR.rgb, COLOR.a * fade * 0.78);
+	v_col = vec4(COLOR.rgb, COLOR.a * fade * 0.9);
 }
 void fragment() {
 	float lat = abs(UV.x - 0.5) * 2.0;

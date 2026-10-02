@@ -103,6 +103,7 @@ static func _tune_concept_materials(root: Node3D) -> void:
 				# plain matte rubber: the tread/sidewall normal maps sparkle like static
 				# under a low sun at chase-camera distance
 				m.normal_enabled = false
+				m.ao_enabled = false   # see Rim2
 				m.roughness = 0.92
 				m.metallic = 0.0
 			elif nm == "Rim2":
@@ -112,6 +113,19 @@ static func _tune_concept_materials(root: Node3D) -> void:
 				m.albedo_color = Color(0.70, 0.71, 0.73)
 				m.metallic = 0.35
 				m.roughness = 0.45
+				# the model's baked occlusion map is near-black across the wheel, and
+				# occlusion scales ambient light — which is ALL the light a wheel on the
+				# car's shaded side gets. With it on, that whole side's wheels render as
+				# black discs (checked by render, both ways).
+				m.ao_enabled = false
+			elif nm == "Rim1":
+				# the spoke faces ship as pure black paint (albedo 0.001): in the arch's
+				# shade the whole wheel collapsed into one dark disc. Gunmetal keeps the
+				# two-tone wheel but leaves the spokes something to catch the light with.
+				m.albedo_color = Color(0.20, 0.205, 0.215)
+				m.metallic = 0.3
+				m.roughness = 0.5
+				m.ao_enabled = false   # see Rim2
 			elif nm == "Brakelight":
 				m.emission_energy_multiplier = CONCEPT_TAIL_IDLE
 			elif nm.begins_with("Interior 3"):
