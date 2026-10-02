@@ -159,6 +159,9 @@ const PK_FUEL_VALUE := 14.0      # fuel units per can (deliberately small — a 
 const PK_FUEL_SLOT := 8          # a fuel can every Nth slot (~128 m); the rest are coins
 const PK_ARC_COINS := 6          # coins arced over each gap jump
 const PK_ARC_PEAK := 7.0         # arc apex above the launch level
+## Time trials switch the coin/fuel line off (HCMain sets this per run mode): there is
+## no money or fuel in a trial, and a coin weave would only read as a fake racing line.
+var pickups_enabled := true
 var _pk_root: Node3D
 var _pk_frontier: float = 0.0    # arc-length spawned up to
 var _pk_init := false
@@ -1097,6 +1100,23 @@ func spawn_pos() -> Vector3:
 	var i := mini(28, _n - 1)   # ~110 m in, still inside the opening straight
 	return Vector3(_px[i], height_at(_px[i], _pz[i]) + 4.0, _pz[i])
 
+## Arc-length of spawn_pos() — where a fresh run's `progress` starts counting from.
+func spawn_s() -> float:
+	return float(mini(28, _n - 1)) * STEP
+
+## Road frame at arc-length s for placing set dressing (start/finish gates): centre
+## point on the deck, the road's right vector, and the drivable half-width there.
+## Pure read — unlike progress() it never touches the stateful projection hint.
+func frame_at_s(s: float) -> Dictionary:
+	var i := clampi(int(round(s / STEP)), 0, maxi(_n - 1, 0))
+	if _n == 0:
+		return {"pos": Vector3.ZERO, "right": Vector3.RIGHT, "half": road_half}
+	return {
+		"pos": point_at_s(s),
+		"right": Vector3(cos(_ph[i]), 0.0, sin(_ph[i])),
+		"half": lerpf(road_half, road_half_turn, _pw[i]),
+	}
+
 ## Distance-along-road (arc-length) at a world position — drives distance/money.
 func progress(pos: Vector3) -> float:
 	return _project(pos.x, pos.z).s
@@ -1526,6 +1546,10 @@ func _process(_delta: float) -> void:
 ## Frees pickups that fall well behind. Deterministic + respawnable (see reset_pickups).
 func _update_pickups() -> void:
 	if _target == null:
+		return
+	if not pickups_enabled:
+		if not _pk_nodes.is_empty():
+			reset_pickups()
 		return
 	if _pk_root == null:
 		_pk_root = Node3D.new()

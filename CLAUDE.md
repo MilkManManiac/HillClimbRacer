@@ -28,7 +28,8 @@ first so you can checkpoint and diff your own work.
 <console> --headless --path . tests/MapProbe.tscn       # all three maps boot + drive
 <console> --headless --path . tests/TitleFlowProbe.tscn # title → map click → START → alive
 <console> --headless --path . tests/CarBodyProbe.tscn   # GLB car bodies load/scale
-<console> --headless --path . tests/TrialProbe.tscn     # time-trial: timer/record/ghost/medals
+<console> --headless --path . tests/TrialProbe.tscn     # weekly trial: fixed car, line-to-line clock, wreck restart, results, save
+<console> --headless --path . tests/GhostShareProbe.tscn # ghost file export/import round-trip (rival + splits)
 <console> --headless --path . tests/AudioProbe.tscn     # synth buffers non-silent, non-clipping
 <console> --headless --path . tests/StuntProbe.tscn     # overpass/corkscrew surfaces + canyon pop regression
 <console> --headless --path . tests/LoopProbe.tscn      # vertical loop: fast car inverts, slow car detaches
@@ -36,6 +37,11 @@ first so you can checkpoint and diff your own work.
 <console> --headless --path . tests/BalloonProbe.tscn   # Party Balloons: fall cap, drain/pops, save round-trip
 <console> --headless --path . tests/SkidProbe.tscn      # skid ribbons: pool cap, strip breaks, brake-lock, reset
 ```
+When changing a trial track's car, tune or length (`HCTimeTrial.TRACKS`), run
+`tests/TrialBot.tscn` — a bot lap that prints time/average speed/wrecks — and re-set
+the medal times from it. `tests/TrialShot.tscn` (no `--headless`, ~1 min) renders the
+trial screens.
+
 When editing a map's `stunts` string, run `tests/LoopScan.tscn` first — it sweeps
 anchor placements against generator collisions (the `creep_xing` tripwire).
 

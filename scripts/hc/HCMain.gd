@@ -166,16 +166,46 @@ var _sprint_next_checkpoint := 0.0
 var _sprint_lbl: Label
 
 # --- time trial mode (title-screen "TIME TRIAL" toggle) -------------------------
-# Orthogonal to sprint: sprint is a per-map property (canyon only) and always wins
-# on maps that declare it; trial is a player-picked global toggle that only takes
-# effect on maps WITHOUT their own mode (see HCTimeTrialScript.FINISH_M / _reset_run_mode).
-# Crossing the finish line does not end the run — it banks a record/ghost and the
-# drive continues classic-style, so trial composes with the existing death/shop flow
-# instead of replacing it.
+# The weekly trial is its own game, not a skin on classic: the track picks the car and
+# its setup (HCTimeTrialScript.TRACKS), so everyone's time is comparable. No fuel, no
+# money, no shop. The clock runs from a start line to a finish line; a wreck restarts
+# the run by itself; crossing the finish ENDS the run on a results panel. Trial wins
+# over a map's own mode (canyon is a sprint in classic and a trial here). The garage
+# pick (_garage_vehicle / _garage_map) is remembered untouched while trial is on.
 var _run_mode := "classic"        # "classic" | "trial" — persisted, defaults to classic
-var _trial_active := false        # true this run iff sprint isn't active + trial supports _map
+var _trial_active := false        # true this run iff trial mode is on and the map has a track
 var _trial_time := 0.0
+var _trial_running := false       # start line crossed, finish line not yet
 var _trial_finished := false
+var _trial_start_s := 0.0         # arc-length of the start line
+var _trial_finish_s := 0.0        # arc-length of the finish line
+var _trial_run_id := 0            # bumped every reset — a stale wreck-restart timer checks it
+var _ghost_clock := 0.0           # ghost playback time; keeps running after the finish so a
+                                  # slower ghost can still be watched coming home
+var _run_splits: Array = []       # this run's split times so far
+var _best_splits := {}            # "<map>|<vehicle>" -> Array[float], the best run's splits, persisted
+var _garage_vehicle := "minivan"  # classic-mode ride, restored when trial mode is switched off
+var _garage_map := "hills"        # classic-mode map, same
+var _trial_props: Node3D          # start/finish gates + split markers for the live track
+var _trial_props_for := 0         # instance id of the terrain they were built on
+var _split_lbl: Label             # HUD: gap to your best at the last split
+var _split_rival_lbl: Label       # HUD: gap to the imported rival at the last split
+var _split_tween: Tween
+var _results_layer: CanvasLayer   # finish panel (time / gap / medal / retry)
+var _results_panel: PanelContainer
+var _results_time_lbl: Label
+var _results_gap_lbl: Label
+var _results_medal_lbl: Label
+var _results_rival_lbl: Label
+var _results_retry_btn: Button
+var _title_classic_box: VBoxContainer   # title sections only classic uses (map grid, vehicle strip)
+var _title_trial_box: VBoxContainer     # title sections only trial uses (weekly card, ghosts)
+var _title_sub_lbl: Label
+var _weekly_stat_lbl: Label
+var _hint_lbl: Label              # bottom-left control legend (differs per mode)
+var _fuel_bg: ColorRect
+var _health_bg: ColorRect
+const TRIAL_WRECK_DELAY := 0.7    # s between a trial wreck and the automatic restart
 var _trial_splits_hit := {}       # split index (int) -> true, cleared every run
 var _trial_result := ""           # last finish summary line, folded into the wreck screen
 var _ghost: Node3D                # HCGhostScript instance (your personal best); duck-typed .call()
@@ -449,20 +479,22 @@ func _collect_save() -> Dictionary:
 			"time": float(rd.get("time", 0.0)),
 			"data": rd.get("data", []),
 			"name": str(rd.get("name", "")),
+			"splits": rd.get("splits", []),
 		}
 	return {
 		"version": 1,
 		"money": money,
 		"levels": levels_out,
 		"owned": owned_out,
-		"vehicle": _vehicle,
+		"vehicle": _garage_vehicle,   # the GARAGE pick — trial mode's fixed car is never saved over it
 		"cosm_owned": cosm_owned_out,
 		"cosm_color": cosm_color_out,
-		"map": _map,
+		"map": _garage_map,
 		"best": best_out,
 		"body_kits": _body_kits.duplicate(),
 		"run_mode": _run_mode,
 		"best_time": best_time_out,
+		"best_splits": _best_splits.duplicate(true),
 		"ghosts": ghosts_out,
 		"ghost_version": HCGhostScript.VERSION,
 		"rivals": rivals_out,
@@ -514,6 +546,10 @@ func _apply_save(d: Dictionary) -> void:
 	var best_time_in: Dictionary = d.get("best_time", {})
 	for k in best_time_in:
 		_best_time[k] = float(best_time_in[k])
+	var best_splits_in: Dictionary = d.get("best_splits", {})
+	for k in best_splits_in:
+		if best_splits_in[k] is Array:
+			_best_splits[k] = best_splits_in[k]
 	# ghosts are versioned separately from the save schema itself: a mismatch means
 	# HCGhostScript's sample layout changed since this save was written, so every stored
 	# ghost is dropped (best TIMES still restore above — only the visual replay is lost)
@@ -532,8 +568,16 @@ func _apply_save(d: Dictionary) -> void:
 						"time": float(rd.get("time", 0.0)),
 						"data": rd["data"],
 						"name": str(rd.get("name", "")),
+						"splits": rd.get("splits", []),
 					}
 	master_volume = clampf(float(d.get("volume", master_volume)), 0.0, 1.0)
+	# the save holds the garage picks; trial mode swaps in the weekly track + its car
+	_garage_vehicle = _vehicle
+	_garage_map = _map
+	if _run_mode == "trial":
+		_map = HCTimeTrialScript.WEEKLY
+		_vehicle = HCTimeTrialScript.car_for(_map)
+		_levels = _all_levels[_vehicle]
 
 ## Write the full save snapshot to disk. Cheap enough to call on every purchase/switch/
 ## death — it's a few hundred bytes of JSON, not a hot-path concern.
@@ -591,6 +635,8 @@ func _ready() -> void:
 	_build_pause_menu()
 	_juice_buttons_in(_pause_layer)
 	_build_volume_toast()
+	_build_results_panel()
+	_juice_buttons_in(_results_layer)
 	_apply_upgrades()
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 	_build_start_menu()   # title + how-to-play; pauses the game until you hit START
@@ -930,7 +976,7 @@ func _setup_terrain_and_car() -> void:
 	_car = RigidBody3D.new()
 	_car.set_script(HCCarScript)
 	_car.set("vehicle_type", _vehicle)   # set BEFORE add_child so _ready builds the right ride
-	_car.set("body_glb", str(_body_kits.get(_vehicle, "")))   # imported shell, if one is picked
+	_car.set("body_glb", _body_for(_vehicle))   # imported shell, if one is picked
 	add_child(_car)
 	_car.set("road_half", _terrain.get("road_half") if USE_TRACK else _terrain.get("road_half_width"))
 	_car.set("terrain", _terrain)
@@ -956,6 +1002,16 @@ func _setup_terrain_and_car() -> void:
 	add_child(_audio)
 	_audio.call("setup", _car)
 	_apply_volume()
+
+## Imported body shell for a ride — always the stock body in a trial, because a kit
+## re-fits the wheel stance to its model and the trial car must be identical for everyone.
+func _body_for(vk: String) -> String:
+	return "" if _is_trial() else str(_body_kits.get(vk, ""))
+
+## Trial mode is on AND the active map has a trial track. The single test every
+## "which rules apply" decision goes through (car setup, fuel, shop, HUD).
+func _is_trial() -> bool:
+	return _run_mode == "trial" and HCTimeTrialScript.supports(_map)
 
 ## Build the distant-scenery rig once at boot. Independent of the terrain node's
 ## identity (unlike _terrain/_car, it's never freed/rebuilt on a map switch — see
@@ -1052,6 +1108,8 @@ func _apply_map() -> void:
 	_cam_heading = Vector3(0, 0, -1)
 	_cam_look_ready = false
 	_was_dead = false
+	if _run_mode != "trial":
+		_garage_map = _map
 	_update_map_row()
 	_save_game()   # persist the map selection
 	if _shop and _shop.visible:
@@ -1091,16 +1149,10 @@ func _refresh_map_buttons() -> void:
 		var stat: Label = _map_card_stat_lbl[mk]
 		var best_m := int(float(_best.get(mk, 0.0)))
 		var line := "Best: %d m" % best_m
-		if HCTimeTrialScript.supports(mk):
-			var bt: float = float(_best_time.get(_trial_key(mk, _vehicle), -1.0))
-			if bt >= 0.0:
-				var medal := HCTimeTrialScript.medal_for(mk, bt)
-				line += "   ⏱ %s %s" % [HCTimeTrialScript.format_time(bt), HCTimeTrialScript.medal_glyph(medal)]
-			else:
-				line += "   ⏱ no trial time yet"
-		elif MAPS[mk].mode == "sprint":
+		if MAPS[mk].mode == "sprint":
 			line += "   (sprint mode)"
 		stat.text = line
+	_refresh_weekly_card()
 	_refresh_ghost_row()
 
 ## Update the title-screen GHOSTS status line for the CURRENTLY SELECTED map (rivals
@@ -1162,13 +1214,14 @@ func _process(delta: float) -> void:
 	var d: bool = _car.get("dead")
 	if d and not _was_dead:
 		_was_dead = true
+		if _trial_active:
+			_on_trial_wreck()
+			return
 		_last_earned = int(float(_car.get("distance")) * MONEY_PER_M * _cash_mult())
 		money += _last_earned
 		var dist_now: float = _car.get("distance")
 		if dist_now > float(_best.get(_map, 0.0)):
 			_best[_map] = dist_now   # new PB on this map
-		if _ghost and _trial_active and not _trial_finished:
-			_ghost.call("stop_recording")   # crashed before the line — this attempt's recording is dead weight
 		_save_game()   # persist the bank + best BEFORE the shop even opens
 		if _audio:
 			_audio.call("play_wreck")
@@ -1323,6 +1376,8 @@ func _on_balloon_pop() -> void:
 ## Combo juice: every chained trick thumps the combo label with an escalating blip,
 ## a bank flashes the score gold, a drop stings. All audio stays _audio-guarded.
 func _on_car_combo(kind: String, _amount: int, chain: int) -> void:
+	if _trial_active:
+		return   # no score in a trial — the clock is the only number on screen
 	if _audio:
 		match kind:
 			"trick":
@@ -1353,26 +1408,43 @@ func _on_car_combo(kind: String, _amount: int, chain: int) -> void:
 
 ## Reseed BOTH alternate run modes for the (possibly new) active map/vehicle: sprint's
 ## countdown (opt-in per map via MAPS[_map].mode — classic maps stay inactive, no timer
-## shown, no death-on-zero) and time-trial's timer/splits/ghost. Sprint always wins on
-## maps that declare it (canyon) — the title-screen Classic/Time Trial toggle only takes
-## effect on maps that don't have their own mode, so canyon always plays like canyon
-## regardless of _run_mode.
+## shown, no death-on-zero) and the time trial's clock/lines/splits/ghosts. Trial wins
+## where both apply: canyon is a sprint in classic and this week's trial in trial mode.
+## Runs at boot before the HUD exists, so everything it touches is null-guarded.
 func _reset_run_mode_state() -> void:
-	_sprint_active = MAPS[_map].mode == "sprint"
+	_trial_run_id += 1
+	_trial_active = _is_trial()
+	_sprint_active = (not _trial_active) and MAPS[_map].mode == "sprint"
 	_sprint_time = SPRINT_TIME
 	_sprint_next_checkpoint = SPRINT_CHECKPOINT_M
-	_trial_active = (not _sprint_active) and _run_mode == "trial" and HCTimeTrialScript.supports(_map)
 	_trial_time = 0.0
+	_ghost_clock = 0.0
+	_trial_running = false
 	_trial_finished = false
 	_trial_splits_hit.clear()
+	_run_splits = []
 	_trial_result = ""
+	if _trial_active and _terrain and _terrain.has_method("spawn_s"):
+		_trial_start_s = float(_terrain.call("spawn_s")) + HCTimeTrialScript.START_RUNUP
+		_trial_finish_s = _trial_start_s + HCTimeTrialScript.length(_map)
+	if _car:
+		_car.set("infinite_fuel", _trial_active)
+		_car.set("autobrake", false)
+	if _terrain:
+		_terrain.set("pickups_enabled", not _trial_active)
+	_sync_trial_props()
+	_hide_results()
+	if _split_lbl:
+		_split_lbl.text = ""
+		_split_rival_lbl.text = ""
 	_load_ghost_for_current()
+	# recording starts when the car crosses the start line (see _update_trial), so the
+	# ghost's clock and the trial clock are the same clock
 	if _ghost:
-		if _trial_active and _car:
-			_ghost.call("start_recording", _car)
-		else:
-			_ghost.call("stop_recording")
-			_ghost.call("hide_ghost")
+		_ghost.call("stop_recording")
+		_ghost.call("hide_ghost")
+	if _rival_ghost:
+		_rival_ghost.call("hide_ghost")
 
 func _trial_key(map_key: String, vehicle_key: String) -> String:
 	return "%s|%s" % [map_key, vehicle_key]
@@ -1431,53 +1503,128 @@ func _update_sprint(delta: float) -> void:
 func _update_trial(delta: float) -> void:
 	if _ghost:
 		_ghost.call("tick_record", delta)   # no-op unless a recording is in progress
-	if not _trial_active or _car == null or bool(_car.get("dead")):
+	if not _trial_active or _car == null:
 		return
-	if not _trial_finished:
+	if _trial_running or _trial_finished:
+		_ghost_clock += delta
+		if _ghost:
+			_ghost.call("show_at", _ghost_clock)
+		if _rival_ghost:
+			_rival_ghost.call("show_at", _ghost_clock)   # never records — just plays back the imported file
+	if _trial_finished or bool(_car.get("dead")):
+		return
+	var dist: float = _car.get("distance")
+	# A line is crossed somewhere INSIDE a frame. Dividing the overshoot by the speed
+	# gives back the slice of the frame spent past the line, so start/split/finish times
+	# don't carry a frame of jitter (16 ms would swamp a "-0.02" gap).
+	var spd: float = maxf(_car.linear_velocity.length(), 1.0)
+	if not _trial_running:
+		if dist < _trial_start_s:
+			return
+		_trial_running = true
+		_trial_time = minf((dist - _trial_start_s) / spd, delta)
+		_ghost_clock = _trial_time
+		if _ghost:
+			_ghost.call("start_recording", _car)
+		if _audio:
+			_audio.call("play_click")
+	else:
 		_trial_time += delta
-		var dist: float = _car.get("distance")
-		var splits := HCTimeTrialScript.split_distances(_map)
-		for i in range(splits.size()):
-			if not _trial_splits_hit.has(i) and dist >= splits[i]:
-				_trial_splits_hit[i] = true
-				_car.set("trick_text", "SPLIT %d — %s" % [i + 1, HCTimeTrialScript.format_time(_trial_time)])
-				_car.set("_trick_timer", 1.6)
-				if _audio:
-					_audio.call("play_click")
-		if dist >= HCTimeTrialScript.finish_distance(_map):
-			_finish_trial()
-	if _ghost:
-		_ghost.call("show_at", _trial_time)
-	if _rival_ghost:
-		_rival_ghost.call("show_at", _trial_time)   # never records — just plays back the imported file
+	var offs := HCTimeTrialScript.split_offsets(_map)
+	for i in range(offs.size()):
+		var split_s: float = _trial_start_s + offs[i]
+		if not _trial_splits_hit.has(i) and dist >= split_s:
+			_trial_splits_hit[i] = true
+			var t_split: float = _trial_time - minf((dist - split_s) / spd, delta)
+			_run_splits.append(t_split)
+			_show_split(i, t_split)
+	if dist >= _trial_finish_s:
+		_trial_time -= minf((dist - _trial_finish_s) / spd, delta)
+		_finish_trial()
 
-## Bank a finished trial run: compare against the saved best, persist a new record +
-## ghost if this run is faster (or the first clean finish on this map+vehicle), and
-## announce it through the same trick-text HUD channel sprint checkpoints use.
+## Flash the gap to your best run (and to the imported rival) at split `i`. Green =
+## ahead, red = behind. With no best yet there is nothing to compare, so the big number
+## stays empty — the split's own elapsed time under the live clock just read as noise.
+func _show_split(i: int, t_split: float) -> void:
+	if _audio:
+		_audio.call("play_click")
+	if _split_lbl == null:
+		return
+	var best: Array = _best_splits.get(_trial_key(_map, _vehicle), [])
+	if i < best.size():
+		var d: float = t_split - float(best[i])
+		_split_lbl.text = HCTimeTrialScript.format_delta(d)
+		_split_lbl.add_theme_color_override("font_color", Color(0.45, 1.0, 0.55) if d < 0.0 else Color(1.0, 0.42, 0.38))
+	else:
+		_split_lbl.text = ""
+	var rd: Dictionary = _rival_data.get(_map, {})
+	var rs: Array = rd.get("splits", [])
+	if i < rs.size():
+		_split_rival_lbl.text = "%s  %s" % [str(rd.get("name", "RIVAL")), HCTimeTrialScript.format_delta(t_split - float(rs[i]))]
+	else:
+		_split_rival_lbl.text = ""
+	_split_lbl.modulate.a = 1.0
+	_split_rival_lbl.modulate.a = 1.0
+	if _split_tween and _split_tween.is_valid():
+		_split_tween.kill()
+	_split_tween = create_tween()
+	_split_tween.tween_interval(2.2)
+	_split_tween.tween_property(_split_lbl, "modulate:a", 0.0, 0.4)
+	_split_tween.parallel().tween_property(_split_rival_lbl, "modulate:a", 0.0, 0.4)
+
+## A trial wreck never opens the shop: a short beat so the crash reads, then the run
+## restarts by itself. Enter/Back restarts sooner. A wreck AFTER the finish line
+## (the car is braking itself to a stop) changes nothing — the results panel stays.
+func _on_trial_wreck() -> void:
+	if _audio:
+		_audio.call("play_wreck")
+	if _trial_finished:
+		return
+	_trial_running = false
+	if _ghost:
+		_ghost.call("stop_recording")   # this attempt's recording is dead weight
+	if _split_lbl:
+		if _split_tween and _split_tween.is_valid():
+			_split_tween.kill()
+		_split_lbl.text = "WRECKED"
+		_split_lbl.add_theme_color_override("font_color", Color(1.0, 0.42, 0.38))
+		_split_lbl.modulate.a = 1.0
+		_split_rival_lbl.text = ""
+	get_tree().create_timer(TRIAL_WRECK_DELAY).timeout.connect(_trial_wreck_restart.bind(_trial_run_id))
+
+## Timer callback for the automatic restart — a no-op if the player already restarted
+## (or switched car/map) in the meantime, which is what the run id is for.
+func _trial_wreck_restart(run_id: int) -> void:
+	if run_id == _trial_run_id and is_instance_valid(_car) and bool(_car.get("dead")):
+		_restart()
+
+## The finish line: stop the clock, bank a new record + its splits + its ghost if this
+## run is the fastest (or the first) on this track, brake the car to a stop and put the
+## results panel up. The run is over — the only ways on are Retry and Main Menu.
 func _finish_trial() -> void:
+	_trial_running = false
 	_trial_finished = true
 	var key := _trial_key(_map, _vehicle)
 	var prev: float = float(_best_time.get(key, -1.0))
 	var is_best: bool = prev < 0.0 or _trial_time < prev
-	var medal := HCTimeTrialScript.medal_for(_map, _trial_time)
-	var glyph := HCTimeTrialScript.medal_glyph(medal)
 	if is_best:
 		_best_time[key] = _trial_time
+		_best_splits[key] = _run_splits.duplicate()
 		if _ghost:
 			var data: Array = _ghost.call("recorded_data")
 			if data.size() > 0:
-				_ghost_data[key] = data   # this run becomes the new ghost others race against
-		_trial_result = "FINISH!  %s  —  NEW BEST!  %s" % [HCTimeTrialScript.format_time(_trial_time), glyph]
-		_car.set("trick_text", "🏁 NEW BEST  %s  %s" % [HCTimeTrialScript.format_time(_trial_time), glyph])
+				_ghost_data[key] = data   # this run becomes the ghost you (and friends) race
+		_trial_result = "FINISH  %s  NEW BEST" % HCTimeTrialScript.format_time(_trial_time)
 	else:
-		_trial_result = "FINISH!  %s   (best %s)  %s" % [HCTimeTrialScript.format_time(_trial_time), HCTimeTrialScript.format_time(prev), glyph]
-		_car.set("trick_text", "🏁 FINISH  %s  %s" % [HCTimeTrialScript.format_time(_trial_time), glyph])
-	_car.set("_trick_timer", 3.0)
+		_trial_result = "FINISH  %s  (best %s)" % [HCTimeTrialScript.format_time(_trial_time), HCTimeTrialScript.format_time(prev)]
 	if _ghost:
 		_ghost.call("stop_recording")
+	if _car:
+		_car.set("autobrake", true)
 	if _audio:
 		_audio.call("play_cash")
-	_save_game()   # bank the record/ghost immediately — don't wait for a death that may not come soon
+	_save_game()
+	_show_results(prev, is_best)
 
 # --- feel: speed-lines overlay ----------------------------------------------
 
@@ -1587,23 +1734,32 @@ func _init_levels() -> void:
 		_all_levels[vk] = d
 	_levels = _all_levels[_vehicle]
 
+## Upgrade levels for the trial car: the track's fixed setup, every other key at 0.
+func _trial_setup() -> Dictionary:
+	var setup: Dictionary = HCTimeTrialScript.setup_for(_map)
+	var out := {}
+	for k in UP_KEYS:
+		out[k] = int(setup.get(k, 0))
+	return out
+
 func _apply_upgrades() -> void:
 	if _car == null:
 		return
 	var v: Dictionary = VEHICLES[_vehicle]   # per-ride bases; upgrades ramp on top
+	var lv: Dictionary = _trial_setup() if _is_trial() else _levels
 	# starter is intentionally weak/slow; upgrades ramp it up hard
-	_car.set("engine_force", float(v.engine_base) + _levels.engine * float(v.engine_per))
+	_car.set("engine_force", float(v.engine_base) + lv.engine * float(v.engine_per))
 	# AERODYNAMICS (was Stretch): slippier body — raises top speed (soft cap tracks it).
 	# speed_cap = per-vehicle CEILING so maxed engines can't run away to absurd speeds
 	# (an engine-maxed F1 used to reach ~184 m/s); the ladder stays intact because each
 	# faster ride's cap sits above the previous one's.
-	_car.set("max_speed", minf(float(v.speed_base) + _levels.engine * float(v.speed_per) + _levels.stretch * 5.0, float(v.get("speed_cap", 60.0))))
+	_car.set("max_speed", minf(float(v.speed_base) + lv.engine * float(v.speed_per) + lv.stretch * 5.0, float(v.get("speed_cap", 60.0))))
 	if _car.has_method("apply_engine"):
-		_car.call("apply_engine", _levels.engine)
+		_car.call("apply_engine", lv.engine)
 	# fuel is the run timer — VERY low stock so you can barely move; two upgrades fix it:
 	#   Fuel Tank = capacity, Fuel Economy = slower burn. Heavy rides drink more (fuel_burn).
-	_car.set("max_fuel", float(v.fuel_base) + _levels.fuel * float(v.fuel_per))
-	_car.set("fuel_eff", float(v.fuel_burn) * maxf(1.0 - _levels.fueleff * 0.08, 0.45))
+	_car.set("max_fuel", float(v.fuel_base) + lv.fuel * float(v.fuel_per))
+	_car.set("fuel_eff", float(v.fuel_burn) * maxf(1.0 - lv.fueleff * 0.08, 0.45))
 	# intrinsic handling per ride (grip/gravity/steer); not touched by upgrades
 	_car.set("grip", float(v.grip))
 	_car.set("gravity_force", float(v.gravity))
@@ -1613,42 +1769,42 @@ func _apply_upgrades() -> void:
 	_car.set("drift_yaw_max", float(v.get("drift_yaw_max", 3.1)))
 	_car.set("drift_snap", float(v.get("drift_snap", 7.0)))
 	# Aerodynamics also carries momentum better — less speed scrubbed mid-drift.
-	_car.set("drift_scrub", float(v.get("drift_scrub", 0.9)) * maxf(1.0 - _levels.stretch * 0.1, 0.4))
+	_car.set("drift_scrub", float(v.get("drift_scrub", 0.9)) * maxf(1.0 - lv.stretch * 0.1, 0.4))
 	_car.set("slide_thresh", float(v.get("slide_thresh", 0.85)))
 	_car.set("com_height", float(v.get("com_height", -0.4)))
 	# DOWNFORCE (was Wide Body): a speed-scaled push into the road so the car plants and
 	# corners flatter at speed. Purely mechanical — does not change the car's size.
-	_car.set("downforce", float(_levels.wide) * 0.9)
+	_car.set("downforce", float(lv.wide) * 0.9)
 	if _car.has_method("apply_com"):
 		_car.call("apply_com")   # push the new CoM height into the rigid body
 	# Suspension softens landings (higher free-impact threshold) + shows the springs
-	_car.set("land_damage_speed", float(v.land_base) + _levels.suspension * 5.0 + _levels.wheels * 2.0)
+	_car.set("land_damage_speed", float(v.land_base) + lv.suspension * 5.0 + lv.wheels * 2.0)
 	if _car.has_method("apply_suspension"):
-		_car.call("apply_suspension", _levels.suspension)
+		_car.call("apply_suspension", lv.suspension)
 	# Bigger Wheels: more ride height + larger wheels (clearance over bumps).
 	# Per-ride growth — the monster's wheels balloon dramatically.
-	_car.set("suspension_rest", float(v.susp_rest) + _levels.wheels * float(v.susp_per))
-	_car.set("wheel_radius", float(v.wheel_rad) + _levels.wheels * float(v.wheel_per))
+	_car.set("suspension_rest", float(v.susp_rest) + lv.wheels * float(v.susp_per))
+	_car.set("wheel_radius", float(v.wheel_rad) + lv.wheels * float(v.wheel_per))
 	if _car.has_method("apply_wheel_size"):
 		_car.call("apply_wheel_size")
 	# Wings = lift / air time
 	if _car.has_method("apply_wings"):
-		_car.call("apply_wings", _levels.wings)
-	_car.set("dive_force", 30.0 + _levels.dive * 16.0)     # heavier dive to time ramps
+		_car.call("apply_wings", lv.wings)
+	_car.set("dive_force", 30.0 + lv.dive * 16.0)     # heavier dive to time ramps
 	# Durability = roll cage + armor (more health / frame)
-	_car.set("max_health", float(v.health_base) + _levels.durability * 18.0)
+	_car.set("max_health", float(v.health_base) + lv.durability * 18.0)
 	if _car.has_method("apply_cage"):
-		_car.call("apply_cage", _levels.durability)
+		_car.call("apply_cage", lv.durability)
 	if _car.has_method("apply_cans"):
-		_car.call("apply_cans", _levels.fuel)
+		_car.call("apply_cans", lv.fuel)
 	if _car.has_method("apply_airbrake"):
-		_car.call("apply_airbrake", _levels.dive)
+		_car.call("apply_airbrake", lv.dive)
 	# Rockets: rear nozzles + boost thrust (hold Ctrl)
 	if _car.has_method("apply_rockets"):
-		_car.call("apply_rockets", _levels.rockets)
+		_car.call("apply_rockets", lv.rockets)
 	# Party Balloons: roof bundle + airborne float (hold F)
 	if _car.has_method("apply_balloons"):
-		_car.call("apply_balloons", _levels.balloons)
+		_car.call("apply_balloons", lv.balloons)
 	# (Downforce/Aerodynamics are pure mechanical tuning now — no chassis resize.)
 	_apply_cosmetics()   # cosmetics, re-applied on every rebuild/swap
 
@@ -1698,8 +1854,8 @@ func _build_start_menu() -> void:
 	title_lbl.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.6))
 	title_lbl.add_theme_constant_override("outline_size", 6)
 	_bob_logo(title_lbl)   # slow bob/tilt flourish — purely cosmetic, tied to the ALWAYS-mode layer
-	var sub_lbl := _shop_label(box, "Drive as far as you can — or race the clock. Fuel is your timer.", 14, Color(0.68, 0.74, 0.86))
-	sub_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_title_sub_lbl = _shop_label(box, "", 14, Color(0.68, 0.74, 0.86))
+	_title_sub_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	box.add_child(HSeparator.new())
 
 	# scrollable middle: mode toggle + map cards + vehicle strip + control legend, so
@@ -1715,23 +1871,32 @@ func _build_start_menu() -> void:
 
 	_build_mode_toggle(scb)
 
-	_shop_label(scb, "SELECT MAP", 13, Color(0.6, 0.64, 0.72))
+	# trial-only sections: this week's track card + ghost sharing
+	_title_trial_box = VBoxContainer.new()
+	_title_trial_box.add_theme_constant_override("separation", 10)
+	scb.add_child(_title_trial_box)
+	_build_weekly_card(_title_trial_box)
+	_title_trial_box.add_child(HSeparator.new())
+	_build_ghost_row(_title_trial_box)
+
+	# classic-only sections: map grid + garage vehicle strip
+	_title_classic_box = VBoxContainer.new()
+	_title_classic_box.add_theme_constant_override("separation", 10)
+	scb.add_child(_title_classic_box)
+	_shop_label(_title_classic_box, "SELECT MAP", 13, Color(0.6, 0.64, 0.72))
 	var grid := GridContainer.new()
 	grid.columns = 2
 	grid.add_theme_constant_override("h_separation", 10)
 	grid.add_theme_constant_override("v_separation", 10)
-	scb.add_child(grid)
+	_title_classic_box.add_child(grid)
 	_map_btns.clear()
 	_map_card_stat_lbl.clear()
 	for mk in MAP_KEYS:
 		_build_map_card(grid, mk)
+	_title_classic_box.add_child(HSeparator.new())
+	_build_title_vehicle_row(_title_classic_box)
 	_refresh_map_buttons()
-
-	scb.add_child(HSeparator.new())
-	_build_ghost_row(scb)
-
-	scb.add_child(HSeparator.new())
-	_build_title_vehicle_row(scb)
+	_refresh_title_mode()
 
 	scb.add_child(HSeparator.new())
 	_shop_label(scb, "CONTROLS", 13, Color(0.6, 0.64, 0.72))
@@ -1746,7 +1911,7 @@ func _build_start_menu() -> void:
 	_nav_hint(hints, "R · Y", "Recover")
 	_nav_hint(hints, "Tab · ☰", "Garage")
 	_nav_hint(hints, "Esc", "Pause")
-	var tip := _shop_label(scb, "Drift corners by braking into the turn or flicking the wheel hard. Every upgrade changes HOW the car handles, not just the numbers — try them all in the Garage.", 12, Color(0.62, 0.66, 0.74))
+	var tip := _shop_label(scb, "Drift corners by braking into the turn or flicking the wheel hard.", 12, Color(0.62, 0.66, 0.74))
 	tip.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	tip.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 
@@ -1774,7 +1939,7 @@ func _build_mode_toggle(parent: Node) -> void:
 	_mode_btns.clear()
 	for mode_key in ["classic", "trial"]:
 		var b := Button.new()
-		b.text = "🏁  CLASSIC" if mode_key == "classic" else "⏱  TIME TRIAL"
+		b.text = "CLASSIC" if mode_key == "classic" else "WEEKLY TRIAL"
 		b.toggle_mode = true
 		b.custom_minimum_size = Vector2(170, 38)
 		b.add_theme_font_size_override("font_size", 15)
@@ -1789,10 +1954,69 @@ func _on_title_mode_button(mode_key: String) -> void:
 	if mode_key == _run_mode:
 		return
 	_run_mode = mode_key
-	_reset_run_mode_state()
+	# trial = this week's track in its fixed car; classic = whatever the garage had
+	var want_map: String = HCTimeTrialScript.WEEKLY if mode_key == "trial" else _garage_map
+	var want_veh: String = HCTimeTrialScript.car_for(want_map) if mode_key == "trial" else _garage_vehicle
+	if want_map != _map:
+		_map = want_map
+		_apply_map()
+	_swap_vehicle(want_veh)   # always rebuild: same ride can still differ by setup/body kit;
+	                          # also resets the run state and saves
 	_refresh_mode_buttons()
 	_refresh_map_buttons()
-	_save_game()
+	_refresh_title_vehicle_buttons()
+	_refresh_title_mode()
+	# hand focus back to START so Enter/A launches instead of re-toggling the mode
+	if _start_btn and is_instance_valid(_start_btn):
+		_start_btn.grab_focus()
+
+## Show the title sections that belong to the active mode and hide the other's.
+func _refresh_title_mode() -> void:
+	var trial := _run_mode == "trial"
+	if _title_trial_box and is_instance_valid(_title_trial_box):
+		_title_trial_box.visible = trial
+	if _title_classic_box and is_instance_valid(_title_classic_box):
+		_title_classic_box.visible = not trial
+	if _title_sub_lbl and is_instance_valid(_title_sub_lbl):
+		_title_sub_lbl.text = "One track. One car. Fastest time wins." if trial else "Drive as far as you can. Fuel is your timer."
+
+## "This week's track": the one card trial mode offers. Everything on it is read from
+## HCTimeTrialScript.TRACKS, so swapping the weekly track is a data edit.
+func _build_weekly_card(parent: Node) -> void:
+	var mk: String = HCTimeTrialScript.WEEKLY
+	var m: Dictionary = MAPS[mk]
+	var accent: Color = m.get("accent", Color(0.6, 0.62, 0.68))
+	var card := PanelContainer.new()
+	_style_panel(card, Color(0.09, 0.095, 0.12, 0.95), accent, 2, 12)
+	parent.add_child(card)
+	var cpad := MarginContainer.new()
+	for cm in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
+		cpad.add_theme_constant_override(cm, 16)
+	card.add_child(cpad)
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", 4)
+	cpad.add_child(vb)
+	_shop_label(vb, "WEEK %d  ·  THIS WEEK'S TRACK" % HCTimeTrialScript.week_of(mk), 12, Color(0.6, 0.64, 0.72))
+	_shop_label(vb, str(m.name).to_upper(), 30, accent)
+	var car_name := str(VEHICLES[HCTimeTrialScript.car_for(mk)].name)
+	_shop_label(vb, "%s, fixed tune   ·   %.1f km   ·   no fuel, no upgrades" % [car_name, HCTimeTrialScript.length(mk) / 1000.0], 15, Color(0.86, 0.88, 0.93))
+	vb.add_child(HSeparator.new())
+	_weekly_stat_lbl = _shop_label(vb, "", 15, Color(0.86, 0.88, 0.93))
+	_shop_label(vb, HCTimeTrialScript.ladder_text(mk), 12, Color(0.6, 0.64, 0.72))
+	_refresh_weekly_card()
+
+func _refresh_weekly_card() -> void:
+	if _weekly_stat_lbl == null or not is_instance_valid(_weekly_stat_lbl):
+		return
+	var mk: String = HCTimeTrialScript.WEEKLY
+	var bt: float = float(_best_time.get(_trial_key(mk, HCTimeTrialScript.car_for(mk)), -1.0))
+	if bt < 0.0:
+		_weekly_stat_lbl.text = "Your best:  no time set yet"
+		_weekly_stat_lbl.add_theme_color_override("font_color", Color(0.86, 0.88, 0.93))
+		return
+	var medal := HCTimeTrialScript.medal_for(mk, bt)
+	_weekly_stat_lbl.text = "Your best:  %s   %s" % [HCTimeTrialScript.format_time(bt), HCTimeTrialScript.medal_glyph(medal)]
+	_weekly_stat_lbl.add_theme_color_override("font_color", HCTimeTrialScript.medal_color(medal) if medal != "" else Color(0.86, 0.88, 0.93))
 
 func _refresh_mode_buttons() -> void:
 	for k in _mode_btns:
@@ -1928,6 +2152,7 @@ func _export_best_ghost() -> void:
 		"vehicle": _vehicle,
 		"time": time,
 		"sample_hz": HCGhostScript.SAMPLE_HZ,
+		"splits": _best_splits.get(key, []),   # outside the checksum: optional, older files lack it
 		"samples": data,
 		"checksum": HCGhostScript.checksum(data, time),
 	}
@@ -2008,11 +2233,16 @@ func import_rival_ghost_text(json_text: String, source_name: String) -> Dictiona
 	if expect_cs != HCGhostScript.checksum(samples, time_in):
 		return {"ok": false, "msg": "Ghost file failed its integrity check (corrupted?)."}
 	var vehicle_in := str(d.get("vehicle", ""))
+	var splits_in: Array = []
+	if d.get("splits") is Array:
+		for v in d["splits"]:
+			splits_in.append(float(v))
 	_rival_data[map_in] = {
 		"vehicle": vehicle_in,
 		"time": time_in,
 		"data": samples,
 		"name": source_name,
+		"splits": splits_in,
 	}
 	if map_in == _map:
 		_load_ghost_for_current()   # already on this map — swap the live rival in immediately
@@ -2947,8 +3177,8 @@ func _show_shop() -> void:
 		_restart_btn.call_deferred("grab_focus")
 
 func _toggle_shop() -> void:
-	if _shop == null:
-		return
+	if _shop == null or _is_trial():
+		return   # the trial car is fixed — there is nothing to buy or change
 	_shop.visible = not _shop.visible
 	if _shop.visible:
 		_shop_header.text = "GARAGE"
@@ -2983,6 +3213,8 @@ func _on_vehicle_button(vk: String) -> void:
 ## place — geometry differs — so we free & recreate, then re-wire and re-apply).
 func _swap_vehicle(vk: String) -> void:
 	_vehicle = vk
+	if _run_mode != "trial":
+		_garage_vehicle = vk
 	_levels = _all_levels[vk]   # switch to this ride's own upgrade tree
 	var was_visible := _shop and _shop.visible
 	if _terrain.is_connected("pickup_collected", _on_pickup_collected):
@@ -2998,7 +3230,7 @@ func _swap_vehicle(vk: String) -> void:
 	_car = RigidBody3D.new()
 	_car.set_script(HCCarScript)
 	_car.set("vehicle_type", _vehicle)
-	_car.set("body_glb", str(_body_kits.get(_vehicle, "")))   # imported shell, if one is picked
+	_car.set("body_glb", _body_for(_vehicle))   # imported shell, if one is picked
 	add_child(_car)
 	_car.set("road_half", _terrain.get("road_half") if USE_TRACK else _terrain.get("road_half_width"))
 	_car.set("terrain", _terrain)
@@ -3047,6 +3279,7 @@ func _fresh_start() -> void:
 	_body_kits = {}   # back to stock shells on every ride
 	_run_mode = "classic"
 	_best_time = {}
+	_best_splits = {}
 	_ghost_data = {}
 	_rival_data = {}
 	if save_enabled and FileAccess.file_exists(SAVE_PATH):
@@ -3234,9 +3467,9 @@ func _refresh_cosmetics() -> void:
 func _setup_hud() -> void:
 	var layer := CanvasLayer.new()
 	add_child(layer)
-	_bar_bg(layer, Vector2(28, 28), Color(0, 0, 0, 0.5))
+	_fuel_bg = _bar_bg(layer, Vector2(28, 28), Color(0, 0, 0, 0.5))
 	_fuel_bar = _bar(layer, Vector2(30, 30), Color(0.95, 0.8, 0.2))
-	_bar_bg(layer, Vector2(28, 56), Color(0, 0, 0, 0.5))
+	_health_bg = _bar_bg(layer, Vector2(28, 56), Color(0, 0, 0, 0.5))
 	_health_bar = _bar(layer, Vector2(30, 58), Color(0.9, 0.3, 0.3))
 	# balloon float charge: a slim strip tucked under health, shown only once the
 	# Party Balloons upgrade is owned (the roof bundle itself is the primary meter)
@@ -3326,6 +3559,24 @@ func _setup_hud() -> void:
 	_trial_sub_lbl.add_theme_color_override("font_color", Color(0.75, 0.8, 0.88))
 	_hud_outline(_trial_sub_lbl, 3)
 	layer.add_child(_trial_sub_lbl)
+	# split gap: the big green/red number a trial is actually played for
+	_split_lbl = Label.new()
+	_split_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	_split_lbl.position = Vector2(-200, 128)
+	_split_lbl.custom_minimum_size = Vector2(400, 0)
+	_split_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_split_lbl.add_theme_font_size_override("font_size", 46)
+	_hud_outline(_split_lbl, 7)
+	layer.add_child(_split_lbl)
+	_split_rival_lbl = Label.new()
+	_split_rival_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	_split_rival_lbl.position = Vector2(-200, 186)
+	_split_rival_lbl.custom_minimum_size = Vector2(400, 0)
+	_split_rival_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_split_rival_lbl.add_theme_font_size_override("font_size", 20)
+	_split_rival_lbl.add_theme_color_override("font_color", Color(1.0, 0.55, 0.5))
+	_hud_outline(_split_rival_lbl, 4)
+	layer.add_child(_split_rival_lbl)
 	_trick_lbl = Label.new()
 	_trick_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
 	_trick_lbl.position = Vector2(-240, 120)
@@ -3340,15 +3591,17 @@ func _setup_hud() -> void:
 	hint.position = Vector2(28, -34)
 	hint.add_theme_font_size_override("font_size", 13)
 	hint.add_theme_color_override("font_color", Color(0.8, 0.8, 0.85))
+	_hint_lbl = hint
 	hint.text = "KB: Shift/W drive • S brake • A/D steer • Ctrl boost • Space dive • F balloons • R recover • air W/S pitch, Q/E roll • Tab garage • Enter retry\nPad: RT throttle • LT brake • L-stick steer/pitch • R-stick roll • RB boost • LB dive • Ⓧ balloons • Y recover • Start garage • Ⓑ retry"
 	layer.add_child(hint)
 
-func _bar_bg(layer: CanvasLayer, pos: Vector2, col: Color) -> void:
+func _bar_bg(layer: CanvasLayer, pos: Vector2, col: Color) -> ColorRect:
 	var r := ColorRect.new()
 	r.position = pos
 	r.size = Vector2(224, 18)
 	r.color = col
 	layer.add_child(r)
+	return r
 
 func _bar(layer: CanvasLayer, pos: Vector2, col: Color) -> ColorRect:
 	var r := ColorRect.new()
@@ -3373,13 +3626,22 @@ func _update_hud() -> void:
 	if blv > 0:
 		var bcap := maxf(float(_car.get("balloon_cap")), 0.001)
 		_balloon_bar.size.x = 220.0 * clampf(float(_car.get("balloon_time")) / bcap, 0.0, 1.0)
+	# a trial shows the clock and the speed, nothing else: no fuel, no score, no combo
+	var trial := _trial_active
+	for n in [_fuel_bar, _fuel_bg, _health_bar, _health_bg, _score_lbl]:
+		n.visible = not trial
+	if _hint_lbl.visible == trial:
+		_hint_lbl.visible = not trial
 	var air: String = "  ✈ AIR" if _car.get("airborne") else ""
-	_info.text = "%d m    %d km/h%s" % [int(dist), int(_car.call("get_speed_kmh")), air]
+	if trial:
+		_info.text = "%d km/h" % int(_car.call("get_speed_kmh"))
+	else:
+		_info.text = "%d m    %d km/h%s" % [int(dist), int(_car.call("get_speed_kmh")), air]
 	_score_lbl.text = "SCORE %d" % int(_car.get("score"))
-	_trick_lbl.text = _car.get("trick_text")
+	_trick_lbl.text = "" if trial else str(_car.get("trick_text"))
 	# combo readout: pot + multiplier, thin drain bar for the grace window
 	var pot := float(_car.get("combo_pot"))
-	var combo_open := pot > 0.5
+	var combo_open := pot > 0.5 and not trial
 	_combo_lbl.visible = combo_open
 	_combo_bar.visible = combo_open
 	_combo_bar_bg.visible = combo_open
@@ -3398,28 +3660,202 @@ func _update_sprint_hud() -> void:
 	_sprint_lbl.text = "%d" % ceili(_sprint_time)
 	_sprint_lbl.add_theme_color_override("font_color", Color(1.0, 0.3, 0.3) if _sprint_time < 10.0 else Color(0.6, 1.0, 0.7))
 
-## Time-trial countdown-up: live timer + a small "to go / best / medals" readout.
-## Shares the sprint label's screen real estate (never both active on the same map)
-## so the top-center HUD zone never crowds two big timers at once.
+## Trial clock + one quiet line under it (distance left, your best). Shares the sprint
+## label's screen slot — the two modes are never active on the same run.
 func _update_trial_hud() -> void:
 	if not _trial_active or _car == null:
 		_trial_lbl.text = ""
 		_trial_sub_lbl.text = ""
 		return
-	if bool(_car.get("dead")) and not _trial_finished:
-		return   # freeze the last live reading through the death/shop transition
-	_trial_lbl.text = HCTimeTrialScript.format_time(_trial_time)
-	var key := _trial_key(_map, _vehicle)
-	var best: float = float(_best_time.get(key, -1.0))
-	var best_txt: String = ("best " + HCTimeTrialScript.format_time(best)) if best >= 0.0 else "no record yet"
 	if _trial_finished:
-		var medal := HCTimeTrialScript.medal_for(_map, _trial_time)
-		_trial_lbl.add_theme_color_override("font_color", HCTimeTrialScript.medal_color(medal) if medal != "" else Color(0.6, 1.0, 0.7))
-		_trial_sub_lbl.text = "FINISHED  %s   %s" % [HCTimeTrialScript.medal_glyph(medal), best_txt]
+		_trial_lbl.text = ""   # the results panel owns the time now
+		_trial_sub_lbl.text = ""
+		return
+	_trial_lbl.text = HCTimeTrialScript.format_time(_trial_time)
+	var best: float = float(_best_time.get(_trial_key(_map, _vehicle), -1.0))
+	var best_txt: String = ("best " + HCTimeTrialScript.format_time(best)) if best >= 0.0 else "no time set yet"
+	if _trial_running:
+		var remain: float = maxf(_trial_finish_s - float(_car.get("distance")), 0.0)
+		_trial_sub_lbl.text = "%d m to go   ·   %s" % [int(remain), best_txt]
 	else:
-		_trial_lbl.add_theme_color_override("font_color", Color(1, 1, 1))
-		var remain: float = maxf(HCTimeTrialScript.finish_distance(_map) - float(_car.get("distance")), 0.0)
-		_trial_sub_lbl.text = "%dm to go   %s   %s" % [int(remain), best_txt, HCTimeTrialScript.ladder_text(_map)]
+		_trial_sub_lbl.text = "%s   ·   Enter restarts" % best_txt
+
+# --- trial: finish panel -----------------------------------------------------------
+
+## Built once, hidden. Sits high on the screen and does not dim it, so the car rolling
+## to a stop (and a slower ghost still coming home) stay visible underneath.
+func _build_results_panel() -> void:
+	_results_layer = CanvasLayer.new()
+	_results_layer.layer = 11   # above the HUD and shop, below pause (15) and title (20)
+	_results_layer.visible = false
+	add_child(_results_layer)
+	var center := CenterContainer.new()
+	center.set_anchors_preset(Control.PRESET_FULL_RECT)
+	center.theme = _ui_theme
+	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_results_layer.add_child(center)
+	var panel := PanelContainer.new()
+	panel.custom_minimum_size = Vector2(440, 0)
+	_style_panel(panel, Color(0.07, 0.075, 0.1, 0.94), Color(0.4, 0.44, 0.55), 1, 14)
+	center.add_child(panel)
+	_results_panel = panel
+	var pad := MarginContainer.new()
+	for m in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
+		pad.add_theme_constant_override(m, 22)
+	panel.add_child(pad)
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 6)
+	pad.add_child(box)
+	var head := _shop_label(box, "FINISH", 14, Color(0.6, 0.64, 0.72))
+	head.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_results_time_lbl = _shop_label(box, "", 58, Color(1, 1, 1))
+	_results_time_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_results_gap_lbl = _shop_label(box, "", 22, Color(1, 1, 1))
+	_results_gap_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_results_medal_lbl = _shop_label(box, "", 15, Color(0.75, 0.8, 0.88))
+	_results_medal_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_results_rival_lbl = _shop_label(box, "", 15, Color(1.0, 0.55, 0.5))
+	_results_rival_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	box.add_child(HSeparator.new())
+	_results_retry_btn = _menu_button(box, "RETRY   (Enter / Back)", _restart)
+	_menu_button(box, "MAIN MENU", _go_to_main_menu)
+
+func _show_results(prev_best: float, is_best: bool) -> void:
+	if _results_layer == null:
+		return
+	var medal := HCTimeTrialScript.medal_for(_map, _trial_time)
+	_results_time_lbl.text = HCTimeTrialScript.format_time(_trial_time)
+	_results_time_lbl.add_theme_color_override("font_color", HCTimeTrialScript.medal_color(medal) if medal != "" else Color(1, 1, 1))
+	if prev_best < 0.0:
+		_results_gap_lbl.text = "FIRST TIME ON THE BOARD"
+		_results_gap_lbl.add_theme_color_override("font_color", Color(0.45, 1.0, 0.55))
+	elif is_best:
+		_results_gap_lbl.text = "NEW BEST   %s" % HCTimeTrialScript.format_delta(_trial_time - prev_best)
+		_results_gap_lbl.add_theme_color_override("font_color", Color(0.45, 1.0, 0.55))
+	else:
+		_results_gap_lbl.text = "%s   off your best %s" % [HCTimeTrialScript.format_delta(_trial_time - prev_best), HCTimeTrialScript.format_time(prev_best)]
+		_results_gap_lbl.add_theme_color_override("font_color", Color(1.0, 0.42, 0.38))
+	# medal earned, plus what the next one up costs
+	var ladder: Dictionary = HCTimeTrialScript.MEDALS.get(_map, {})
+	var next_up := ""
+	for tier in ["bronze", "silver", "gold"]:
+		if ladder.has(tier) and _trial_time > float(ladder[tier]):
+			next_up = "%s at %s" % [tier, HCTimeTrialScript.format_time(float(ladder[tier]))]
+			break
+	var medal_txt: String = (HCTimeTrialScript.medal_glyph(medal) + " MEDAL") if medal != "" else "no medal"
+	_results_medal_lbl.text = medal_txt if next_up == "" else "%s   ·   next: %s" % [medal_txt, next_up]
+	var rd: Dictionary = _rival_data.get(_map, {})
+	_results_rival_lbl.visible = rd.has("data")
+	if rd.has("data"):
+		_results_rival_lbl.text = "%s   %s" % [str(rd.get("name", "RIVAL")), HCTimeTrialScript.format_delta(_trial_time - float(rd.get("time", 0.0)))]
+	_results_layer.visible = true
+	_animate_panel_in(_results_panel, false)
+	_results_retry_btn.call_deferred("grab_focus")
+
+func _hide_results() -> void:
+	if _results_layer:
+		_results_layer.visible = false
+
+# --- trial: start/finish gates + split markers -----------------------------------------
+
+## Keep the gate props in step with the live track: built when a trial starts on a
+## terrain that doesn't have them yet, freed when the mode or the map moves on. Keyed on
+## the terrain node itself because every map switch builds a fresh one.
+func _sync_trial_props() -> void:
+	var want: int = _terrain.get_instance_id() if (_trial_active and _terrain and _terrain.has_method("frame_at_s")) else 0
+	if want == _trial_props_for and (want == 0 or is_instance_valid(_trial_props)):
+		return
+	if is_instance_valid(_trial_props):
+		_trial_props.queue_free()
+	_trial_props = null
+	_trial_props_for = want
+	if want == 0:
+		return
+	_trial_props = Node3D.new()
+	add_child(_trial_props)
+	var accent: Color = MAPS[_map].get("accent", Color(0.9, 0.5, 0.2))
+	_build_gate(_trial_start_s, "start", accent)
+	_build_gate(_trial_finish_s, "finish", accent)
+	for off in HCTimeTrialScript.split_offsets(_map):
+		_build_gate(_trial_start_s + off, "split", accent)
+
+## One arch across the road at arc-length s, tilted to the road's own grade. "start" and
+## "finish" get heavy posts, a chequered banner and a chequered strip on the tarmac;
+## "split" is a slim glowing hoop you only need to notice, not read. Visual only — no
+## collision, so nothing here can ever touch the car or the camera ray.
+func _build_gate(s: float, kind: String, accent: Color) -> void:
+	var fr: Dictionary = _terrain.call("frame_at_s", s)
+	var pos: Vector3 = fr.pos
+	var right: Vector3 = (fr.right as Vector3).normalized()
+	var fwd: Vector3 = (_terrain.call("point_at_s", s + 2.0) as Vector3) - (_terrain.call("point_at_s", s - 2.0) as Vector3)
+	if fwd.length() < 0.01:
+		fwd = right.cross(Vector3.UP) * -1.0
+	fwd = fwd.normalized()
+	var up: Vector3 = (-fwd).cross(right).normalized()   # z × x = y, with local -z = forward
+	var gate := Node3D.new()
+	_trial_props.add_child(gate)
+	gate.global_transform = Transform3D(Basis(right, up, -fwd).orthonormalized(), pos)
+	var half: float = float(fr.half) + 2.0   # posts stand just outside the drivable edge
+	var heavy := kind != "split"
+	var post_w: float = 0.9 if heavy else 0.35
+	var height: float = 10.0 if heavy else 7.5
+	var frame_mat := StandardMaterial3D.new()
+	frame_mat.albedo_color = Color(0.13, 0.13, 0.15) if heavy else accent
+	if not heavy:
+		frame_mat.emission_enabled = true
+		frame_mat.emission = accent
+		frame_mat.emission_energy_multiplier = 0.9   # higher blows out to white under the glow pass
+	for side in [-1.0, 1.0]:
+		var post := MeshInstance3D.new()
+		var pm := BoxMesh.new()
+		pm.size = Vector3(post_w, height, post_w)
+		post.mesh = pm
+		post.material_override = frame_mat
+		post.position = Vector3(side * half, height * 0.5 - 0.5, 0)   # sunk a little: no gap on a crown
+		gate.add_child(post)
+	var beam := MeshInstance3D.new()
+	var bm := BoxMesh.new()
+	bm.size = Vector3(half * 2.0 + post_w, post_w, post_w)
+	beam.mesh = bm
+	beam.material_override = frame_mat
+	beam.position = Vector3(0, height - 0.5 - post_w * 0.5, 0)
+	gate.add_child(beam)
+	if not heavy:
+		return
+	# chequered banner under the beam (both faces) + the same pattern laid on the road
+	var banner_h := 2.0
+	var cols: int = maxi(int(round(half * 2.0 / (banner_h * 0.5))), 4)
+	var check_mat := _checker_material(cols, 2, accent if kind == "start" else Color(0.96, 0.96, 0.96))
+	var banner := MeshInstance3D.new()
+	var qm := QuadMesh.new()
+	qm.size = Vector2(half * 2.0, banner_h)
+	banner.mesh = qm
+	banner.material_override = check_mat
+	banner.position = Vector3(0, height - 0.5 - post_w - banner_h * 0.5, 0)
+	gate.add_child(banner)
+	var strip := MeshInstance3D.new()
+	var sm := QuadMesh.new()
+	var strip_len := 4.0
+	sm.size = Vector2(float(fr.half) * 2.0, strip_len)
+	strip.mesh = sm
+	strip.material_override = _checker_material(maxi(int(round(float(fr.half) * 2.0 / (strip_len * 0.5))), 4), 2, accent if kind == "start" else Color(0.96, 0.96, 0.96))
+	strip.rotation.x = -PI * 0.5
+	strip.position = Vector3(0, 0.07, 0)   # just proud of the tarmac so it never z-fights
+	gate.add_child(strip)
+
+## Two-tone chequer as a tiny nearest-filtered texture (cols × rows texels): `light`
+## against near-black. Unshaded so the pattern stays readable at dusk and at night.
+func _checker_material(cols: int, rows: int, light: Color) -> StandardMaterial3D:
+	var img := Image.create(cols, rows, false, Image.FORMAT_RGB8)
+	for y in range(rows):
+		for x in range(cols):
+			img.set_pixel(x, y, light if (x + y) % 2 == 0 else Color(0.06, 0.06, 0.07))
+	var mat := StandardMaterial3D.new()
+	mat.albedo_texture = ImageTexture.create_from_image(img)
+	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	return mat
 
 ## Warn the player to build speed on a gap run-up (green = you'll make it).
 func _update_gap_telegraph() -> void:

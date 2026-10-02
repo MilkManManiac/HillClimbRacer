@@ -40,7 +40,7 @@ func _ready() -> void:
 	await get_tree().process_frame
 	root.call("_begin_game")
 	root.call("_on_title_mode_button", "trial")
-	_check(bool(root.get("_trial_active")), "trial active on hills")
+	_check(bool(root.get("_trial_active")), "trial active on canyon")
 
 	var car: RigidBody3D = null
 	for c in root.get_children():
@@ -49,16 +49,20 @@ func _ready() -> void:
 	_check(car != null, "car found")
 
 	Input.action_press("accelerate")
-	for i in range(240):   # ~2s of sim
+	var wait := 0
+	while wait < 960 and not bool(root.get("_trial_running")):   # the clock (and the ghost) start at the line
+		await get_tree().physics_frame
+		wait += 1
+	for i in range(180):   # ~1.5s of recorded run
 		await get_tree().physics_frame
 	Input.action_release("accelerate")
-	car.set("distance", 1500.0)   # past hills' 1000m finish line
+	car.set("distance", float(root.get("_trial_finish_s")) + 1.0)   # past the finish line
 	await get_tree().physics_frame
 	await get_tree().physics_frame
 	_check(bool(root.get("_trial_finished")), "finish detected")
 
 	var vehicle: String = str(root.get("_vehicle"))
-	var key := "hills|" + vehicle
+	var key := "canyon|" + vehicle
 	var ghost_data: Dictionary = root.get("_ghost_data")
 	var rec_n: int = (ghost_data[key] as Array).size() if ghost_data.has(key) else 0
 	_check(rec_n >= 80, "synthetic ghost recorded (%d floats)" % rec_n)
@@ -71,7 +75,7 @@ func _ready() -> void:
 		for f in d.get_files():
 			if f.ends_with(".hcghost"):
 				exported_name = f
-	_check(exported_name != "" and exported_name.begins_with("hills_" + vehicle + "_"), "exported file named correctly (%s)" % exported_name)
+	_check(exported_name != "" and exported_name.begins_with("canyon_" + vehicle + "_"), "exported file named correctly (%s)" % exported_name)
 
 	var ef := FileAccess.open(TMP_DIR + "/" + exported_name, FileAccess.READ)
 	var original_text := ef.get_as_text() if ef else ""
@@ -87,14 +91,15 @@ func _ready() -> void:
 	corrupt["checksum"] = int(corrupt["checksum"]) + 1
 	var corrupt_res: Dictionary = root.call("import_rival_ghost_text", JSON.stringify(corrupt), "corrupt_test")
 	_check(not bool(corrupt_res.get("ok", true)), "corrupt checksum rejected (%s)" % str(corrupt_res.get("msg", "")))
-	_check(not (root.get("_rival_data") as Dictionary).has("hills"), "corrupt import did not install a rival")
+	_check(not (root.get("_rival_data") as Dictionary).has("canyon"), "corrupt import did not install a rival")
 
 	# --- stage 4: valid import -----------------------------------------------------
-	var import_res: Dictionary = root.call("import_rival_ghost_text", original_text, "friend_hills_52s")
+	var import_res: Dictionary = root.call("import_rival_ghost_text", original_text, "friend_canyon_52s")
 	_check(bool(import_res.get("ok", false)), "valid import accepted (%s)" % str(import_res.get("msg", "")))
 	var rival_data: Dictionary = root.get("_rival_data")
-	_check(rival_data.has("hills"), "rival stored under map key \"hills\"")
-	_check(str((rival_data.get("hills", {}) as Dictionary).get("name", "")) == "friend_hills_52s", "rival keeps source filename as its label")
+	_check(rival_data.has("canyon"), "rival stored under map key \"canyon\"")
+	_check(str((rival_data.get("canyon", {}) as Dictionary).get("name", "")) == "friend_canyon_52s", "rival keeps source filename as its label")
+	_check(((rival_data.get("canyon", {}) as Dictionary).get("splits", []) as Array).size() == HCTimeTrialScript.SPLIT_FRACS.size(), "rival carries its split times (for the gap call-outs)")
 
 	# --- stage 5: rival appears in trial playback state, alongside your own best ---
 	root.call("_reset_run_mode_state")   # reloads both ghosts for the (already active) map
@@ -115,10 +120,10 @@ func _ready() -> void:
 	root.call("_clear_rival_ghost")
 	_check(not bool(rival.call("has_data")), "clear rival drops its playback data")
 	_check(bool(ghost.call("has_data")), "personal-best ghost survives clearing the rival")
-	_check(not (root.get("_rival_data") as Dictionary).has("hills"), "clear rival removes the save-schema entry")
+	_check(not (root.get("_rival_data") as Dictionary).has("canyon"), "clear rival removes the save-schema entry")
 
 	# re-import for the save/load stage below
-	root.call("import_rival_ghost_text", original_text, "friend_hills_52s")
+	root.call("import_rival_ghost_text", original_text, "friend_canyon_52s")
 
 	# --- stage 6: save/load persists the rival (in-memory JSON round-trip, like
 	# TrialProbe's ghost round-trip — never touches the real user://hc_save.json) -----
@@ -130,9 +135,9 @@ func _ready() -> void:
 	root2.call("_begin_game")
 	root2.call("_apply_save", parsed)
 	var rival_data2: Dictionary = root2.get("_rival_data")
-	var ok2 := rival_data2.has("hills") \
-		and str((rival_data2["hills"] as Dictionary).get("name", "")) == "friend_hills_52s" \
-		and absf(float((rival_data2["hills"] as Dictionary).get("time", -1.0)) - float((rival_data["hills"] as Dictionary).get("time", -2.0))) < 0.001
+	var ok2 := rival_data2.has("canyon") \
+		and str((rival_data2["canyon"] as Dictionary).get("name", "")) == "friend_canyon_52s" \
+		and absf(float((rival_data2["canyon"] as Dictionary).get("time", -1.0)) - float((rival_data["canyon"] as Dictionary).get("time", -2.0))) < 0.001
 	_check(ok2, "rival survives save/load JSON round-trip")
 	remove_child(root2)
 	root2.queue_free()

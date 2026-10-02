@@ -44,6 +44,10 @@ extends RigidBody3D
 @export var land_damage_speed: float = 12.0  # vertical impact speed before damage starts
 
 var fuel: float = 100.0
+## Time-trial switches, set by HCMain: no fuel gauge in a trial (the clock is the
+## pressure), and the car brakes itself to a stop once it has crossed the finish line.
+var infinite_fuel := false
+var autobrake := false
 var health: float = 100.0
 var distance: float = 0.0
 var airborne: bool = false
@@ -432,6 +436,10 @@ func _physics_process(delta: float) -> void:
 	var drive := maxf(Input.get_action_strength("accelerate"), (1.0 if Input.is_key_pressed(KEY_SHIFT) else 0.0))
 	var braking := Input.get_action_strength("brake")
 	var steer_in := Input.get_axis("turn_right", "turn_left")
+	if autobrake:
+		drive = 0.0
+		braking = 1.0 if fwd_speed > 0.5 else 0.0   # stop, don't creep into reverse
+		steer_in = 0.0
 	var pitch_in := Input.get_action_strength("pitch_up") - Input.get_action_strength("pitch_down")
 
 	if _grounded:
@@ -754,7 +762,7 @@ func _physics_process(delta: float) -> void:
 	# ~R+shift off the centre-line; the loop has its own off-the-ribbon dismount.
 	if _grounded and _loop.is_empty() and _road_off() > _road_half_here() + 1.5:
 		health = 0.0
-	fuel = maxf(fuel, 0.0)
+	fuel = max_fuel if infinite_fuel else maxf(fuel, 0.0)
 	if terrain and terrain.has_method("progress"):
 		distance = maxf(distance, terrain.call("progress", global_position))   # arc-length on the track
 	else:

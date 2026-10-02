@@ -23,6 +23,39 @@ Design pillars (in priority order):
    all-drift sprint against the clock, big-air snow ridge. More flavors welcome.
 5. **Session-friendly.** Death → shop → retry in seconds. No friction.
 
+## Direction change (2026-10-01 — "HC v9", weekly trial)
+
+Owner call: "drop a lot of the upgrade stuff and focus more on a multiplayer trial type
+game." His format, in his words: "almost like a weekly track. same car/setup for each
+map. go with mid to fast range cars. Then whoever can get the fastest time they win.
+show ghosts of fastest… roughly a 45 - 60 second map but with the idea some people may
+get really good at it." Then: "no boost. we can just pick one map for now and fix others
+as needed." So the weekly trial is now the main game; classic (endless + shop) is still
+there behind the CLASSIC toggle, untouched.
+
+- **One track, one car**: `HCTimeTrial.TRACKS` names the car, its fixed upgrade levels
+  and the length per track. Week 1 = Sunset Canyon, Sports Car, engine 2 (72 m/s cap),
+  2800 m. Why engine 2: a stock sports car (40 m/s) was held flat through every corner
+  by the bot — no time to find. At 72 the bot averages 52.6 m/s, so the line matters.
+- **Trial rules** (`HCMain._is_trial()` is the one switch): no fuel, no pickups, no
+  money, no shop, no score/combo HUD, stock body (kits refit the wheel stance). Garage
+  picks are remembered (`_garage_vehicle/_garage_map`) and restored on CLASSIC.
+- **Clock runs line to line**: starts 24 m past spawn, stops at the finish; crossings
+  are sub-frame corrected (overshoot / speed). 4 splits flash the GAP to your best
+  (green/red) and to the rival. A wreck auto-restarts after 0.7 s; Enter/Back restarts
+  any time. The finish ends the run: car brakes itself, results panel (time, gap,
+  medal, next medal, rival gap, Retry / Main Menu).
+- **Props**: chequered start/finish gates + glowing split hoops, built by HCMain from
+  `HCTrack.frame_at_s` (visual only, no collision).
+- **Ghost files** now carry the run's splits (optional field, outside the checksum).
+- Tests: `TrialProbe` rewritten (46 checks), `GhostShareProbe` moved to canyon,
+  `tests/TrialBot.tscn` = bot lap for calibration (53.3 s, 0 wrecks),
+  `tests/TrialShot.tscn` = renders title/start/split/finish/results PNGs.
+- Medals (gold 50 / silver 54 / bronze 65) are bot-calibrated — human pass wanted.
+- NOT built yet: the online board, more than one rival ghost, the week rollover /
+  archive, any second track. Gravity Works likely needs shortening when it gets a turn
+  (owner: "took awhile").
+
 ## Update (2026-07-09, eleventh pass — "HC v8", same session)
 
 - **6th map: Dune Drift** (amber card, classic mode): golden-hour desert, long
@@ -303,7 +336,8 @@ Work in passes; after each pass run the battery, screenshot what changed, commit
    wheels. This is the long-term "wacky sandbox" identity — prototype one absurd part
    end-to-end (shop → visual → physics → feel) before building many.
 
-Anti-goals: no multiplayer, no open world, no realism sim, don't touch the horror-game
+Anti-goals: no collided realtime multiplayer (ghost-based trial multiplayer IS the
+direction as of 2026-10-01 — see the top of this file), no open world, no realism sim, don't touch the horror-game
 files, don't add heavyweight assets (keep the low-poly/procedural look — it's the style).
 
 ## Definition of "amazing" for this pass
